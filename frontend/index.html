@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Jarvis V3 - 智能助手</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="/static/vue.global.js"></script>
+    <script>
+        window.__vClickOutside = {
+            mounted(el, binding) {
+                el.__clickOutside = (e) => {
+                    if (!el.contains(e.target) && el !== e.target) binding.value(e);
+                };
+                document.addEventListener('click', el.__clickOutside);
+            },
+            unmounted(el) {
+                document.removeEventListener('click', el.__clickOutside);
+            }
+        };
+    </script>
+</head>
+<body>
+    <div id="app">
+        <!-- 侧边栏 -->
+        <aside class="sidebar">
+            <div class="logo">
+                <span class="logo-icon">🤖</span>
+                <span class="logo-text">Jarvis V3</span>
+                <span class="logo-badge">BETA</span>
+            </div>
+            <button class="new-conversation-btn" @click="newConversation">+ 新对话</button>
+            <div class="sidebar-section-label">对话历史</div>
+            <div class="conversation-list">
+                <div v-if="conversations.length === 0" class="conv-empty">暂无对话</div>
+                <div v-for="c in conversations" :key="c.session_id"
+                     class="conversation-item"
+                     :class="{ active: c.session_id === currentSessionId }"
+                     @click="switchConversation(c.session_id)">
+                    <div class="conv-title">{{ c.title || '新对话' }}</div>
+                    <div class="conv-time">{{ c.updated_at ? formatTime(c.updated_at) : '' }}</div>
+                    <button class="conv-delete" title="删除" @click.stop="deleteConversation(c.session_id)">🗑</button>
+                </div>
+            </div>
+            <div class="sidebar-bottom-nav">
+                <div class="nav-item" @click="showSettings = !showSettings"><span>⚙️</span><span>设置</span></div>
+            </div>
+        </aside>
+
+        <!-- 主聊天区 -->
+        <main class="main-content">
+            <div class="chat-container">
+                <div class="chat-header">
+                    <h1>与 Jarvis 对话</h1>
+                    <p>基于四层状态机架构的智能助手</p>
+                </div>
+
+                <div class="chat-messages" ref="msgContainer">
+                    <!-- 空状态 -->
+                    <div v-if="messages.length === 0" class="empty-state" style="text-align:center;padding:60px 20px;color:var(--text-muted);">
+                        <div style="font-size:48px;margin-bottom:16px;">🤖</div>
+                        <p style="font-size:16px;color:var(--text-secondary);">开始与 Jarvis V3 对话</p>
+                        <p style="font-size:13px;color:var(--text-muted);margin-top:8px;">输入你的问题或指令...</p>
+                    </div>
+                    <!-- 消息列表 -->
+                    <div v-for="(msg, i) in messages" :key="msg._uid || i"
+                         class="message"
+                         :class="msg.role">
+                        <div class="message-avatar">{{ msg.role === 'user' ? '👤' : msg.role === 'tool_result' ? '🔧' : '🤖' }}</div>
+                        <div class="message-content" v-html="msg.html" :id="'msg-' + msg._uid + '-content'"></div>
+                    </div>
+                </div>
+
+                <div class="status-bar" :class="statusClass">{{ statusText }}</div>
+
+                <div class="chat-input-container">
+                    <div class="input-wrapper">
+                        <textarea ref="inputEl"
+                                  v-model="inputText"
+                                  @keydown="onInputKeydown"
+                                  rows="1"
+                                  placeholder="输入你的请求..."
+                                  :disabled="sending"></textarea>
+                        <div class="btn-group">
+                        <button v-if="!sending" @click="sendMessage" :disabled="!inputText.trim()">发送</button>
+                        <button v-else class="interrupt-btn" @click="interruptSession" :disabled="interrupting">⏹ 中断</button>
+                        </div>
+                    </div>
+                    <div class="input-tip">按 Enter 发送 · Shift+Enter 换行</div>
+                </div>
+            </div>
+        </main>
+
+        <!-- 设置面板 -->
+        <div v-if="showSettings" v-click-outside="() => showSettings = false" class="settings-panel">
+            <button class="close-settings" @click="showSettings = false">✕</button>
+            <h3>⚙️ 设置</h3>
+            <div class="settings-group">
+                <label>模型选择</label>
+                <select v-model="modelName">
+                    <option value="deepseek-chat">DeepSeek Chat</option>
+                    <option value="deepseek-reasoner">DeepSeek Reasoner</option>
+                </select>
+                <div class="mode-description">使用 DeepSeek API 作为 LLM 后端</div>
+            </div>
+            <hr style="border-color:var(--border-subtle);margin:16px 0;">
+            <div class="api-key-header">🔑 API Key 配置</div>
+            <div v-for="p in apiProviders" :key="p.id" class="api-key-section">
+                <div class="key-label">{{ p.name || p.id }}</div>
+                <div class="key-row">
+                    <input type="password" v-model="p.newKey" :placeholder="p.masked || '输入 API Key...'">
+                    <span class="key-status" :class="p.configured ? 'configured' : 'unconfigured'">{{ p.configured ? '✅ 已配置' : '⚠️ 未配置' }}</span>
+                    <button class="key-save-btn" @click="saveApiKey(p)" :disabled="!p.newKey">💾 保存</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/api.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>
