@@ -1,0 +1,2356 @@
+================================================================================
+# FILE: engine/longterm/topic_inject.py
+# LINES: 194
+================================================================================
+
+"""
+Topic 注入 — 记忆上下文注入 + 反馈闭环
+
+功能:
+  1. Injector: 将相关记忆注入到 LLM 上下文
+  2. 反馈处理：用户说"不对"、"不是这样"时，自动降权相关记忆
+  3. 记忆合并：两条相似记忆自动合并
+
+使用:
+    injector = Injector(topic_store)
+    context = injector.prepare_injection(user_input)
+    # → context = "[Relevant Memories]\\n• ..."
+
+    # 处理负反馈
+    was_feedback, remaining = injector.handle_feedback(user_input)
+    if was_feedback:
+        # 降权相关记忆
+        ...
+"""
+
+import json
+import logging
+from typing import Optional, List, Tuple, Dict
+
+from .topic_store import TopicStore
+from .topic_search import build_injection_block, search_topics
+
+logger = logging.getLogger(__name__)
+
+# 负反馈关键词（用户表示"不对"）
+_FEEDBACK_PATTERNS = [
+    "不对", "不是", "错了", "不是这样", "不对啊",
+    "你记错了", "错了", "不对", "不对的",
+    "不是这个", "你没记住", "我说的是",
+    "no", "not", "wrong", "incorrect",
+]
+
+class Injector:
+    """
+    记忆注入器 — 负责记忆的注入、反馈处理、合并
+
+    使用示例:
+        store = TopicStore("data/topics.db")
+        injector = Injector(store)
+
+        # Phase 1: 准备注入
+        memory_block = injector.prepare_injection("帮我写一个Python脚本")
+        if memory_block:
+            messages.insert(0, {"role": "system", "content": memory_block})
+
+        # Phase 2: 处理反馈
+        if injector.handle_feedback(user_input)[0]:
+            injector.apply_feedback(user_input)
+    """
+
+    def __init__(self, store: TopicStore, max_injection_tokens: int = 800):
+        self.store = store
+        self.max_injection_tokens = max_injection_tokens
+        self._last_injected: List[str] = []  # 上次注入的 topic ids
+
+    def prepare_injection(self, user_input: str) -> str:
+        """
+        准备记忆注入块
+
+        根据用户输入检索相关记忆，构建注入文本。
+
+        Returns:
+            注入文本（空字符串 = 无相关记忆）
+        """
+        block = build_injection_block(
+            store=self.store,
+            query=user_input,
+            top_k=5,
+            max_tokens=self.max_injection_tokens,
+        )
+        self._last_injected = self._extract_topic_ids(block)
+        return block
+
+    @staticmethod
+    def handle_feedback(user_input: str) -> Tuple[bool, str]:
+        """
+        检测用户输入是否包含负反馈
+
+        Returns:
+            (is_feedback, remaining_text)
+            is_feedback: 是否包含负反馈
+            remaining_text: 去除反馈关键词后的文本
+        """
+        text = user_input.strip()
+        for pattern in _FEEDBACK_PATTERNS:
+            if pattern in text:
+                # 去除反馈词
+                remaining = text.replace(pattern, "").strip()
+                # 去除开头的标点
+                remaining = remaining.lstrip("，。！？,!.?")
+                return True, remaining or text
+
+        return False, text
+
+    def apply_feedback(self, feedback_text: str):
+        """
+        根据反馈降权相关记忆
+
+        当用户说"不对"时，找到与当前对话相关的记忆并降权。
+        """
+        # 找到反馈文本涉及的记忆
+        results = search_topics(
+            self.store, feedback_text, top_k=5, min_confidence=0.05
+        )
+        for r in results:
+            topic = r["topic"]
+            tid = topic["id"]
+            current_conf = topic.get("confidence", 1.0)
+            # 降权 30%
+            new_conf = max(0.05, current_conf * 0.7)
+            self.store.update_topic(tid, confidence=new_conf)
+            logger.info(
+                f"Feedback applied to {tid}: {current_conf:.2f} → {new_conf:.2f}"
+            )
+
+    def merge_similar_topics(self, threshold: float = 0.8) -> int:
+        """
+        合并相似 Topic（做梦整合）
+
+        检查所有 Topic 两两之间的相似度，高于 threshold 的合并。
+
+        Returns:
+            合并的数量
+        """
+        all_topics = self.store.get_all_topics(limit=500)
+        import itertools
+
+        merged = 0
+        for a, b in itertools.combinations(all_topics, 2):
+            # 用标题和摘要的文本相似度
+            text_a = f"{a['title']} {a.get('one_liner', '')}"
+            text_b = f"{b['title']} {b.get('one_liner', '')}"
+            sim = self._text_similarity(text_a, text_b)
+
+            if sim >= threshold:
+                # 合并：保留置信度更高的那个
+                if a["confidence"] >= b["confidence"]:
+                    keep, remove = a, b
+                else:
+                    keep, remove = b, a
+
+                # 扩展 keep 的 summary
+                keep_summary = keep.get("summary", "")
+                remove_summary = remove.get("summary", "")
+                if remove_summary and remove_summary not in keep_summary:
+                    new_summary = keep_summary + "\n" + remove_summary
+                    # 合并 tags
+                    keep_tags = list(
+                        set(keep.get("tags", []) + remove.get("tags", []))
+                    )
+                    self.store.update_topic(
+                        keep["id"],
+                        summary=new_summary[:500],
+                        tags=keep_tags,
+                        confidence=min(1.0, keep["confidence"] + 0.1),
+                    )
+                self.store.delete_topic(remove["id"])
+                merged += 1
+
+        if merged > 0:
+            logger.info(f"Merged {merged} similar topics")
+
+        return merged
+
+    @staticmethod
+    def _extract_topic_ids(block: str) -> List[str]:
+        """从注入块中提取 Topic ID（当前简化版）"""
+        _ = block
+        return []
+
+    @staticmethod
+    def _text_similarity(a: str, b: str) -> float:
+        """简单文本相似度（基于公共子串/Jaccard）"""
+        if not a or not b:
+            return 0.0
+        set_a = set(a)
+        set_b = set(b)
+        if not set_a or not set_b:
+            return 0.0
+        intersection = set_a & set_b
+        union = set_a | set_b
+        return len(intersection) / len(union)
+
+def get_injector(store: Optional[TopicStore] = None,
+                 db_path: str = "data/topics.db") -> Injector:
+    """快捷获取 Injector 实例"""
+    if store is None:
+        store = TopicStore(db_path)
+    return Injector(store)
+
+================================================================================
+# FILE: engine/longterm/topic_search.py
+# LINES: 161
+================================================================================
+
+"""
+Topic 检索 — BM25 + 向量混合检索 + 上下文注入
+
+提供:
+  1. search_topics: 检索相关 Topic（混合搜索 + 关联传播）
+  2. build_injection_block: 构建注入到 LLM 上下文的记忆块
+  3. simple_kw_search: 纯关键词搜索（轻量级 fallback）
+"""
+
+import logging
+from typing import Optional, List, Dict, Any
+
+from .topic_store import TopicStore
+
+logger = logging.getLogger(__name__)
+
+def search_topics(
+    store: TopicStore,
+    query: str,
+    top_k: int = 5,
+    propagate_links: bool = True,
+    min_confidence: float = 0.1,
+) -> List[Dict]:
+    """
+    检索相关 Topic（混合检索 + 弱关联传播）
+
+    流程:
+      1. BM25 + 向量混合检索，召回 top_k 个 Topic
+      2. 对每个 Topic 展开弱关联传播（最多 depth=1）
+      3. RRF 融合 + 置信度过滤
+
+    Returns:
+        [{"topic": {...}, "score": float, "source": "search|propagation"}, ...]
+    """
+    results = []
+
+    # Phase 1: 混合检索
+    search_results = store.search(query, top_k=top_k, min_confidence=min_confidence)
+    seen_ids = set()
+    for topic, score in search_results:
+        seen_ids.add(topic["id"])
+        results.append({
+            "topic": topic,
+            "score": round(score, 4),
+            "source": "search",
+        })
+
+    # Phase 2: 弱关联传播
+    if propagate_links:
+        for topic, _ in search_results[:3]:
+            related = store.get_related_topics(topic["id"], max_depth=1)
+            for rel_topic, strength in related:
+                if rel_topic["id"] not in seen_ids:
+                    seen_ids.add(rel_topic["id"])
+                    results.append({
+                        "topic": rel_topic,
+                        "score": round(strength, 4),
+                        "source": "propagation",
+                    })
+
+    # 排序（搜索优先，同分搜索 > 传播）
+    results.sort(key=lambda x: (x["score"], x["source"] == "search"), reverse=True)
+    return results[:top_k]
+
+def build_injection_block(
+    store: TopicStore,
+    query: str,
+    top_k: int = 5,
+    max_tokens: int = 800,
+) -> str:
+    """
+    构建注入到 LLM 上下文的记忆块
+
+    用于在 LLM 处理用户输入前注入相关记忆。
+
+    输出格式:
+      [Relevant Memories]
+      • [置信度] 标题: 一句话摘要
+      • ...
+
+    Args:
+        store: TopicStore 实例
+        query: 用户输入或查询
+        top_k: 最多注入多少条
+        max_tokens: 注入块的最大 token 估算
+
+    Returns:
+        格式化的记忆注入文本（空字符串 = 无相关记忆）
+    """
+    results = search_topics(store, query, top_k=top_k, min_confidence=0.15)
+
+    if not results:
+        return ""
+
+    lines = ["[Relevant Memories]"]
+    used_chars = len(lines[0])
+
+    for r in results:
+        topic = r["topic"]
+        title = topic.get("title", "")
+        one_liner = topic.get("one_liner", "")
+        confidence = topic.get("confidence", 1.0)
+        source = r["source"]
+
+        icon = "🔄" if source == "propagation" else "📌"
+        tag_str = ""
+        if topic.get("tags"):
+            tags = topic["tags"][:3]
+            tag_str = f" [{', '.join(tags)}]"
+
+        line = f"{icon} [{confidence:.0%}] {title}: {one_liner}{tag_str}"
+        if len(line) > 200:
+            line = line[:197] + "..."
+
+        # 估算 token（中文 ≈ 2 char/token，英文 ≈ 4 char/token）
+        est_tokens = sum(
+            2 if '\u4e00' <= c <= '\u9fff' else 1
+            for c in line
+        ) // 2 + 1
+        new_total = used_chars + est_tokens + 1
+
+        if new_total > max_tokens:
+            break
+
+        lines.append(line)
+        used_chars = new_total
+
+        # 更新访问计数
+        store.record_access(topic["id"])
+
+    if len(lines) <= 1:
+        return ""
+
+    return "\n".join(lines)
+
+def search_simple(
+    store: TopicStore,
+    keyword: str,
+    top_k: int = 10,
+) -> List[Dict]:
+    """
+    纯关键词搜索（轻量级，不使用 BM25/向量）
+
+    用于"搜一下我记得..."这种用户明确要求搜索记忆的场景。
+    """
+    all_topics = store.get_all_topics(limit=1000)
+    if not all_topics:
+        return []
+
+    kw = keyword.lower()
+    scored = []
+    for topic in all_topics:
+        text = f"{topic['title']} {topic.get('one_liner', '')} {topic.get('summary', '')} {json.dumps(topic.get('tags', []))}".lower()
+        count = text.count(kw)
+        if count > 0:
+            scored.append((topic, count))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [t for t, _ in scored[:top_k]]
+
+import json
+
+================================================================================
+# FILE: engine/longterm/topic_store.py
+# LINES: 689
+================================================================================
+
+"""
+Topic 存储 - SQLite 双层记忆系统
+
+架构:
+  Topic 层 (SQLite)          原文层 (JSON 文件)
+  ┌──────────────────┐       ┌──────────────────┐
+  │ 标题 (title)     │       │ 完整对话原文      │
+  │ 一句话摘要       │  ←──→ │ 角色 (user/ai)   │
+  │ 完整摘要         │       │ 时间戳            │
+  │ 标签 (tags)      │       │ 会话 ID           │
+  │ 弱关联           │       └──────────────────┘
+  │ 置信度           │
+  │ embedding 向量   │ ←── 可选，降级后 BM25 纯文本检索
+  └──────────────────┘
+
+特点:
+  - 零外部依赖（SQLite 是 Python 内置）
+  - embedding 失败时自动降级到 BM25 文本搜索
+  - 支持弱关联传播（Topic A ↔ Topic B 的相关度提升）
+  - 支持置信度衰减（长期未访问的记忆自动降权）
+"""
+
+import json
+import logging
+import os
+import sqlite3
+import math
+import hashlib
+from datetime import datetime
+from typing import Optional, List, Dict, Any, Tuple
+from collections import Counter
+
+logger = logging.getLogger(__name__)
+
+# ── BM25 ──
+
+class BM25Index:
+    """
+    纯 Python BM25 索引（零外部依赖）
+
+    用于 embedding 不可用时的文本检索降级方案。
+    """
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self._doc_count = 0
+        self._avg_doc_len = 0.0
+        self._doc_lens: List[int] = []
+        self._doc_texts: List[str] = []
+        self._term_df: Dict[str, int] = {}  # term → doc frequency
+        self._term_cf: Dict[str, int] = {}  # term → collection frequency
+        self._dirty = True
+
+    def add_document(self, text: str):
+        """添加一篇文档到索引"""
+        tokens = self._tokenize(text)
+        self._doc_texts.append(text)
+        self._doc_lens.append(len(tokens))
+        doc_terms = set(tokens)
+        for term in doc_terms:
+            self._term_df[term] = self._term_df.get(term, 0) + 1
+        for term in tokens:
+            self._term_cf[term] = self._term_cf.get(term, 0) + 1
+        self._dirty = True
+
+    def remove_document(self, index: int):
+        """移除一篇文档"""
+        if 0 <= index < len(self._doc_texts):
+            tokens = self._tokenize(self._doc_texts[index])
+            doc_terms = set(tokens)
+            for term in doc_terms:
+                if term in self._term_df:
+                    self._term_df[term] -= 1
+                    if self._term_df[term] <= 0:
+                        del self._term_df[term]
+            for term in tokens:
+                if term in self._term_cf:
+                    self._term_cf[term] -= 1
+                    if self._term_cf[term] <= 0:
+                        del self._term_cf[term]
+            del self._doc_texts[index]
+            del self._doc_lens[index]
+            self._dirty = True
+
+    def rebuild(self, texts: List[str]):
+        """重建索引"""
+        self._doc_texts = []
+        self._doc_lens = []
+        self._term_df = {}
+        self._term_cf = {}
+        for text in texts:
+            self.add_document(text)
+        self._finalize()
+
+    def _finalize(self):
+        """准备搜索（更新统计信息）"""
+        self._doc_count = len(self._doc_texts)
+        if self._doc_count > 0:
+            self._avg_doc_len = sum(self._doc_lens) / self._doc_count
+        self._dirty = False
+
+    def search(self, query: str, top_k: int = 10) -> List[Tuple[int, float]]:
+        """搜索，返回 [(doc_index, score), ...]"""
+        if self._dirty:
+            self._finalize()
+        if self._doc_count == 0:
+            return []
+
+        query_terms = self._tokenize(query)
+        if not query_terms:
+            return []
+
+        scores = [0.0] * self._doc_count
+        for term in set(query_terms):
+            if term not in self._term_df:
+                continue
+            df = self._term_df[term]
+            idf = math.log((self._doc_count - df + 0.5) / (df + 0.5) + 1.0)
+            for i, doc_len in enumerate(self._doc_lens):
+                # Term frequency in this document
+                tf = self._tokenize(self._doc_texts[i]).count(term)
+                if tf == 0:
+                    continue
+                score = idf * (tf * (self.k1 + 1)) / (
+                    tf + self.k1 * (1 - self.b + self.b * doc_len / self._avg_doc_len)
+                )
+                scores[i] += score
+
+        # 排序取 top_k
+        scored_indices = sorted(
+            range(len(scores)), key=lambda i: scores[i], reverse=True
+        )
+        return [(i, scores[i]) for i in scored_indices[:top_k] if scores[i] > 0]
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        """分词（支持中文和英文）"""
+        if not text:
+            return []
+        text = text.lower()
+        tokens = []
+        # 中文：单字
+        for ch in text:
+            if '\u4e00' <= ch <= '\u9fff':
+                tokens.append(ch)
+        # 英文：按非字母字符分割
+        import re
+        en_tokens = re.findall(r'[a-z0-9_]+', text)
+        tokens.extend(en_tokens)
+        # 过滤短词
+        return [t for t in tokens if len(t) >= 1]
+
+# ── 嵌入器 ──
+
+class EmbeddingProvider:
+    """
+    嵌入提供者 — 尝试使用真实嵌入，失败则降级到 BM25
+
+    不抛出异常，所有失败静默降级。
+    """
+
+    def __init__(self):
+        self._real_embedder = None
+        self._try_init()
+
+    def _try_init(self):
+        """尝试初始化真实嵌入器"""
+        for module_name, class_name, method in [
+            ("sentence_transformers", "SentenceTransformer", None),
+        ]:
+            try:
+                import importlib
+                mod = importlib.import_module(module_name)
+                logger.info(f"Found embedding module: {module_name}")
+                # 暂时不加载模型（太大），仅在需要时加载
+                self._real_embedder = module_name
+                return
+            except ImportError:
+                continue
+        logger.info("No embedding module found, will use BM25 fallback")
+
+    def is_available(self) -> bool:
+        return self._real_embedder is not None
+
+    async def embed(self, text: str) -> Optional[List[float]]:
+        """生成嵌入，失败返回 None"""
+        if not self._real_embedder:
+            return None
+        try:
+            if self._real_embedder == "sentence_transformers":
+                import sentence_transformers
+                # 懒加载模型
+                model = sentence_transformers.SentenceTransformer(
+                    "paraphrase-multilingual-MiniLM-L12-v2"
+                )
+                vec = model.encode(text).tolist()
+                return vec
+        except Exception as e:
+            logger.warning(f"Embedding failed, fallback to BM25: {e}")
+            self._real_embedder = None
+        return None
+
+# ── Topic Store ──
+
+class TopicStore:
+    """
+    Topic 存储 — SQLite 双层记忆
+
+    Schema:
+      CREATE TABLE topics (
+        id          TEXT PRIMARY KEY,
+        title       TEXT NOT NULL,
+        one_liner   TEXT,          -- 一句话摘要
+        summary     TEXT,          -- 完整摘要
+        tags        TEXT,          -- JSON 数组
+        source      TEXT,          -- 来源（session_id）
+        confidence  REAL DEFAULT 1.0,
+        access_count INTEGER DEFAULT 0,
+        created_at  TEXT,
+        updated_at  TEXT,
+        embedding   BLOB           -- JSON 浮点数组
+      );
+
+      CREATE TABLE topic_links (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_id   TEXT NOT NULL,
+        target_id   TEXT NOT NULL,
+        strength    REAL DEFAULT 0.5,  -- 关联强度
+        link_type   TEXT DEFAULT 'related',  -- related / temporal / causal
+        created_at  TEXT
+      );
+
+      CREATE INDEX idx_topics_tags ON topics(tags);
+      CREATE INDEX idx_topics_confidence ON topics(confidence);
+      CREATE INDEX idx_topic_links_source ON topic_links(source_id);
+    """
+
+    def __init__(self, db_path: str = "data/topics.db"):
+        self.db_path = db_path
+        self._embedder = EmbeddingProvider()
+        self._bm25 = BM25Index()
+        self._bm25_loaded = False
+        self._init_db()
+
+    def _init_db(self):
+        """初始化数据库和表"""
+        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS topics (
+                    id          TEXT PRIMARY KEY,
+                    title       TEXT NOT NULL,
+                    one_liner   TEXT,
+                    summary     TEXT,
+                    tags        TEXT,
+                    source      TEXT,
+                    confidence  REAL DEFAULT 1.0,
+                    access_count INTEGER DEFAULT 0,
+                    created_at  TEXT,
+                    updated_at  TEXT,
+                    embedding   BLOB
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS topic_links (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id   TEXT NOT NULL,
+                    target_id   TEXT NOT NULL,
+                    strength    REAL DEFAULT 0.5,
+                    link_type   TEXT DEFAULT 'related',
+                    created_at  TEXT,
+                    FOREIGN KEY (source_id) REFERENCES topics(id),
+                    FOREIGN KEY (target_id) REFERENCES topics(id)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_topics_tags ON topics(tags)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_topics_confidence ON topics(confidence)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_topic_links_source ON topic_links(source_id)
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ── CRUD ──
+
+    def create_topic(
+        self,
+        title: str,
+        one_liner: str = "",
+        summary: str = "",
+        tags: Optional[List[str]] = None,
+        source: str = "",
+        confidence: float = 1.0,
+    ) -> str:
+        """创建一条 Topic 记忆"""
+        import uuid
+        topic_id = f"t_{uuid.uuid4().hex[:12]}"
+        now = datetime.utcnow().isoformat()
+        tags_json = json.dumps(tags or [], ensure_ascii=False)
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """INSERT INTO topics
+                   (id, title, one_liner, summary, tags, source,
+                    confidence, access_count, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+                (topic_id, title, one_liner, summary, tags_json, source,
+                 confidence, now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 同步到 BM25 索引
+        self._sync_to_bm25()
+
+        logger.info(f"Created topic: {topic_id} — {title[:40]}")
+        return topic_id
+
+    def get_topic(self, topic_id: str) -> Optional[Dict]:
+        """获取一条 Topic"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM topics WHERE id = ?", (topic_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return self._row_to_dict(row)
+        finally:
+            conn.close()
+
+    def update_topic(self, topic_id: str, **kwargs) -> bool:
+        """更新 Topic（支持 embedding 更新）"""
+        allowed = {"title", "one_liner", "summary", "tags", "confidence", "embedding"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return False
+
+        now = datetime.utcnow().isoformat()
+        updates["updated_at"] = now
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [topic_id]
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            if "tags" in updates and isinstance(updates["tags"], list):
+                idx = list(updates.keys()).index("tags")
+                values[idx] = json.dumps(updates["tags"], ensure_ascii=False)
+            if "embedding" in updates and isinstance(updates["embedding"], list):
+                idx = list(updates.keys()).index("embedding")
+                values[idx] = json.dumps(updates["embedding"], ensure_ascii=False)
+            conn.execute(
+                f"UPDATE topics SET {set_clause} WHERE id = ?", values
+            )
+            conn.commit()
+            # embedding 更新后清除缓存，确保下次检索重新加载
+            if "embedding" in updates and hasattr(self, '_embedding_cache'):
+                self._embedding_cache.discard(topic_id)
+            return conn.total_changes > 0
+        finally:
+            conn.close()
+
+    def record_access(self, topic_id: str):
+        """记录访问，增加 access_count 并提升置信度"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """UPDATE topics
+                   SET access_count = access_count + 1,
+                       confidence = MIN(1.0, confidence + 0.05),
+                       updated_at = ?
+                   WHERE id = ?""",
+                (datetime.utcnow().isoformat(), topic_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def delete_topic(self, topic_id: str) -> bool:
+        """删除 Topic（同时删除关联的链接）"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("DELETE FROM topic_links WHERE source_id = ? OR target_id = ?",
+                         (topic_id, topic_id))
+            conn.execute("DELETE FROM topics WHERE id = ?", (topic_id,))
+            conn.commit()
+            return conn.total_changes > 0
+        finally:
+            conn.close()
+
+    def get_all_topics(self, limit: int = 100, offset: int = 0) -> List[Dict]:
+        """获取所有 Topic"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM topics ORDER BY confidence DESC, created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+            return [self._row_to_dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def count(self) -> int:
+        """Topic 总数"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute("SELECT COUNT(*) as cnt FROM topics").fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+    # ── 关联（弱关联传播）──
+
+    def add_link(self, source_id: str, target_id: str,
+                 strength: float = 0.5,
+                 link_type: str = "related") -> bool:
+        """在两个 Topic 之间建立关联"""
+        if source_id == target_id:
+            return False
+        conn = sqlite3.connect(self.db_path)
+        try:
+            # 检查是否已存在
+            existing = conn.execute(
+                """SELECT id FROM topic_links
+                   WHERE (source_id = ? AND target_id = ?)
+                      OR (source_id = ? AND target_id = ?)""",
+                (source_id, target_id, target_id, source_id),
+            ).fetchone()
+            if existing:
+                # 更新强度
+                conn.execute(
+                    "UPDATE topic_links SET strength = ?, updated_at = ? WHERE id = ?",
+                    (strength, datetime.utcnow().isoformat(), existing[0]),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO topic_links
+                       (source_id, target_id, strength, link_type, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (source_id, target_id, strength, link_type,
+                     datetime.utcnow().isoformat()),
+                )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def get_related_topics(self, topic_id: str, max_depth: int = 1) -> List[Tuple[Dict, float]]:
+        """
+        获取关联的 Topic（支持弱关联传播）
+
+        Args:
+            topic_id: 源 Topic ID
+            max_depth: 传播深度（1 = 直接关联，2 = 间接关联）
+
+        Returns:
+            [(topic_dict, strength), ...]
+        """
+        visited = {topic_id}
+        results = []
+
+        def _walk(current_id: str, depth: int, decay: float):
+            if depth > max_depth:
+                return
+            conn = sqlite3.connect(self.db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                links = conn.execute(
+                    """SELECT source_id, target_id, strength FROM topic_links
+                       WHERE source_id = ? OR target_id = ?""",
+                    (current_id, current_id),
+                ).fetchall()
+                for link in links:
+                    neighbor = link["target_id"] if link["source_id"] == current_id else link["source_id"]
+                    if neighbor in visited:
+                        continue
+                    visited.add(neighbor)
+                    topic = self.get_topic(neighbor)
+                    if topic:
+                        propagated_strength = link["strength"] * decay
+                        results.append((topic, propagated_strength))
+                        _walk(neighbor, depth + 1, decay * 0.5)
+            finally:
+                conn.close()
+
+        _walk(topic_id, 1, 1.0)
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+
+    # ── 检索 ──
+
+    def search(self, query: str, top_k: int = 10,
+               min_confidence: float = 0.1) -> List[Tuple[Dict, float]]:
+        """
+        检索相关 Topic（BM25 + 向量混合）
+
+        策略:
+          1. 尝试 embedding 向量检索（如果有）
+          2. 降级到 BM25 全文检索
+          3. RRF 融合（当两者都有结果时）
+        """
+        all_topics = self.get_all_topics(limit=1000)
+        if not all_topics:
+            return []
+
+        texts = [f"{t['title']} {t['one_liner'] or ''} {t['summary'] or ''}"
+                 for t in all_topics]
+
+        # BM25 检索
+        self._load_bm25(texts)
+        bm25_results = self._bm25.search(query, top_k=top_k * 2)
+
+        # 向量检索（如果有嵌入）
+        vector_results = []
+        if self._embedder.is_available():
+            vector_results = self._search_vector(query, all_topics, top_k=top_k * 2)
+
+        # RRF 融合
+        if vector_results and bm25_results:
+            merged = self._rrf_fusion(
+                [(all_topics[i], s) for i, s in bm25_results],
+                vector_results,
+                k=60,
+            )
+        elif bm25_results:
+            merged = [(all_topics[i], s) for i, s in bm25_results]
+        else:
+            merged = vector_results if vector_results else []
+
+        # 过滤低置信度 + 排序
+        filtered = [
+            (t, s) for t, s in merged
+            if t["confidence"] >= min_confidence
+        ]
+        return filtered[:top_k]
+
+    def _search_vector(self, query: str, topics: List[Dict],
+                       top_k: int) -> List[Tuple[Dict, float]]:
+        """向量检索（需要嵌入）"""
+        import asyncio
+        try:
+            query_vec = asyncio.run(self._embedder.embed(query))
+            if query_vec is None:
+                return []
+
+            scored = []
+            for topic in topics:
+                emb = topic.get("embedding")
+                if emb:
+                    # 余弦相似度
+                    sim = self._cosine_similarity(query_vec, emb)
+                    scored.append((topic, sim))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            return scored[:top_k]
+        except Exception as e:
+            logger.warning(f"Vector search failed: {e}")
+            return []
+
+    @staticmethod
+    def _cosine_similarity(a: List[float], b: List[float]) -> float:
+        if not a or not b:
+            return 0.0
+        dot = sum(x * y for x, y in zip(a, b))
+        na = sum(x * x for x in a) ** 0.5
+        nb = sum(x * x for x in b) ** 0.5
+        if na == 0 or nb == 0:
+            return 0.0
+        return dot / (na * nb)
+
+    @staticmethod
+    def _rrf_fusion(
+        list_a: List[Tuple[Any, float]],
+        list_b: List[Tuple[Any, float]],
+        k: int = 60,
+    ) -> List[Tuple[Any, float]]:
+        """Reciprocal Rank Fusion"""
+        rank_scores: Dict[int, float] = {}
+        items = {}
+
+        for rank, (item, _) in enumerate(list_a):
+            idx = id(item)
+            rank_scores[idx] = rank_scores.get(idx, 0) + 1.0 / (k + rank + 1)
+            items[idx] = item
+        for rank, (item, _) in enumerate(list_b):
+            idx = id(item)
+            rank_scores[idx] = rank_scores.get(idx, 0) + 1.0 / (k + rank + 1)
+            items[idx] = item
+
+        sorted_items = sorted(rank_scores.items(), key=lambda x: x[1], reverse=True)
+        return [(items[idx], score) for idx, score in sorted_items]
+
+    def _load_bm25(self, texts: List[str]):
+        """加载 BM25 索引"""
+        if self._bm25_loaded:
+            return
+        self._bm25.rebuild(texts)
+        self._bm25_loaded = True
+
+    def _sync_to_bm25(self):
+        """重新同步 BM25 索引（增量添加后标记需要刷新）"""
+        self._bm25_loaded = False
+
+    # ── 维护 ──
+
+    def decay_confidence(self, factor: float = 0.95):
+        """
+        衰减所有 Topic 的置信度（长期未访问的记忆逐渐降权）
+
+        调用时机：定期（每天/每次启动）
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE topics SET confidence = confidence * ? WHERE confidence > 0.1",
+                (factor,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def prune_topics(self, min_confidence: float = 0.05, keep_min: int = 50):
+        """
+        清理低置信度 Topic，保留至少 keep_min 个
+
+        Returns:
+            删除的数量
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0]
+            if total <= keep_min:
+                return 0
+            to_delete = conn.execute(
+                """SELECT id FROM topics
+                   WHERE confidence < ?
+                   ORDER BY confidence ASC
+                   LIMIT ?""",
+                (min_confidence, total - keep_min),
+            ).fetchall()
+            ids = [row[0] for row in to_delete]
+            for tid in ids:
+                conn.execute("DELETE FROM topic_links WHERE source_id = ? OR target_id = ?",
+                             (tid, tid))
+                conn.execute("DELETE FROM topics WHERE id = ?", (tid,))
+            conn.commit()
+            return len(ids)
+        finally:
+            conn.close()
+
+    def get_all_links(self) -> List[Dict]:
+        """获取所有关联"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM topic_links ORDER BY strength DESC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _row_to_dict(row) -> Dict:
+        d = dict(row)
+        if "tags" in d and d["tags"]:
+            try:
+                d["tags"] = json.loads(d["tags"])
+            except (json.JSONDecodeError, TypeError):
+                d["tags"] = []
+        else:
+            d["tags"] = []
+        if "embedding" in d and d["embedding"]:
+            try:
+                d["embedding"] = json.loads(d["embedding"])
+            except (json.JSONDecodeError, TypeError):
+                d["embedding"] = None
+        return d
+
+================================================================================
+# FILE: engine/message/__init__.py
+# LINES: 2
+================================================================================
+
+"""消息管理"""
+from .message_list import MessageList
+
+================================================================================
+# FILE: engine/message/message_list.py
+# LINES: 168
+================================================================================
+
+"""
+message/message_list.py — 消息列表管理
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any, Dict, Iterator, List, Optional
+
+from ..core.types import Message, Role
+
+class MessageList:
+    """消息列表 — 管理消息历史"""
+
+    def __init__(self, max_messages: Optional[int] = None, max_tokens: Optional[int] = None):
+        self._messages: List[Message] = []
+        self._max_messages = max_messages
+        self._max_tokens = max_tokens
+
+    # ── 添加消息 ──
+
+    def add(self, message: Message) -> None:
+        self._messages.append(deepcopy(message))
+        self._truncate_if_needed()
+
+    def add_many(self, messages: List[Message]) -> None:
+        for msg in messages:
+            self._messages.append(deepcopy(msg))
+        self._truncate_if_needed()
+
+    def add_user(self, content: str) -> None:
+        self.add(Message.user(content))
+
+    def add_assistant(self, content: str, tool_calls: Optional[List] = None) -> None:
+        self.add(Message.assistant(content, tool_calls))
+
+    def add_tool(self, call_id: str, content: str) -> None:
+        self.add(Message.tool(call_id, content))
+
+    def add_system(self, content: str) -> None:
+        self.add(Message.system(content))
+
+    # ── 查询 ──
+
+    def get_all(self) -> List[Message]:
+        return deepcopy(self._messages)
+
+    def get_last(self, n: int) -> List[Message]:
+        return deepcopy(self._messages[-n:])
+
+    def get_for_llm(self, include_system: bool = True) -> List[Dict]:
+        """获取供 LLM 使用的格式"""
+        msgs = self._messages
+        if not include_system:
+            msgs = [m for m in msgs if m.role != Role.SYSTEM]
+        return [m.to_dict() for m in msgs]
+
+    def get_system_messages(self) -> List[Message]:
+        return [m for m in self._messages if m.role == Role.SYSTEM]
+
+    def get_user_messages(self) -> List[Message]:
+        return [m for m in self._messages if m.role == Role.USER]
+
+    def get_last_user_message(self) -> Optional[Message]:
+        for m in reversed(self._messages):
+            if m.role == Role.USER:
+                return m
+        return None
+
+    # ── 修改 ──
+
+    def replace_last(self, message: Message) -> None:
+        if self._messages:
+            self._messages[-1] = deepcopy(message)
+        else:
+            self._messages.append(deepcopy(message))
+
+    def truncate(self, keep_last: int) -> None:
+        """保留最后 keep_last 条非系统消息，系统消息始终保留"""
+        if keep_last <= 0:
+            self._messages = self.get_system_messages()
+            return
+        system_msgs = self.get_system_messages()
+        other_msgs = [m for m in self._messages if m.role != Role.SYSTEM]
+        if len(other_msgs) > keep_last:
+            other_msgs = other_msgs[-keep_last:]
+        self._messages = system_msgs + other_msgs
+
+    def clear(self) -> None:
+        self._messages = []
+
+    def remove_last(self) -> Optional[Message]:
+        if self._messages:
+            return self._messages.pop()
+        return None
+
+    # ── 自动截断 ──
+
+    def _truncate_if_needed(self) -> None:
+        if self._max_messages:
+            system_count = len(self.get_system_messages())
+            max_others = self._max_messages - system_count
+            if max_others > 0 and len(self._messages) > self._max_messages:
+                system_msgs = self.get_system_messages()
+                other_msgs = [m for m in self._messages if m.role != Role.SYSTEM]
+                if len(other_msgs) > max_others:
+                    other_msgs = other_msgs[-max_others:]
+                self._messages = system_msgs + other_msgs
+
+        if self._max_tokens and self.estimate_tokens() > self._max_tokens:
+            self._truncate_by_tokens()
+
+    def _truncate_by_tokens(self) -> None:
+        system_msgs = self.get_system_messages()
+        other_msgs = [m for m in self._messages if m.role != Role.SYSTEM]
+        kept_others = []
+        current_tokens = self._count_tokens_messages(system_msgs)
+        for msg in reversed(other_msgs):
+            msg_tokens = self._estimate_message_tokens(msg)
+            if current_tokens + msg_tokens <= self._max_tokens:
+                kept_others.insert(0, msg)
+                current_tokens += msg_tokens
+            else:
+                break
+        self._messages = system_msgs + kept_others
+
+    # ── Token 估算 ──
+
+    def estimate_tokens(self) -> int:
+        return self._count_tokens_messages(self._messages)
+
+    def _count_tokens_messages(self, messages: List[Message]) -> int:
+        return sum(self._estimate_message_tokens(m) for m in messages)
+
+    def _estimate_message_tokens(self, message: Message) -> int:
+        """
+        估算消息的 token 数（支持中文）
+
+        中文约 1.5 token/字，英文约 0.25 token/字符
+        比简单 len//4 更准确，尤其适合中文场景
+        """
+        import re
+        total_tokens = 0
+
+        if message.content:
+            chinese = len(re.findall(r'[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]', message.content))
+            other = len(message.content) - chinese
+            total_tokens += int(chinese * 1.5 + other * 0.25)
+
+        if message.tool_calls:
+            text = str(message.tool_calls)
+            chinese = len(re.findall(r'[\u4e00-\u9fff]', text))
+            other = len(text) - chinese
+            total_tokens += int(chinese * 1.5 + other * 0.25)
+
+        if message.name:
+            total_tokens += len(message.name) // 4
+
+        return total_tokens + 10  
+
+    def __len__(self) -> int:
+        return len(self._messages)
+
+    def __iter__(self) -> Iterator[Message]:
+        return iter(self._messages)
+
+    def __repr__(self) -> str:
+        return f"MessageList({len(self._messages)}条)"
+
+================================================================================
+# FILE: engine/session/__init__.py
+# LINES: 2
+================================================================================
+
+"""会话管理"""
+from .session import Session
+
+================================================================================
+# FILE: engine/session/manager.py
+# LINES: 181
+================================================================================
+
+"""
+会话管理器 - 管理多个会话的生命周期
+"""
+
+import logging
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+
+from .session import Session
+from ..storage.store import MessageStore
+from ..storage.file_store import FileMessageStore
+
+logger = logging.getLogger(__name__)
+
+class SessionManager:
+    """
+    会话管理器
+
+    负责：
+    - 创建/删除会话
+    - 保存/加载会话
+    - 切换当前会话
+    - 管理历史会话
+    """
+
+    def __init__(self, store: Optional[MessageStore] = None, storage_dir: str = "./sessions"):
+        """
+        Args:
+            store: 存储实例
+            storage_dir: 存储目录（如果使用默认文件存储）
+        """
+        self._store = store or FileMessageStore(storage_dir)
+        self._sessions: Dict[str, Session] = {}
+        self._current_session_id: Optional[str] = None
+
+    async def create_session(
+        self,
+        user_id: Optional[str] = None,
+        title: str = "",
+        metadata: Optional[Dict] = None,
+    ) -> Session:
+        """创建新会话"""
+        session = Session(
+            user_id=user_id,
+            title=title,
+            metadata=metadata or {},
+        )
+        self._sessions[session.session_id] = session
+        self._current_session_id = session.session_id
+
+        # 保存到存储
+        await self._store.save_session(session)
+
+        logger.info(f"Created session: {session.session_id}")
+        return session
+
+    async def get_session(self, session_id: str) -> Optional[Session]:
+        """获取会话（先从内存，再从存储加载）"""
+        # 先从内存获取
+        if session_id in self._sessions:
+            session = self._sessions[session_id]
+            session.touch()
+            return session
+
+        # 从存储加载
+        session = await self._store.load_session(session_id)
+        if session:
+            self._sessions[session_id] = session
+            logger.debug(f"Loaded session from storage: {session_id}")
+
+        return session
+
+    async def save_session(self, session: Session) -> None:
+        """保存会话"""
+        session.touch()
+        self._sessions[session.session_id] = session
+        await self._store.save_session(session)
+        logger.debug(f"Saved session: {session.session_id}")
+
+    async def delete_session(self, session_id: str) -> bool:
+        """删除会话"""
+        if session_id in self._sessions:
+            del self._sessions[session_id]
+
+        if self._current_session_id == session_id:
+            self._current_session_id = None
+
+        return await self._store.delete_session(session_id)
+
+    async def list_sessions(
+        self,
+        user_id: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """列出会话摘要"""
+        summaries = await self._store.list_sessions(user_id)
+
+        # 排序：最新的在前
+        summaries.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+
+        return summaries[offset:offset + limit]
+
+    async def get_or_create_session(
+        self,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        title: str = "",
+    ) -> Session:
+        """获取或创建会话"""
+        if session_id:
+            session = await self.get_session(session_id)
+            if session:
+                return session
+
+        return await self.create_session(user_id=user_id, title=title)
+
+    def set_current_session(self, session_id: str) -> bool:
+        """设置当前会话"""
+        if session_id in self._sessions:
+            self._current_session_id = session_id
+            return True
+        return False
+
+    def get_current_session(self) -> Optional[Session]:
+        """获取当前会话"""
+        if self._current_session_id:
+            return self._sessions.get(self._current_session_id)
+        return None
+
+    async def rename_session(self, session_id: str, new_title: str) -> bool:
+        """重命名会话"""
+        session = await self.get_session(session_id)
+        if not session:
+            return False
+
+        session.title = new_title
+        await self.save_session(session)
+        return True
+
+    async def archive_session(self, session_id: str) -> bool:
+        """归档会话"""
+        session = await self.get_session(session_id)
+        if not session:
+            return False
+
+        session.is_archived = True
+        await self.save_session(session)
+        return True
+
+    async def unarchive_session(self, session_id: str) -> bool:
+        """取消归档"""
+        session = await self.get_session(session_id)
+        if not session:
+            return False
+
+        session.is_archived = False
+        await self.save_session(session)
+        return True
+
+    async def clear_old_sessions(self, days: int = 30) -> int:
+        """清理旧会话"""
+        sessions = await self._store.list_sessions()
+
+        deleted = 0
+        for summary in sessions:
+            updated_at = datetime.fromisoformat(summary.get("updated_at", ""))
+            if (datetime.now() - updated_at).days > days:
+                if await self._store.delete_session(summary["session_id"]):
+                    deleted += 1
+                if summary["session_id"] in self._sessions:
+                    del self._sessions[summary["session_id"]]
+
+        logger.info(f"Cleared {deleted} old sessions")
+        return deleted
+
+    async def close(self) -> None:
+        """关闭管理器，保存所有会话"""
+        for session in self._sessions.values():
+            await self._store.save_session(session)
+        logger.info("SessionManager closed")
+
+================================================================================
+# FILE: engine/session/session.py
+# LINES: 125
+================================================================================
+
+"""
+会话实体定义（DAG 架构版）
+
+移除了 StateMachine 依赖，改用 DAG 执行上下文。
+"""
+
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field
+from datetime import datetime
+from uuid import uuid4
+
+from ..message.message_list import MessageList
+
+@dataclass
+class Session:
+    """会话实体"""
+
+    # 标识
+    session_id: str = field(default_factory=lambda: f"sess_{uuid4().hex[:12]}")
+
+    # 用户标识
+    user_id: Optional[str] = None
+
+    # 内容（DAG 版本：消息列表 + 可选检查点）
+    messages: MessageList = field(default_factory=MessageList)
+
+    # 检查点（用于 DAG 执行恢复）
+    checkpoint: Optional[Dict[str, Any]] = None
+    pending_approval: Optional[Dict[str, Any]] = None
+
+    # 元数据
+    title: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # 时间
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    last_accessed_at: datetime = field(default_factory=datetime.now)
+
+    # 状态
+    is_active: bool = True
+    is_archived: bool = False
+
+    def touch(self) -> None:
+        """更新访问时间"""
+        self.updated_at = datetime.now()
+        self.last_accessed_at = datetime.now()
+
+    def add_message(self, message: Any) -> None:
+        """添加消息"""
+        self.messages.add(message)
+        self.updated_at = datetime.now()
+
+    def add_user_message(self, content: str) -> None:
+        """添加用户消息"""
+        self.messages.add_user(content)
+        self.updated_at = datetime.now()
+
+    def add_assistant_message(self, content: str, tool_calls: Optional[List] = None) -> None:
+        """添加助手消息"""
+        self.messages.add_assistant(content, tool_calls)
+        self.updated_at = datetime.now()
+
+    def add_tool_message(self, call_id: str, content: str) -> None:
+        """添加工具消息"""
+        self.messages.add_tool(call_id, content)
+        self.updated_at = datetime.now()
+
+    def get_summary(self) -> Dict[str, Any]:
+        """获取会话摘要"""
+        return {
+            "session_id": self.session_id,
+            "user_id": self.user_id,
+            "title": self.title,
+            "message_count": len(self.messages),
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "last_accessed_at": self.last_accessed_at.isoformat(),
+            "is_active": self.is_active,
+            "is_archived": self.is_archived,
+            "has_checkpoint": self.checkpoint is not None,
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典（用于持久化）"""
+        return {
+            "session_id": self.session_id,
+            "user_id": self.user_id,
+            "messages": [msg.to_dict() for msg in self.messages.get_all()],
+            "checkpoint": self.checkpoint,
+            "pending_approval": self.pending_approval,
+            "title": self.title,
+            "metadata": self.metadata,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "last_accessed_at": self.last_accessed_at.isoformat(),
+            "is_active": self.is_active,
+            "is_archived": self.is_archived,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Session":
+        """从字典恢复"""
+        from ..core.types import Message
+
+        messages = MessageList()
+        for msg_data in data.get("messages", []):
+            messages.add(Message.from_dict(msg_data))
+
+        session = cls(
+            session_id=data.get("session_id"),
+            user_id=data.get("user_id"),
+            messages=messages,
+            checkpoint=data.get("checkpoint"),
+            pending_approval=data.get("pending_approval"),
+            title=data.get("title", ""),
+            metadata=data.get("metadata", {}),
+            created_at=datetime.fromisoformat(data["created_at"]) if data.get("created_at") else datetime.now(),
+            updated_at=datetime.fromisoformat(data["updated_at"]) if data.get("updated_at") else datetime.now(),
+            last_accessed_at=datetime.fromisoformat(data["last_accessed_at"]) if data.get("last_accessed_at") else datetime.now(),
+            is_active=data.get("is_active", True),
+            is_archived=data.get("is_archived", False),
+        )
+
+        return session
+
+================================================================================
+# FILE: engine/storage/__init__.py
+# LINES: 3
+================================================================================
+
+"""存储层"""
+from .store import MessageStore
+from .file_store import FileMessageStore
+
+================================================================================
+# FILE: engine/storage/file_store.py
+# LINES: 127
+================================================================================
+
+"""
+文件存储实现 - 使用 JSON 文件存储会话
+"""
+
+import json
+import os
+import logging
+from typing import Optional, Dict, Any, List
+from pathlib import Path
+
+from .store import MessageStore
+from ..session.session import Session
+
+logger = logging.getLogger(__name__)
+
+class FileMessageStore(MessageStore):
+    """基于文件的消息存储"""
+
+    def __init__(self, storage_dir: str = "./sessions"):
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+
+        # 索引文件
+        self.index_file = self.storage_dir / "index.json"
+        self._load_index()
+
+    def _load_index(self) -> None:
+        """加载索引"""
+        self._index: Dict[str, Dict] = {}
+        if self.index_file.exists():
+            try:
+                with open(self.index_file, "r") as f:
+                    self._index = json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to load index: {e}")
+                self._index = {}
+
+    def _save_index(self) -> None:
+        """保存索引"""
+        try:
+            with open(self.index_file, "w") as f:
+                json.dump(self._index, f, indent=2, default=str)
+        except Exception as e:
+            logger.error(f"Failed to save index: {e}")
+
+    def _get_session_path(self, session_id: str) -> Path:
+        """获取会话文件路径"""
+        return self.storage_dir / f"{session_id}.json"
+
+    async def save_session(self, session: Session) -> None:
+        """保存会话"""
+        session.touch()
+        data = session.to_dict()
+
+        file_path = self._get_session_path(session.session_id)
+        try:
+            with open(file_path, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+
+            # 更新索引
+            self._index[session.session_id] = {
+                "session_id": session.session_id,
+                "user_id": session.user_id,
+                "title": session.title,
+                "created_at": session.created_at.isoformat(),
+                "updated_at": session.updated_at.isoformat(),
+                "message_count": len(session.messages),
+                "is_archived": session.is_archived,
+            }
+            self._save_index()
+
+            logger.debug(f"Saved session: {session.session_id}")
+        except Exception as e:
+            logger.error(f"Failed to save session {session.session_id}: {e}")
+            raise
+
+    async def load_session(self, session_id: str) -> Optional[Session]:
+        """加载会话"""
+        file_path = self._get_session_path(session_id)
+        if not file_path.exists():
+            return None
+
+        try:
+            with open(file_path, "r") as f:
+                data = json.load(f)
+
+            session = Session.from_dict(data)
+            logger.debug(f"Loaded session: {session_id}")
+            return session
+        except Exception as e:
+            logger.error(f"Failed to load session {session_id}: {e}")
+            return None
+
+    async def delete_session(self, session_id: str) -> bool:
+        """删除会话"""
+        file_path = self._get_session_path(session_id)
+        if not file_path.exists():
+            return False
+
+        try:
+            file_path.unlink()
+            if session_id in self._index:
+                del self._index[session_id]
+                self._save_index()
+            logger.info(f"Deleted session: {session_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete session {session_id}: {e}")
+            return False
+
+    async def session_exists(self, session_id: str) -> bool:
+        """检查会话是否存在"""
+        return self._get_session_path(session_id).exists()
+
+    async def list_sessions(
+        self,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """列出会话摘要"""
+        sessions = list(self._index.values())
+
+        if user_id:
+            sessions = [s for s in sessions if s.get("user_id") == user_id]
+
+        sessions.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+
+        return sessions
+
+================================================================================
+# FILE: engine/storage/store.py
+# LINES: 39
+================================================================================
+
+"""
+存储抽象接口
+"""
+
+from abc import ABC, abstractmethod
+from typing import Optional, Dict, Any, List
+
+from ..session.session import Session
+
+class MessageStore(ABC):
+    """消息存储抽象接口"""
+
+    @abstractmethod
+    async def save_session(self, session: Session) -> None:
+        """保存会话"""
+        pass
+
+    @abstractmethod
+    async def load_session(self, session_id: str) -> Optional[Session]:
+        """加载会话"""
+        pass
+
+    @abstractmethod
+    async def delete_session(self, session_id: str) -> bool:
+        """删除会话"""
+        pass
+
+    @abstractmethod
+    async def session_exists(self, session_id: str) -> bool:
+        """检查会话是否存在"""
+        pass
+
+    @abstractmethod
+    async def list_sessions(
+        self,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """列出会话摘要"""
+        pass
+
+================================================================================
+# FILE: engine/tool/__init__.py
+# LINES: 5
+================================================================================
+
+"""工具系统"""
+from .base import BaseTool, ToolSchema, ToolParameter
+from .registry import ToolRegistry
+from .executor import ToolExecutor
+from .policy import ToolPolicy, AccessLevel
+
+================================================================================
+# FILE: engine/tool/base.py
+# LINES: 150
+================================================================================
+
+"""
+工具基类 - 所有工具必须继承
+"""
+
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+
+from ..core.types import ToolResult
+
+@dataclass
+class ToolParameter:
+    """工具参数定义"""
+    name: str
+    type: str
+    description: str
+    required: bool = False
+    default: Optional[Any] = None
+    enum: Optional[List[Any]] = None
+
+    def to_openai_schema(self) -> Dict:
+        schema = {"type": self.type, "description": self.description}
+        if self.enum:
+            schema["enum"] = self.enum
+        if self.default is not None:
+            schema["default"] = self.default
+        return schema
+
+@dataclass
+class ToolSchema:
+    """工具完整 Schema"""
+    name: str
+    description: str
+    parameters: List[ToolParameter] = field(default_factory=list)
+
+    def to_openai_tool(self) -> Dict:
+        properties = {}
+        required = []
+        for param in self.parameters:
+            properties[param.name] = param.to_openai_schema()
+            if param.required:
+                required.append(param.name)
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                }
+            }
+        }
+
+class BaseTool(ABC):
+    """工具基类"""
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """工具名称"""
+        ...
+
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """工具描述"""
+        ...
+
+    @property
+    @abstractmethod
+    def parameters(self) -> List[ToolParameter]:
+        """参数列表"""
+        ...
+
+    def get_schema(self) -> ToolSchema:
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            parameters=self.parameters,
+        )
+
+    @abstractmethod
+    async def execute(self, call_id: str, **kwargs) -> ToolResult:
+        """执行工具，call_id 由框架传入"""
+        ...
+
+    def validate_args(self, args: Dict[str, Any]) -> tuple[bool, Optional[str]]:
+        """验证参数，返回 (是否通过, 错误信息)"""
+        missing = []
+        type_errors = []
+
+        for param in self.parameters:
+            if param.required and param.name not in args:
+                missing.append(param.name)
+                continue
+
+            if param.name in args:
+                value = args[param.name]
+
+                if param.type == "string" and not isinstance(value, str):
+                    type_errors.append(
+                        f"参数 '{param.name}' 必须是字符串，当前是 {type(value).__name__}"
+                    )
+                elif param.type == "number" and not isinstance(value, (int, float)):
+                    type_errors.append(
+                        f"参数 '{param.name}' 必须是数字，当前是 {type(value).__name__}"
+                    )
+                elif param.type == "boolean" and not isinstance(value, bool):
+                    type_errors.append(
+                        f"参数 '{param.name}' 必须是布尔值，当前是 {type(value).__name__}"
+                    )
+
+                if param.enum and value not in param.enum:
+                    type_errors.append(
+                        f"参数 '{param.name}' 必须是以下之一: {param.enum}"
+                    )
+
+        if missing:
+            return False, (
+                f"缺少必需参数: {', '.join(missing)}。\n"
+                f"请提供这些参数后重试。示例: {self._example_args(missing)}\n"
+                f"如果你不需要使用此工具，请直接给用户文字回答，"
+                f"无需重复调用工具。"
+            )
+
+        if type_errors:
+            return False, "; ".join(type_errors)
+
+        return True, None
+
+    def _example_args(self, missing: List[str]) -> str:
+        """为缺失参数生成调用示例"""
+        examples = []
+        for name in missing:
+            for p in self.parameters:
+                if p.name == name:
+                    if p.type == "string":
+                        examples.append(f'{name}="示例值"')
+                    elif p.type == "number":
+                        examples.append(f'{name}=0')
+                    elif p.type == "boolean":
+                        examples.append(f'{name}=true')
+                    elif p.enum:
+                        examples.append(f'{name}="{p.enum[0]}"')
+                    else:
+                        examples.append(f'{name}=...')
+                    break
+        return "{" + ", ".join(examples) + "}"
+
+================================================================================
+# FILE: engine/tool/executor.py
+# LINES: 104
+================================================================================
+
+"""
+工具执行器 - 执行工具调用
+（懒加载触发点：这里调用 registry.get() 时才实例化）
+"""
+import asyncio
+import logging
+from typing import List, Optional
+
+from ..core.types import ToolCall, ToolResult
+from .registry import ToolRegistry
+from .policy import ToolPolicy, AccessLevel
+
+logger = logging.getLogger("ToolExecutor")
+
+class ToolExecutor:
+    """工具执行器（带超时控制 + 权限策略）"""
+
+    def __init__(self, registry: Optional[ToolRegistry] = None,
+                 default_timeout: float = 30.0,
+                 policy: Optional[ToolPolicy] = None):
+        self.registry = registry or ToolRegistry()
+        self._max_parallel = 10
+        self._default_timeout = default_timeout
+        self.policy = policy
+
+    def set_max_parallel(self, max_parallel: int) -> None:
+        self._max_parallel = max_parallel
+
+    async def execute_one(self, call: ToolCall, timeout: Optional[float] = None) -> ToolResult:
+        """执行单个工具调用（带超时控制 + 权限检查）"""
+        # ── 权限检查 ──
+        if self.policy:
+            access = self.policy.check(call.name, call.id)
+            if access == AccessLevel.DENY:
+                return ToolResult.error(
+                    call.id, call.name,
+                    f"工具 '{call.name}' 已被禁止执行"
+                )
+            elif access == AccessLevel.REQUIRE_APPROVAL:
+                # 挂起等待人类审批
+                logger.warning(f"⏸️ 工具 '{call.name}' 等待审批 (call_id={call.id[:12]})")
+                return ToolResult.error(
+                    call.id, call.name,
+                    f"工具 '{call.name}' 需要人类审批才能执行"
+                )
+
+        tool = self.registry.get(call.name)
+
+        if not tool:
+            return ToolResult.error(
+                call.id, call.name,
+                f"工具 '{call.name}' 未注册"
+            )
+
+        is_valid, error_msg = tool.validate_args(call.arguments)
+        if not is_valid:
+            return ToolResult.error(call.id, call.name, error_msg or "参数无效")
+
+        try:
+            timeout_val = timeout if timeout is not None else self._default_timeout
+            logger.debug(f"执行工具: {call.name} (超时: {timeout_val}s)")
+            result = await asyncio.wait_for(
+                tool.execute(call.id, **call.arguments),
+                timeout=timeout_val
+            )
+            return result
+        except asyncio.TimeoutError:
+            return ToolResult.error(
+                call.id, call.name,
+                f"工具执行超时 ({timeout_val}s)"
+            )
+        except Exception as e:
+            logger.exception(f"工具 {call.name} 异常: {e}")
+            return ToolResult.error(call.id, call.name, str(e))
+
+    async def execute_parallel(
+        self,
+        calls: List[ToolCall],
+        timeout: Optional[float] = None,
+    ) -> List[ToolResult]:
+        """并行执行多个工具（带超时）"""
+        if not calls:
+            return []
+
+        semaphore = asyncio.Semaphore(self._max_parallel)
+
+        async def execute_with_limit(call: ToolCall):
+            async with semaphore:
+                return await self.execute_one(call, timeout=timeout)
+
+        results = await asyncio.gather(
+            *[execute_with_limit(c) for c in calls],
+            return_exceptions=True
+        )
+
+        final_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                final_results.append(
+                    ToolResult.error(calls[i].id, calls[i].name, str(result))
+                )
+            else:
+                final_results.append(result)
+        return final_results
+
+================================================================================
+# FILE: engine/tool/policy.py
+# LINES: 104
+================================================================================
+
+"""
+tool/policy.py — 工具权限策略
+
+定义工具的访问控制：
+- ALLOW: 无条件允许
+- DENY: 无条件拒绝
+- REQUIRE_APPROVAL: 需要人类审批
+
+使用方式：
+    policy = ToolPolicy()
+    policy.set("shell_execute", AccessLevel.REQUIRE_APPROVAL)
+    policy.set("file_write", AccessLevel.REQUIRE_APPROVAL)
+
+    executor = ToolExecutor(registry, policy=policy)
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+from enum import Enum
+import logging
+
+logger = logging.getLogger(__name__)
+
+class AccessLevel(Enum):
+    ALLOW = "allow"
+    DENY = "deny"
+    REQUIRE_APPROVAL = "require_approval"
+
+DEFAULT_POLICY: Dict[str, AccessLevel] = {
+    # Shell — 默认禁止，需显式授权
+    "shell_execute": AccessLevel.DENY,
+
+    # 文件写操作 — 默认需审批
+    "file_write": AccessLevel.REQUIRE_APPROVAL,
+
+    # 进程管理 — 默认禁止
+    "process_list": AccessLevel.DENY,
+
+    # Git 写操作 — 默认需审批
+    "git_commit": AccessLevel.REQUIRE_APPROVAL,
+    "git_push": AccessLevel.REQUIRE_APPROVAL,
+
+    # 其余工具默认 allow
+}
+
+@dataclass
+class ToolPolicy:
+    """
+    工具权限策略
+
+    支持规则的动态添加和查询。
+    approve() 和 deny() 用于在运行时临时覆盖（如人类确认后）。
+    """
+
+    _rules: Dict[str, AccessLevel] = field(default_factory=lambda: dict(DEFAULT_POLICY))
+    _pending_approvals: Dict[str, str] = field(default_factory=dict)  # tool_name -> call_id
+
+    def get(self, tool_name: str) -> AccessLevel:
+        """获取工具的访问级别"""
+        return self._rules.get(tool_name, AccessLevel.ALLOW)
+
+    def set(self, tool_name: str, level: AccessLevel) -> None:
+        """设置工具的访问级别"""
+        self._rules[tool_name] = level
+        logger.info(f"策略: {tool_name} -> {level.value}")
+
+    def check(self, tool_name: str, call_id: str = "") -> AccessLevel:
+        """
+        检查工具是否允许执行
+
+        Returns:
+            AccessLevel: ALLOW / DENY / REQUIRE_APPROVAL
+        """
+        level = self.get(tool_name)
+
+        if level == AccessLevel.DENY:
+            logger.warning(f"🔒 工具被禁止: {tool_name}")
+        elif level == AccessLevel.REQUIRE_APPROVAL:
+            self._pending_approvals[call_id] = tool_name
+            logger.info(f"📝 需要审批: {tool_name} (call_id={call_id[:12]})")
+
+        return level
+
+    def approve(self, call_id: str) -> bool:
+        """批准一个待审批的调用"""
+        if call_id in self._pending_approvals:
+            tool_name = self._pending_approvals.pop(call_id)
+            logger.info(f"✅ 已批准: {tool_name}")
+            return True
+        return False
+
+    def deny(self, call_id: str) -> bool:
+        """拒绝一个待审批的调用"""
+        if call_id in self._pending_approvals:
+            tool_name = self._pending_approvals.pop(call_id)
+            logger.info(f"❌ 已拒绝: {tool_name}")
+            return True
+        return False
+
+    def reset(self) -> None:
+        """重置为默认策略"""
+        self._rules = dict(DEFAULT_POLICY)
+        self._pending_approvals.clear()
+        logger.info("策略已重置为默认值")
+
+================================================================================
+# FILE: engine/tool/registry.py
+# LINES: 206
+================================================================================
+
+"""
+工具注册中心 - 纯懒加载模式
+"""
+import logging
+from typing import Dict, Optional, List, Type, Any, Callable
+from threading import Lock
+
+from .base import BaseTool, ToolSchema
+
+logger = logging.getLogger("ToolRegistry")
+
+class ToolRegistry:
+    """
+    工具注册中心 - 纯懒加载
+
+    设计原则：
+    1. 注册时只存类 + 初始化参数，不实例化
+    2. 获取 Schema 时，临时实例化获取元数据后即可丢弃
+    3. 真正执行时，实例化并缓存
+    4. 线程安全
+    """
+
+    _instance: Optional["ToolRegistry"] = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+
+        # 工具类注册表: {name: (tool_class, init_kwargs)}
+        self._registry: Dict[str, tuple] = {}
+
+        # 实例缓存: {name: tool_instance}
+        self._cache: Dict[str, BaseTool] = {}
+
+        # Schema 缓存: {name: ToolSchema}
+        self._schema_cache: Dict[str, ToolSchema] = {}
+
+        # 线程锁
+        self._lock = Lock()
+
+        self._initialized = True
+        logger.debug("ToolRegistry 初始化（纯懒加载模式）")
+
+    # ========== 注册（只存类，不实例化） ==========
+
+    def register(self, tool_class: Type[BaseTool], **init_kwargs) -> "ToolRegistry":
+        """
+        注册工具类（懒加载）
+
+        Args:
+            tool_class: 工具类（BaseTool 子类）
+            **init_kwargs: 初始化参数
+
+        Returns:
+            self
+        """
+        with self._lock:
+            try:
+                temp = tool_class(**init_kwargs)
+                name = temp.name
+            except Exception as e:
+                logger.error(f"获取工具名称失败: {tool_class.__name__}: {e}")
+                return self
+
+            if name in self._registry:
+                logger.warning(f"工具 '{name}' 已注册，将被覆盖")
+
+            self._registry[name] = (tool_class, dict(init_kwargs))
+            self._cache.pop(name, None)
+            self._schema_cache.pop(name, None)
+
+            logger.debug(f"注册工具类: {name} (懒加载)")
+        return self
+
+    def register_many(self, tool_classes: List[Type[BaseTool]]) -> "ToolRegistry":
+        """批量注册工具类"""
+        for tc in tool_classes:
+            self.register(tc)
+        return self
+
+    def register_with_config(
+        self,
+        tool_classes: Dict[Type[BaseTool], Dict[str, Any]]
+    ) -> "ToolRegistry":
+        """注册工具类并带配置"""
+        for tc, kwargs in tool_classes.items():
+            self.register(tc, **kwargs)
+        return self
+
+    # ========== 获取 Schema（轻量，临时实例化） ==========
+
+    def get_schema(self, name: str) -> Optional[ToolSchema]:
+        """获取单个工具的 Schema"""
+        if name in self._schema_cache:
+            return self._schema_cache[name]
+
+        if name in self._cache:
+            schema = self._cache[name].get_schema()
+            self._schema_cache[name] = schema
+            return schema
+
+        if name in self._registry:
+            tool_class, init_kwargs = self._registry[name]
+            try:
+                temp = tool_class(**init_kwargs)
+                schema = temp.get_schema()
+                self._schema_cache[name] = schema
+                return schema
+            except Exception as e:
+                logger.error(f"获取 Schema 失败: {name}: {e}")
+                return None
+
+        return None
+
+    def get_all_schemas(self) -> List[ToolSchema]:
+        """获取所有工具的 Schema（用于发送给 LLM）"""
+        schemas = []
+        for name in list(self._registry.keys()):
+            schema = self.get_schema(name)
+            if schema:
+                schemas.append(schema)
+        return schemas
+
+    def get_openai_tools(self) -> List[Dict]:
+        """获取 OpenAI 格式的工具列表"""
+        return [schema.to_openai_tool() for schema in self.get_all_schemas()]
+
+    # ========== 获取实例（真正使用时才实例化并缓存） ==========
+
+    def get(self, name: str) -> Optional[BaseTool]:
+        """获取工具实例（懒加载：首次调用才实例化）"""
+        if name in self._cache:
+            logger.debug(f"从缓存获取: {name}")
+            return self._cache[name]
+
+        if name in self._registry:
+            tool_class, init_kwargs = self._registry[name]
+            try:
+                logger.debug(f"懒加载实例化: {name}")
+                tool = tool_class(**init_kwargs)
+                self._cache[name] = tool
+                self._schema_cache[name] = tool.get_schema()
+                return tool
+            except Exception as e:
+                logger.error(f"实例化失败: {name}: {e}")
+                return None
+
+        return None
+
+    # ========== 查询 ==========
+
+    def list_tools(self) -> List[str]:
+        """列出所有注册的工具名称"""
+        return list(self._registry.keys())
+
+    def has_tool(self, name: str) -> bool:
+        return name in self._registry
+
+    def count(self) -> int:
+        return len(self._registry)
+
+    def cached_count(self) -> int:
+        return len(self._cache)
+
+    def get_status(self) -> Dict:
+        return {
+            "registered": self.count(),
+            "cached": self.cached_count(),
+            "lazy_pending": self.count() - self.cached_count(),
+            "tool_names": self.list_tools(),
+            "cached_names": list(self._cache.keys()),
+        }
+
+    def remove(self, name: str) -> bool:
+        with self._lock:
+            self._registry.pop(name, None)
+            self._cache.pop(name, None)
+            self._schema_cache.pop(name, None)
+            return name not in self._registry
+
+    def clear_cache(self) -> None:
+        with self._lock:
+            count = len(self._cache)
+            self._cache.clear()
+            self._schema_cache.clear()
+            logger.debug(f"清除 {count} 个工具实例缓存")
+
+    def clear(self) -> "ToolRegistry":
+        with self._lock:
+            self._registry.clear()
+            self._cache.clear()
+            self._schema_cache.clear()
+        return self
+
+    def print_summary(self) -> None:
+        status = self.get_status()
+        logger.info(f"工具注册摘要: {status['registered']} 个注册, {status['cached']} 个已实例化, {status['lazy_pending']} 个待懒加载")
+        for name in sorted(self.list_tools()):
+            state = "✅ 已缓存" if name in self._cache else "💤 懒加载"
+            logger.info(f"  {state} {name}")
+

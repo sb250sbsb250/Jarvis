@@ -1,0 +1,2952 @@
+================================================================================
+# FILE: engine/__init__.py
+# LINES: 60
+================================================================================
+
+"""
+Jarvis V3 Engine — DAG 执行图架构
+
+核心设计：
+  状态机 → 执行图 (WorkflowGraph)
+  隐式行为 → 显式节点 (Node + 端口)
+  全局 context → 显式数据流
+  线性循环 → 任意 DAG 拓扑 + 并行
+"""
+
+from .dag import (
+
+    Node, NodeInput, NodeOutput,
+    LLMNode, ToolNode, RouterNode, ParallelNode,
+    HumanInLoopNode, MapNode, ToolDispatchNode,
+
+    Edge, ConditionalEdge,
+
+    WorkflowGraph,
+
+    ExecutionContext, NodeTrace,
+
+    GraphExecutor, HumanInterruptError,
+
+    AgentGraphBuilder,
+)
+
+from .llm_client import LLMClient
+from .tool.registry import ToolRegistry
+from .tool.base import BaseTool, ToolSchema, ToolParameter
+from .tool.executor import ToolExecutor
+from .tool.policy import ToolPolicy, AccessLevel
+from .message.message_list import MessageList
+from .session.session import Session
+from .core.types import Message, ToolCall, ToolResult, Role
+from .core.errors import (
+    EngineError, ToolNotFoundError, ToolExecutionError,
+    LoopTimeoutError, MaxRetriesExceededError,
+)
+from .storage.file_store import FileMessageStore
+from .storage.store import MessageStore
+
+__all__ = [
+
+    "Node", "NodeInput", "NodeOutput",
+    "LLMNode", "ToolNode", "RouterNode", "ParallelNode",
+    "HumanInLoopNode", "MapNode", "ToolDispatchNode",
+    "Edge", "ConditionalEdge",
+    "WorkflowGraph",
+    "ExecutionContext", "NodeTrace",
+    "GraphExecutor", "HumanInterruptError",
+    "AgentGraphBuilder",
+
+    "LLMClient", "ToolRegistry",
+    "BaseTool", "ToolSchema", "ToolParameter",
+    "ToolExecutor", "ToolPolicy", "AccessLevel",
+    "MessageList", "Session",
+    "Message", "ToolCall", "ToolResult", "Role",
+    "EngineError", "ToolNotFoundError", "ToolExecutionError",
+]
+
+================================================================================
+# FILE: engine/core/__init__.py
+# LINES: 6
+================================================================================
+
+"""核心类型和错误定义"""
+from .types import Message, ToolCall, ToolResult, Role
+from .errors import (
+    EngineError, ToolNotFoundError, ToolExecutionError,
+    LoopTimeoutError, MaxRetriesExceededError,
+)
+
+================================================================================
+# FILE: engine/core/errors.py
+# LINES: 35
+================================================================================
+
+"""
+core/errors.py — 自定义异常定义
+"""
+
+class EngineError(Exception):
+    """引擎基础异常"""
+    pass
+
+class ToolNotFoundError(EngineError):
+    """工具未找到"""
+    pass
+
+class ToolExecutionError(EngineError):
+    """工具执行失败"""
+    pass
+
+class InvalidStateTransitionError(EngineError):
+    """非法状态转换"""
+    pass
+
+class LoopTimeoutError(EngineError):
+    """循环超时"""
+    pass
+
+class MaxRetriesExceededError(EngineError):
+    """超过最大重试次数"""
+    pass
+
+class SessionNotFoundError(EngineError):
+    """会话未找到"""
+    pass
+
+class MessageLimitExceededError(EngineError):
+    """消息数量超限"""
+    pass
+
+================================================================================
+# FILE: engine/core/types.py
+# LINES: 183
+================================================================================
+
+"""
+core/types.py — 核心类型定义
+
+被所有模块依赖的基础类型。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional, Union
+from uuid import uuid4
+
+class Role(str, Enum):
+    """消息角色"""
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+
+@dataclass
+class ToolCall:
+    """工具调用定义"""
+    id: str
+    name: str
+    arguments: Dict[str, Any]
+
+    @classmethod
+    def create(cls, name: str, arguments: Dict[str, Any]) -> "ToolCall":
+        return cls(id=f"call_{uuid4().hex[:8]}", name=name, arguments=arguments)
+
+    def to_openai_format(self) -> Dict:
+        """转换为 OpenAI 格式"""
+        import json
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": json.dumps(self.arguments),
+            }
+        }
+
+    @classmethod
+    def from_openai_format(cls, data: Dict) -> "ToolCall":
+        """从 OpenAI 格式解析"""
+        import json
+        function = data.get("function", {})
+        raw_args = function.get("arguments", "{}")
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                args = {}
+        else:
+            args = raw_args
+        return cls(
+            id=data.get("id", ""),
+            name=function.get("name", ""),
+            arguments=args,
+        )
+
+class ToolResultStatus(str, Enum):
+    """工具执行结果状态"""
+    SUCCESS = "success"
+    ERROR = "error"
+    RETRY = "retry"
+
+@dataclass
+class ToolResult:
+    """工具执行结果"""
+    call_id: str
+    tool_name: str
+    status: ToolResultStatus
+    content: Any
+    error_message: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def success(cls, call_id: str, tool_name: str, content: Any, **metadata) -> "ToolResult":
+        return cls(
+            call_id=call_id,
+            tool_name=tool_name,
+            status=ToolResultStatus.SUCCESS,
+            content=content,
+            metadata=metadata,
+        )
+
+    @classmethod
+    def error(cls, call_id: str, tool_name: str, error_message: str, **metadata) -> "ToolResult":
+        return cls(
+            call_id=call_id,
+            tool_name=tool_name,
+            status=ToolResultStatus.ERROR,
+            content=None,
+            error_message=error_message,
+            metadata=metadata,
+        )
+
+    @classmethod
+    def retry(cls, call_id: str, tool_name: str, error_message: str, **metadata) -> "ToolResult":
+        return cls(
+            call_id=call_id,
+            tool_name=tool_name,
+            status=ToolResultStatus.RETRY,
+            content=None,
+            error_message=error_message,
+            metadata=metadata,
+        )
+
+    def is_success(self) -> bool:
+        return self.status == ToolResultStatus.SUCCESS
+
+    def is_error(self) -> bool:
+        return self.status == ToolResultStatus.ERROR
+
+    def is_retry(self) -> bool:
+        return self.status == ToolResultStatus.RETRY
+
+@dataclass
+class Message:
+    """消息实体"""
+    role: Role
+    content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+
+    def to_dict(self) -> Dict:
+        """转换为字典（OpenAI 兼容格式）"""
+        result = {"role": self.role.value}
+        if self.content is not None:
+            result["content"] = self.content
+        if self.tool_calls:
+            result["tool_calls"] = [
+                tc.to_openai_format() if hasattr(tc, 'to_openai_format')
+                else tc  # 兼容原始 dict（从序列化恢复或外部传入）
+                for tc in self.tool_calls
+            ]
+        if self.tool_call_id:
+            result["tool_call_id"] = self.tool_call_id
+        if self.name:
+            result["name"] = self.name
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "Message":
+        """从字典创建"""
+        tool_calls = None
+        if "tool_calls" in data and data["tool_calls"]:
+            tool_calls = [ToolCall.from_openai_format(tc) for tc in data["tool_calls"]]
+        return cls(
+            role=Role(data.get("role", "user")),
+            content=data.get("content"),
+            tool_calls=tool_calls,
+            tool_call_id=data.get("tool_call_id"),
+            name=data.get("name"),
+        )
+
+    @classmethod
+    def user(cls, content: str) -> "Message":
+        return cls(role=Role.USER, content=content)
+
+    @classmethod
+    def assistant(cls, content: str, tool_calls: Optional[List] = None) -> "Message":
+        """创建助手消息，自动将原始 dict 转换为 ToolCall 对象"""
+        if tool_calls:
+            converted = []
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    converted.append(ToolCall.from_openai_format(tc))
+                else:
+                    converted.append(tc)
+            tool_calls = converted
+        return cls(role=Role.ASSISTANT, content=content, tool_calls=tool_calls)
+
+    @classmethod
+    def tool(cls, call_id: str, content: str) -> "Message":
+        return cls(role=Role.TOOL, tool_call_id=call_id, content=content)
+
+    @classmethod
+    def system(cls, content: str) -> "Message":
+        return cls(role=Role.SYSTEM, content=content)
+
+================================================================================
+# FILE: engine/dag/__init__.py
+# LINES: 21
+================================================================================
+
+"""
+DAG 执行图架构 - Jarvis V3 核心引擎
+
+采用 Node + Edge 的 DAG 执行模型替代传统状态机。
+"""
+
+from .node import (
+    Node, NodeInput, NodeOutput,
+    ToolNode, LLMNode, RouterNode, ParallelNode,
+    HumanInLoopNode, MapNode, ToolDispatchNode,
+    ListFilesNode, FileProcessorNode, FileRenameNode,
+    CodeSearchNode, CodeEditorNode,
+)
+from .edge import Edge, ConditionalEdge
+from .graph import WorkflowGraph
+from .context import ExecutionContext, NodeTrace, ExecutionContextConfig
+from .tracer import AgentTracer, TraceSpan, tracer as global_tracer
+from .executor import GraphExecutor, HumanInterruptError
+from .builder import AgentGraphBuilder
+from .compiler import GraphCompiler, CompiledGraph, compile_graph
+from .planner import DAGPlanner, DAGFactory, describe_tools
+
+================================================================================
+# FILE: engine/dag/batch_processors.py
+# LINES: 75
+================================================================================
+
+"""
+batch_processors.py — 文件级处理器注册中心
+
+提供可注册的文件处理函数，供 MapNode + FileProcessorNode 调度。
+每个处理器接收一个文件路径，返回结构化结果 dict。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Callable, Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+# ── 处理器注册表 ──
+
+_PROCESSORS: Dict[str, Callable[[str], Optional[Dict[str, Any]]]] = {}
+
+def register_processor(name: str) -> Callable:
+    """装饰器：注册一个文件处理器"""
+    def decorator(fn: Callable[[str], Optional[Dict[str, Any]]]):
+        _PROCESSORS[name] = fn
+        logger.info(f"[processors] 注册处理器: {name}")
+        return fn
+    return decorator
+
+def get_processor(name: str) -> Optional[Callable[[str], Optional[Dict[str, Any]]]]:
+    """获取已注册的处理器"""
+    return _PROCESSORS.get(name)
+
+def list_processors() -> Dict[str, str]:
+    """列出所有已注册的处理器（名称 + 文档）"""
+    return {
+        name: (fn.__doc__ or "").strip()[:100]
+        for name, fn in _PROCESSORS.items()
+    }
+
+# ══════════════════════════════════════
+#  内置默认处理器
+# ══════════════════════════════════════
+
+@register_processor("file_exists")
+def _check_file_exists(file_path: str) -> Optional[Dict[str, Any]]:
+    """检查文件是否存在并返回基本信息"""
+    if not os.path.exists(file_path):
+        return None
+    stat = os.stat(file_path)
+    return {
+        "file_name": os.path.basename(file_path),
+        "file_size": stat.st_size,
+        "last_modified": stat.st_mtime,
+        "is_file": os.path.isfile(file_path),
+        "is_dir": os.path.isdir(file_path),
+    }
+
+@register_processor("text_analyzer")
+def _text_analyzer(file_path: str) -> Optional[Dict[str, Any]]:
+    """分析文本文件：字数、行数、字符统计"""
+    if not os.path.isfile(file_path):
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        lines = content.splitlines()
+        return {
+            "file_name": os.path.basename(file_path),
+            "char_count": len(content),
+            "line_count": len(lines),
+            "word_count": len(content.split()),
+            "preview": content[:200],
+        }
+    except Exception as e:
+        logger.warning(f"[text_analyzer] 读取失败 {file_path}: {e}")
+        return None
+
+================================================================================
+# FILE: engine/dag/builder.py
+# LINES: 509
+================================================================================
+
+"""
+dag/builder.py — Agent 图构建器
+
+提供高级 API 来构建常用 Agent DAG：
+  - standard_agent:  标准「思考→路由→执行→反思」循环
+  - simple_agent:    单次 LLM 调用（无工具）
+  - react_agent:     ReAct 模式（思考→行动→观察→思考...）
+  - plan_execute:    规划→批量执行→验证
+  - self_reflection: 生成→自评→修正→生成...
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Callable, Dict, List, Optional
+
+from .node import (
+    Node, LLMNode, ToolNode, RouterNode, ToolDispatchNode,
+    ListFilesNode, FileProcessorNode, FileRenameNode, MapNode,
+    CodeSearchNode, CodeEditorNode, HumanInLoopNode,
+)
+from .edge import Edge, ConditionalEdge
+from .graph import WorkflowGraph
+from ..message.message_list import MessageList
+from .batch_processors import get_processor, list_processors
+
+logger = logging.getLogger(__name__)
+
+class AgentGraphBuilder:
+    """
+    Agent 图构建器
+
+    提供预定义的 DAG 模板，同时支持自定义扩展。
+    """
+
+    def __init__(
+        self,
+        llm_client: Any,
+        tool_registry: Any,
+        system_prompt: str = "",
+        max_steps: int = 10,
+    ):
+        self.llm_client = llm_client
+        self.tool_registry = tool_registry
+        self.system_prompt = system_prompt
+        self.max_steps = max_steps
+
+    # ─────────────────────────────────────────
+    #  模板：标准 Agent 循环
+    # ─────────────────────────────────────────
+
+    def build_standard_agent(
+        self,
+        user_input: str = "",
+        history: Optional[MessageList] = None,
+    ) -> WorkflowGraph:
+        """
+        构建标准 Agent 循环图
+
+        流程:
+          think → router → [tools] → think (循环)
+                          → complete (出口)
+
+        think: LLM 调用
+        router: 判断 LLM 返回了 tool_calls 还是最终回答
+        tools: 自动为每个注册工具创建 ToolNode
+        complete: 输出最终回答
+        """
+        graph = WorkflowGraph("standard_agent")
+
+        think = LLMNode(name="think", system_prompt=self.system_prompt)
+        router = RouterNode(name="router", routes={
+            "executing": "tool_dispatch",
+            "completed": "complete",
+        })
+        dispatch = ToolDispatchNode(name="tool_dispatch")
+        tool_nodes = self._create_tool_nodes()
+        complete = LLMNode(name="complete", system_prompt=self.system_prompt)
+
+        graph.add_node(think)
+        graph.add_node(router)
+        graph.add_node(dispatch)
+        for tn in tool_nodes:
+            graph.add_node(tn)
+        graph.add_node(complete)
+
+        # 边（包含循环边标记）
+        graph.add_edge("think", "router")
+        graph.add_conditional_edge("router", "executing", "tool_dispatch")
+        graph.add_conditional_edge("router", "completed", "complete")
+
+        for tn in tool_nodes:
+            graph.add_edge(
+                "tool_dispatch", tn.name,
+                condition=lambda outputs, n=tn.tool_name: self._check_tool_condition(outputs, n),
+            )
+            edge = graph.add_edge(tn.name, "think")
+            graph.mark_as_loop_edge(edge)  # 标记为合法循环
+
+        graph.set_entry("think")
+        graph.set_exit("complete")
+        graph._meta = self._meta(user_input, history)
+        return graph
+
+    # ─────────────────────────────────────────
+    #  模板：单次 LLM 调用
+    # ─────────────────────────────────────────
+
+    def build_simple_agent(self) -> WorkflowGraph:
+        """简单 Agent：一次 LLM 调用直接返回"""
+        graph = WorkflowGraph("simple_agent")
+        think = LLMNode(name="think", system_prompt=self.system_prompt)
+        complete = LLMNode(name="complete", system_prompt=self.system_prompt)
+        graph.add_node(think)
+        graph.add_node(complete)
+        graph.add_edge("think", "complete")
+        graph.set_entry("think")
+        graph.set_exit("complete")
+        return graph
+
+    # ─────────────────────────────────────────
+    #  模板：ReAct Agent
+    # ─────────────────────────────────────────
+
+    def build_react_agent(
+        self,
+        user_input: str = "",
+        history: Optional[MessageList] = None,
+        max_iterations: int = 5,
+    ) -> WorkflowGraph:
+        """
+        构建 ReAct Agent
+
+        流程:
+          think → router → [tool_action] → observe → think (循环)
+                          → complete (出口)
+
+        与 standard_agent 的区别：
+        - 有 observe 节点专门汇总工具结果
+        - 显式区分"思考→行动→观察"每一步
+        """
+        graph = WorkflowGraph("react_agent")
+
+        think = LLMNode(name="think", system_prompt=self.system_prompt)
+        router = RouterNode(name="router", routes={
+            "executing": "tool_action",
+            "completed": "complete",
+        })
+        tool_action = ToolDispatchNode(name="tool_action")
+        tool_nodes = self._create_tool_nodes()
+        observe = LLMNode(
+            name="observe",
+            system_prompt="根据工具执行结果进行观察和总结，然后继续推理。",
+        )
+        complete = LLMNode(name="complete", system_prompt=self.system_prompt)
+
+        graph.add_node(think)
+        graph.add_node(router)
+        graph.add_node(tool_action)
+        for tn in tool_nodes:
+            graph.add_node(tn)
+        graph.add_node(observe)
+        graph.add_node(complete)
+
+        # 边
+        graph.add_edge("think", "router")
+        graph.add_conditional_edge("router", "executing", "tool_action")
+        graph.add_conditional_edge("router", "completed", "complete")
+
+        for tn in tool_nodes:
+            graph.add_edge(
+                "tool_action", tn.name,
+                condition=lambda outputs, n=tn.tool_name: self._check_tool_condition(outputs, n),
+            )
+            graph.add_edge(tn.name, "observe")
+
+        edge = graph.add_edge("observe", "think")
+        graph.mark_as_loop_edge(edge)
+
+        graph.set_entry("think")
+        graph.set_exit("complete")
+        graph._meta = self._meta(user_input, history, max_iterations=max_iterations)
+        return graph
+
+    # ─────────────────────────────────────────
+    #  模板：Plan-Execute
+    # ─────────────────────────────────────────
+
+    def build_plan_execute(
+        self,
+        user_input: str = "",
+        history: Optional[MessageList] = None,
+    ) -> WorkflowGraph:
+        """
+        构建 Plan-Execute Agent
+
+        流程:
+          plan → dispatch → [tool_1, tool_2, ...] → aggregate → verify
+              → [success] → complete
+              → [retry] → plan (重新规划)
+
+        plan: LLM 将需求拆解为多步计划
+        dispatch: 分发所有步骤到对应工具
+        aggregate: 汇总所有工具结果
+        verify: 检查执行结果是否符合预期
+        """
+        graph = WorkflowGraph("plan_execute")
+
+        plan = LLMNode(
+            name="plan",
+            system_prompt=self.system_prompt + (
+                "\n\n请将用户需求拆解为具体的执行步骤。"
+                "输出格式为可执行的 tool_calls 列表。"
+            ),
+        )
+        dispatch = ToolDispatchNode(name="dispatch")
+        tool_nodes = self._create_tool_nodes()
+        aggregate = LLMNode(
+            name="aggregate",
+            system_prompt="汇总所有工具的执行结果。",
+        )
+        verify = LLMNode(
+            name="verify",
+            system_prompt="验证所有工具执行结果是否符合预期。如果符合输出 success，否则输出 retry（附带原因）。",
+        )
+        plan_router = RouterNode(name="plan_router", routes={
+            "success": "complete",
+            "retry": "plan",
+        })
+        complete = LLMNode(name="complete", system_prompt=self.system_prompt)
+
+        graph.add_node(plan)
+        graph.add_node(dispatch)
+        for tn in tool_nodes:
+            graph.add_node(tn)
+        graph.add_node(aggregate)
+        graph.add_node(verify)
+        graph.add_node(plan_router)
+        graph.add_node(complete)
+
+        # 边
+        graph.add_edge("plan", "dispatch")
+        for tn in tool_nodes:
+            graph.add_edge(
+                "dispatch", tn.name,
+                condition=lambda outputs, n=tn.tool_name: self._check_tool_condition(outputs, n),
+            )
+            graph.add_edge(tn.name, "aggregate")
+        graph.add_edge("aggregate", "verify")
+        graph.add_edge("verify", "plan_router")
+        graph.add_conditional_edge("plan_router", "success", "complete")
+        edge = graph.add_conditional_edge("plan_router", "retry", "plan")
+        graph.mark_as_loop_edge(edge)
+
+        graph.set_entry("plan")
+        graph.set_exit("complete")
+        graph._meta = self._meta(user_input, history)
+        return graph
+
+    # ─────────────────────────────────────────
+    #  模板：Self-Reflection
+    # ─────────────────────────────────────────
+
+    def build_self_reflection(
+        self,
+        user_input: str = "",
+        history: Optional[MessageList] = None,
+        max_reflections: int = 3,
+    ) -> WorkflowGraph:
+        """
+        构建 Self-Reflection Agent
+
+        流程:
+          generate → reflect → [pass] → complete
+                              → [fail] → revise → generate (循环)
+
+        generate: 生成初始回答
+        reflect: 审查质量（输出 pass 或 fail + 修改建议）
+        revise: 根据反馈修改
+        complete: 输出最终结果
+        """
+        graph = WorkflowGraph("self_reflection")
+
+        generate = LLMNode(name="generate", system_prompt=self.system_prompt)
+        reflect = LLMNode(
+            name="reflect",
+            system_prompt=(
+                "请审查上一步的输出质量。从以下维度评估：\n"
+                "1. 准确性\n2. 完整性\n3. 清晰度\n\n"
+                "输出格式：\n"
+                "- 如果通过：pass\n"
+                "- 如果需要修改：fail（附带具体的修改建议）"
+            ),
+        )
+        revise = LLMNode(
+            name="revise",
+            system_prompt="根据反思中的修改建议改进输出。",
+        )
+        reflection_router = RouterNode(name="reflection_router", routes={
+            "pass": "complete",
+            "fail": "revise",
+        })
+        complete = LLMNode(name="complete", system_prompt=self.system_prompt)
+
+        graph.add_node(generate)
+        graph.add_node(reflect)
+        graph.add_node(revise)
+        graph.add_node(reflection_router)
+        graph.add_node(complete)
+
+        graph.add_edge("generate", "reflect")
+        graph.add_edge("reflect", "reflection_router")
+        graph.add_conditional_edge("reflection_router", "pass", "complete")
+        graph.add_conditional_edge("reflection_router", "fail", "revise")
+        edge = graph.add_edge("revise", "generate")
+        graph.mark_as_loop_edge(edge)
+
+        graph.set_entry("generate")
+        graph.set_exit("complete")
+        graph._meta = self._meta(user_input, history, max_reflections=max_reflections)
+        return graph
+
+    # ─────────────────────────────────────────
+    #  模板：代码编辑工作流
+    # ─────────────────────────────────────────
+
+    def build_code_edit_workflow(
+        self,
+        task_description: str = "",
+        base_dir: str = ".",
+    ) -> WorkflowGraph:
+        """
+        构建代码编辑工作流
+
+        自动生成:
+          search_code → editor → [human_review] → confirm
+
+        流程:
+          1. code_search: 搜索相关代码
+          2. editor: 读取/差异/编辑/回滚
+          3. human_review: 人工审查修改
+          4. confirm: 确认完成
+
+        Args:
+            task_description: 任务描述（元数据）
+            base_dir: 项目根目录
+        """
+        graph = WorkflowGraph("code_edit")
+
+        search = CodeSearchNode(name="search_code", base_dir=base_dir)
+        editor = CodeEditorNode(name="editor", base_dir=base_dir)
+        review = HumanInLoopNode(name="review_changes")
+        confirm = LLMNode(
+            name="confirm",
+            system_prompt="确认所有修改已完成。",
+        )
+
+        graph.add_node(search)
+        graph.add_node(editor)
+        graph.add_node(review)
+        graph.add_node(confirm)
+
+        graph.add_edge("search_code", "editor")
+        graph.add_edge("editor", "review_changes")
+        graph.add_edge("review_changes", "confirm")
+
+        graph.set_entry("search_code")
+        graph.set_exit("confirm")
+        graph._meta = self._meta(task_description)
+
+        return graph
+
+    # ─────────────────────────────────────────
+    #  内部帮助方法
+    # ─────────────────────────────────────────
+
+    def _create_tool_nodes(self) -> List[ToolNode]:
+        """为所有注册工具创建 ToolNode 列表"""
+        return [
+            ToolNode(name=f"tool_{name}", tool_name=name)
+            for name in self.tool_registry.list_tools()
+        ]
+
+    @staticmethod
+    def _check_tool_condition(outputs: dict, tool_name: str) -> bool:
+        """检查工具分发条件"""
+        route_val = outputs.get("route")
+        if hasattr(route_val, 'data'):
+            route_val = route_val.data
+        return str(route_val) == tool_name
+
+    # ─────────────────────────────────────────
+    #  模板：批量文件处理
+    # ─────────────────────────────────────────
+
+    def build_batch_process(
+        self,
+        folder_path: str = ".",
+        processor_name: str = "file_exists",
+        post_action: str = "rename",
+        file_patterns: str = ".jpg,.png,.pdf",
+        dry_run: bool = True,
+        max_parallel: int = 10,
+    ) -> WorkflowGraph:
+        """
+        构建批量文件处理 DAG
+
+        自动生成:
+          list_files → map(processor) → aggregate → [rename] → report
+
+        流程:
+          1. list_files: 列出目录中匹配的文件
+          2. map(processor): 对每个文件并行执行处理器
+          3. aggregate: 汇总所有结果
+          4. rename: 根据结果重命名文件（条件执行）
+          5. report: 生成总结报告
+
+        Args:
+            folder_path: 目标文件夹
+            processor_name: 已注册的处理器名称
+            post_action: 后置操作（"rename" / "none"）
+            file_patterns: 文件匹配模式，逗号分隔
+            dry_run: 试运行模式（不实际重命名）
+            max_parallel: 最大并行处理数
+        """
+        graph = WorkflowGraph(f"batch_{processor_name}")
+
+        # ── 获取处理器 ──
+        processor_func = get_processor(processor_name)
+        if processor_func is None:
+            available = list(list_processors().keys())
+            raise ValueError(
+                f"处理器 '{processor_name}' 未注册. "
+                f"可选: {available}"
+            )
+
+        # ── 节点定义 ──
+        list_files = ListFilesNode(name="list_files")
+
+        file_processor = FileProcessorNode(
+            name="process_file",
+            processor_func=processor_func,
+            timeout=120.0,
+        )
+
+        map_node = MapNode(
+            name="map_process",
+            sub_node=file_processor,
+            map_key="item",
+        )
+
+        aggregate = LLMNode(
+            name="aggregate_results",
+            system_prompt=(
+                "汇总所有文件处理结果，统计成功/失败数量，"
+                "列出关键信息（文件名、状态）。"
+            ),
+        )
+
+        rename = FileRenameNode(name="rename_files")
+
+        report = LLMNode(
+            name="generate_report",
+            system_prompt=self.system_prompt,
+        )
+
+        # ── 注册节点 ──
+        graph.add_node(list_files)
+        graph.add_node(map_node)
+        graph.add_node(aggregate)
+
+        if post_action == "rename":
+            graph.add_node(rename)
+
+        graph.add_node(report)
+
+        # ── 边 ──
+        graph.add_edge("list_files", "map_process")
+        graph.add_edge("map_process", "aggregate_results")
+
+        if post_action == "rename":
+            graph.add_edge("aggregate_results", "rename_files")
+            graph.add_edge("rename_files", "generate_report")
+        else:
+            graph.add_edge("aggregate_results", "generate_report")
+
+        graph.set_entry("list_files")
+        graph.set_exit("generate_report")
+
+        # ── 元数据 ──
+        graph._meta = {
+            "folder_path": folder_path,
+            "processor_name": processor_name,
+            "post_action": post_action,
+            "dry_run": dry_run,
+            "max_parallel": max_parallel,
+            "file_patterns": file_patterns,
+        }
+
+        return graph
+
+    @staticmethod
+    def _meta(user_input: str = "", history=None, **extra) -> dict:
+        """构建元数据字典"""
+        meta = {"user_input": user_input}
+        if history:
+            meta["history"] = history
+        meta.update(extra)
+        return meta
+
+================================================================================
+# FILE: engine/dag/compiler.py
+# LINES: 359
+================================================================================
+
+"""
+dag/compiler.py — DAG 图编译器
+
+编译时分析 DAG 结构，生成优化执行计划。
+
+四大优化：
+  1. 工具预取分析 — 提前识别需要加载的工具
+  2. 并行分组 — 自动发现可并行执行的节点组
+  3. 死代码消除 — 移除从入口不可达的节点
+  4. 纯函数链折叠 — 合并连续无副作用的节点（降低调度开销）
+
+编译器不修改原图，返回 CompiledGraph（含优化元数据）。
+GraphExecutor 在 _schedule_graph 前调用 compile() 获取计划。
+"""
+
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Set, Optional, Tuple, Any
+
+from .graph import WorkflowGraph
+from .edge import Edge, ConditionalEdge
+
+logger = logging.getLogger(__name__)
+
+# ── 数据类型 ──
+
+@dataclass
+class CompiledGraph:
+    """
+    编译后的 DAG 执行计划
+
+    不修改原图，仅附加优化元数据。
+    executor 在执行前检查这些元数据来调整行为。
+    """
+    # 优化后的节点执行顺序（拓扑排序 + 并行组排序）
+    node_order: List[str] = field(default_factory=list)
+
+    # 节点 → 并行组 ID（同一 ID 的节点可并行执行）
+    parallel_groups: Dict[str, int] = field(default_factory=dict)
+
+    # 需要预取的工具名列表（executor 提前 import）
+    prefetch_tools: List[str] = field(default_factory=list)
+
+    # 被移除的死代码节点（原图有但不可达）
+    dead_nodes: List[str] = field(default_factory=list)
+
+    # 被折叠的纯函数链（[A,B,C] → A 保留，B,C 移除）
+    fused_chains: List[List[str]] = field(default_factory=list)
+
+    # 每个节点的预估耗时（ms），基于历史或类型经验值
+    estimated_cost_ms: Dict[str, float] = field(default_factory=dict)
+
+    # 编译统计
+    original_node_count: int = 0
+    effective_node_count: int = 0
+    max_parallelism: int = 1
+    critical_path_length: int = 0
+    estimated_speedup: float = 1.0
+
+class GraphCompiler:
+    """
+    DAG 图编译器
+
+    用法:
+        compiler = GraphCompiler()
+        plan = compiler.compile(graph)
+        executor.run(graph, ..., compiled_plan=plan)
+    """
+
+    # 节点类型到预估耗时基准（ms）
+    # 只包含 V3 node.py 中实际存在的类型
+    _BASE_COST: Dict[str, float] = {
+        "LLMNode": 1500.0,
+        "ToolNode": 500.0,
+        "ToolDispatchNode": 0.5,
+        "RouterNode": 0.3,
+        "HumanInLoopNode": float('inf'),
+        "ParallelNode": 100.0,
+        "MapNode": 200.0,
+        "ListFilesNode": 20.0,
+        "FileProcessorNode": 100.0,
+        "FileRenameNode": 10.0,
+        "CodeSearchNode": 200.0,
+        "CodeEditorNode": 300.0,
+    }
+
+    def __init__(self, history: Optional[Dict[str, float]] = None):
+        """
+        Args:
+            history: 历史执行记录 {node_name: avg_duration_ms}
+                     用于校准预估耗时
+        """
+        self._history = history or {}
+
+    def compile(self, graph: WorkflowGraph) -> CompiledGraph:
+        """
+        编译图，返回优化执行计划
+
+        执行流程:
+          1. 死代码消除（标记不可达节点）
+          2. 纯函数链折叠
+          3. 并行度分析
+          4. 工具预取分析
+          5. 执行顺序优化 + 路径估算
+        """
+        if not graph.entry_points:
+            return CompiledGraph(
+                node_order=list(graph.nodes.keys()),
+                original_node_count=len(graph.nodes),
+                effective_node_count=0,
+            )
+
+        original_count = len(graph.nodes)
+
+        # 1. 死代码消除
+        reachable = self._compute_reachable(graph)
+        dead = set(graph.nodes.keys()) - reachable
+        dead_list = sorted(dead)
+
+        # 2. 纯函数链折叠（不影响可达性）
+        fused_chains = self._find_fuse_chains(graph, reachable)
+
+        # 3. 并行度分析（基于拓扑层级）
+        levels = self._topological_levels(graph, reachable)
+        by_level = defaultdict(list)
+        for node, level in levels.items():
+            by_level[level].append(node)
+
+        # 4. 工具预取分析
+        prefetch = self._analyze_prefetch(graph, reachable)
+
+        # 5. 执行顺序 + 并行组分配
+        parallel_groups = {}
+        node_order = []
+        group_id = 0
+        max_parallel = 1
+
+        for level in sorted(by_level.keys()):
+            nodes = by_level[level]
+            if not nodes:
+                continue
+
+            # 同层节点排序：预取工具优先，LLM 次之，工具再次之，其他最后
+            sorted_nodes = sorted(nodes, key=lambda n: (
+                0 if n in prefetch else 1,
+                0 if graph.nodes.get(n) and graph.nodes[n].node_type == "LLMNode" else 1,
+                0 if graph.nodes.get(n) and graph.nodes[n].node_type == "ToolNode" else 2,
+            ))
+
+            for node in sorted_nodes:
+                parallel_groups[node] = group_id
+
+            # 同层节点如果不在同一依赖路径上，可以并行
+            subgroups = self._split_independent_subgroups(graph, nodes)
+            max_parallel = max(max_parallel, len(subgroups))
+
+            node_order.extend(sorted_nodes)
+            group_id += 1
+
+        # 6. 关键路径长度 + 加速比估算
+        critical_path = self._compute_critical_path(graph, levels, reachable)
+        total_cost, parallel_cost = self._estimate_costs(graph, levels, reachable)
+        speedup = total_cost / parallel_cost if parallel_cost > 0 else 1.0
+
+        # 预估每个节点的耗时
+        cost_ms = {}
+        for name in reachable:
+            node = graph.nodes[name]
+            cost_ms[name] = self._history.get(
+                name,
+                self._BASE_COST.get(node.node_type, 50.0)
+            )
+
+        return CompiledGraph(
+            node_order=node_order,
+            parallel_groups=parallel_groups,
+            prefetch_tools=prefetch,
+            dead_nodes=dead_list,
+            fused_chains=fused_chains,
+            estimated_cost_ms=cost_ms,
+            original_node_count=original_count,
+            effective_node_count=len(reachable),
+            max_parallelism=max_parallel,
+            critical_path_length=critical_path,
+            estimated_speedup=round(speedup, 2),
+        )
+
+    # ── 1. 死代码消除 ──
+
+    def _compute_reachable(self, graph: WorkflowGraph) -> Set[str]:
+        """广度优先搜索可达节点（入口 + 条件边 + tool_ 前缀节点）"""
+        # 构建邻接表
+        adjacency = defaultdict(list)
+        for edge in graph.edges:
+            adjacency[edge.source].append(edge.target)
+
+        reachable = set(graph.entry_points)
+        queue = list(graph.entry_points)
+
+        while queue:
+            current = queue.pop(0)
+            for target in adjacency.get(current, []):
+                if target not in reachable:
+                    reachable.add(target)
+                    queue.append(target)
+
+        # tool_ 前缀节点可能通过 ToolDispatchNode 动态调度，标记为可达
+        for name in graph.nodes:
+            if name.startswith("tool_"):
+                reachable.add(name)
+
+        return reachable
+
+    # ── 2. 纯函数链折叠 ──
+
+    def _find_fuse_chains(self, graph: WorkflowGraph,
+                          reachable: Set[str]) -> List[List[str]]:
+        """
+        找到可折叠的纯函数链
+
+        V3 的 node.py 中没有纯函数节点类型（如 PassThroughNode、MergeNode），
+        所以这个方法当前返回空列表。保留结构供后续扩展。
+        """
+        return []
+
+    # ── 3. 并行度分析 ──
+
+    def _topological_levels(self, graph: WorkflowGraph,
+                            reachable: Set[str]) -> Dict[str, int]:
+        """计算每个节点到入口的最远拓扑距离"""
+        levels = {}
+
+        # 初始化
+        for entry in graph.entry_points:
+            if entry in reachable:
+                levels[entry] = 0
+
+        # 动态规划：BFS 遍历所有边
+        changed = True
+        while changed:
+            changed = False
+            for edge in graph.edges:
+                if edge.source in levels and edge.target in reachable:
+                    new_level = levels[edge.source] + 1
+                    if edge.target not in levels or levels[edge.target] < new_level:
+                        levels[edge.target] = new_level
+                        changed = True
+
+        # tool_ 节点的层级修正（通过 ToolDispatchNode 调度，层级至少比 dispatch 高 1）
+        for name in reachable:
+            if name.startswith("tool_") and name not in levels:
+                levels[name] = 0  # 兜底
+
+        return levels
+
+    def _split_independent_subgroups(self, graph: WorkflowGraph,
+                                     nodes: List[str]) -> List[List[str]]:
+        """
+        将同层节点拆分为无相互依赖的并行子组
+
+        同一子组内的节点可能相互依赖（通过边），必须串行。
+        不同子组间的节点无依赖，可以并行。
+        """
+        if len(nodes) <= 1:
+            return [nodes] if nodes else []
+
+        # 构建依赖图（只考虑节点间的边）
+        dep_matrix: Dict[str, Set[str]] = defaultdict(set)
+        for edge in graph.edges:
+            if edge.source in nodes and edge.target in nodes:
+                dep_matrix[edge.target].add(edge.source)
+
+        # 贪心分组
+        groups = []
+        remaining = set(nodes)
+
+        while remaining:
+            group = []
+            for node in list(remaining):
+                # 如果该节点的所有依赖都不在 remaining 中 → 可以放在当前组
+                if dep_matrix[node].isdisjoint(remaining):
+                    group.append(node)
+            if group:
+                for node in group:
+                    remaining.discard(node)
+                groups.append(group)
+            else:
+                # 循环依赖 → 全部放一组
+                groups.append(list(remaining))
+                break
+
+        return groups
+
+    # ── 4. 工具预取分析 ──
+
+    def _analyze_prefetch(self, graph: WorkflowGraph,
+                          reachable: Set[str]) -> List[str]:
+        """分析需要预取的工具"""
+        tools = set()
+        for name in reachable:
+            node = graph.nodes.get(name)
+            if node and node.node_type == "ToolNode":
+                tool_name = getattr(node, 'tool_name', None) or name
+                tools.add(tool_name)
+        return sorted(tools)
+
+    # ── 5. 性能估算 ──
+
+    def _compute_critical_path(self, graph: WorkflowGraph,
+                               levels: Dict[str, int],
+                               reachable: Set[str]) -> int:
+        """计算关键路径长度（节点数）"""
+        if not levels:
+            return 0
+        return max(levels.values()) + 1
+
+    def _estimate_costs(self, graph: WorkflowGraph,
+                        levels: Dict[str, int],
+                        reachable: Set[str]) -> Tuple[float, float]:
+        """
+        估算串行总成本和并行总成本
+
+        Returns:
+            (total_cost, parallel_cost)
+            total_cost: 串行执行总耗时
+            parallel_cost: 理想并行执行耗时（关键路径）
+        """
+        # 每个节点的成本
+        node_cost = {}
+        for name in reachable:
+            node = graph.nodes.get(name)
+            node_cost[name] = self._history.get(
+                name, self._BASE_COST.get(node.node_type if node else "", 50.0)
+            )
+
+        # 串行总成本
+        total = sum(node_cost.values())
+
+        # 并行成本 = 关键路径上各层最大成本之和
+        by_level = defaultdict(list)
+        for name, level in levels.items():
+            by_level[level].append(name)
+
+        parallel = 0.0
+        for level in sorted(by_level.keys()):
+            level_cost = max(node_cost[n] for n in by_level[level])
+            parallel += level_cost
+
+        return total, parallel
+
+# ── 快捷函数 ──
+
+def compile_graph(graph: WorkflowGraph,
+                  history: Optional[Dict[str, float]] = None) -> CompiledGraph:
+    """快捷编译图"""
+    return GraphCompiler(history=history).compile(graph)
+
+================================================================================
+# FILE: engine/dag/context.py
+# LINES: 308
+================================================================================
+
+"""
+dag/context.py — DAG 执行上下文
+
+ExecutionContext 管理：
+  - 节点间数据传递
+  - 执行追踪 (NodeTrace)
+  - 全局共享数据
+  - 检查点保存/恢复
+  - 中断/恢复
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING
+from uuid import uuid4
+
+if TYPE_CHECKING:
+    from .node import NodeOutput
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class NodeTrace:
+    """节点执行追踪"""
+    node_name: str
+    node_type: str = ""
+    start_time: datetime = field(default_factory=datetime.now)
+    end_time: Optional[datetime] = None
+    duration_ms: float = 0.0
+    inputs: Dict[str, Any] = field(default_factory=dict)
+    outputs: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+    events: List[Dict[str, Any]] = field(default_factory=list)
+    children: List["NodeTrace"] = field(default_factory=list)
+
+    def complete(self, outputs: Dict[str, Any] = None, error: Optional[str] = None) -> None:
+        self.end_time = datetime.now()
+        self.duration_ms = (self.end_time - self.start_time).total_seconds() * 1000
+        if outputs:
+            self.outputs = outputs
+        if error:
+            self.error = error
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node": self.node_name,
+            "type": self.node_type,
+            "duration_ms": round(self.duration_ms, 1),
+            "error": self.error,
+            "events": self.events,
+        }
+
+@dataclass
+class EventRecord:
+    """DAG 执行事件记录"""
+    type: str
+    node: str
+    timestamp: datetime = field(default_factory=datetime.now)
+    data: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class ExecutionContextConfig:
+    """执行上下文配置
+
+    - max_traces: 最多保留的追踪记录数（超出后自动裁剪旧记录）
+    - max_events: 最多保留的事件记录数（超出后自动裁剪）
+    - max_output_size: 单个输出值的最大字符长度（超出后截断）
+    - max_checkpoints: 最多保留的检查点数
+    """
+    max_traces: int = 1000
+    max_events: int = 5000
+    max_output_size: int = 5000
+    max_checkpoints: int = 10
+
+class ExecutionContext:
+    """
+    DAG 执行上下文
+
+    - 节点间数据流（端口传递）
+    - 执行追踪（每个节点一个 Trace）
+    - 全局共享数据（global_data）
+    - 检查点（用于断点恢复）
+    - 内存管理：自动裁剪 old 追踪和事件
+    """
+
+    def __init__(
+        self,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        config: Optional[ExecutionContextConfig] = None,
+    ):
+        self.request_id = request_id or f"dag_{uuid4().hex[:8]}"
+        self.session_id = session_id
+        self.created_at = datetime.now()
+
+        # 内存管理配置
+        self.config = config or ExecutionContextConfig()
+
+        # 外部依赖（由 GraphExecutor 注入）
+        self.llm_client: Any = None
+        self.tool_registry: Any = None
+
+        # 节点间数据传递（自动管理）
+        self._node_outputs: Dict[str, Dict[str, Any]] = {}
+
+        # 全局共享数据
+        self.global_data: Dict[str, Any] = {}
+
+        # 追踪系统
+        self.traces: List[NodeTrace] = []
+        self._current_trace: Optional[NodeTrace] = None
+        self.events: List[EventRecord] = []
+
+        # 编译计划（由 GraphExecutor 注入）
+        self.compiled_plan: Any = None
+
+        # 中断/审批
+        self.pending_approval: Optional[Dict] = None
+
+        # 检查点
+        self.checkpoints: List[Dict] = []
+
+    # ── 数据流 ──
+
+    def get_node_output(
+        self,
+        node_name: str,
+        port: Optional[str] = None,
+    ) -> Optional[Any]:
+        """
+        获取指定节点的输出。
+
+        如果 port 指定了端口名，返回该端口的输出值；
+        如果 port 为 None，返回整个输出 dict（所有端口）。
+        """
+        outputs = self._node_outputs.get(node_name)
+        if outputs is None:
+            return None
+        if port is None:
+            return outputs  # 返回整个 dict
+        return outputs.get(port)
+
+    def get_first_node_output(self, node_name: str) -> Optional[Any]:
+        """获取指定节点的第一个非空输出"""
+        outputs = self._node_outputs.get(node_name)
+        if not outputs:
+            return None
+        for port_data in outputs.values():
+            if port_data is not None:
+                return port_data
+        return None
+
+    def set_node_output(self, node_name: str, outputs: Dict[str, Any]) -> None:
+        """保存节点输出"""
+        self._node_outputs[node_name] = outputs
+
+    def get_all_node_outputs(self) -> Dict[str, Any]:
+        """获取所有节点输出"""
+        return dict(self._node_outputs)
+
+    # ── 事件记录 ──
+
+    def record(self, event_type: str, node: str, **data) -> None:
+        """记录执行事件"""
+        event = EventRecord(type=event_type, node=node, data=data)
+        self.events.append(event)
+
+        # 也添加到当前 trace
+        if self._current_trace:
+            self._current_trace.events.append({
+                "type": event_type,
+                "data": data,
+            })
+
+        logger.debug(f"[{event_type}] {node}: {data}")
+
+        # 自动裁剪
+        self._maybe_crop_events()
+
+    def _maybe_crop_events(self) -> None:
+        """如果事件数超过上限，裁剪掉最旧的 50%"""
+        if len(self.events) > self.config.max_events:
+            crop_count = len(self.events) // 2
+            self.events = self.events[crop_count:]
+            logger.debug(f"事件裁剪: 移除 {crop_count} 条旧事件")
+
+    def _maybe_crop_traces(self) -> None:
+        """如果追踪数超过上限，裁剪掉最旧的 50%"""
+        if len(self.traces) > self.config.max_traces:
+            crop_count = len(self.traces) // 2
+            self.traces = self.traces[crop_count:]
+            logger.debug(f"追踪裁剪: 移除 {crop_count} 条旧追踪")
+
+    # ── 追踪管理 ──
+
+    def _truncate_str(self, value: Any, max_len: Optional[int] = None) -> str:
+        """截断字符串表示"""
+        max_len = max_len or self.config.max_output_size
+        s = str(value)
+        if len(s) > max_len:
+            return s[:max_len] + f"... [truncated, {len(s)} total]"
+        return s
+
+    def start_node(self, node: Any, inputs: Dict[str, Any]) -> None:
+        """开始追踪一个节点"""
+        self._current_trace = NodeTrace(
+            node_name=node.name,
+            node_type=node.node_type,
+            inputs={
+                k: self._truncate_str(v.data if hasattr(v, 'data') else v, 200)
+                for k, v in inputs.items()
+            },
+        )
+
+    def end_node(
+        self,
+        outputs: Dict[str, Any],
+        error: Optional[Exception] = None,
+    ) -> None:
+        """结束节点追踪"""
+        if self._current_trace:
+            self._current_trace.complete(
+                outputs={
+                    k: self._truncate_str(v.data if hasattr(v, 'data') else v, 200)
+                    for k, v in outputs.items()
+                },
+                error=str(error) if error else None,
+            )
+            self.traces.append(self._current_trace)
+            self._current_trace = None
+            # 自动裁剪
+            self._maybe_crop_traces()
+
+    # ── 节点耗时统计（供编译器校准用）──
+
+    def get_node_timing(self) -> Dict[str, Dict]:
+        """获取各节点耗时（用于编译器历史校准）"""
+        return {
+            t.node_name: {"duration_ms": t.duration_ms, "error": t.error}
+            for t in self.traces
+        }
+
+    # ── 检查点 ──
+
+    def save_checkpoint(self) -> Dict:
+        """保存检查点"""
+        cp = {
+            "request_id": self.request_id,
+            "session_id": self.session_id,
+            "global_data": dict(self.global_data),
+            "node_outputs": {
+                name: {
+                    port: data
+                    for port, data in outputs.items()
+                }
+                for name, outputs in self._node_outputs.items()
+            },
+            "pending_approval": self.pending_approval,
+        }
+        self.checkpoints.append(cp)
+        # 检查点裁剪
+        if len(self.checkpoints) > self.config.max_checkpoints:
+            self.checkpoints = self.checkpoints[-self.config.max_checkpoints:]
+        return cp
+
+    def restore_checkpoint(self, checkpoint: Dict) -> None:
+        """恢复检查点"""
+        self.global_data = dict(checkpoint.get("global_data", {}))
+        self.pending_approval = checkpoint.get("pending_approval")
+
+        # 恢复节点输出（仅恢复可 JSON 序列化的）
+        node_outputs = checkpoint.get("node_outputs", {})
+        for name, outputs in node_outputs.items():
+            if name not in self._node_outputs:
+                self._node_outputs[name] = {}
+            for port, data in outputs.items():
+                self._node_outputs[name][port] = data
+
+        logger.debug(f"检查点恢复: {len(node_outputs)} 个节点")
+
+    # ── 汇总 ──
+
+    def get_summary(self) -> Dict[str, Any]:
+        """获取执行摘要"""
+        return {
+            "request_id": self.request_id,
+            "session_id": self.session_id,
+            "duration_ms": round((datetime.now() - self.created_at).total_seconds() * 1000, 1),
+            "node_count": len(self.traces),
+            "event_count": len(self.events),
+            "traces": [t.to_dict() for t in self.traces],
+            "has_error": any(t.error for t in self.traces),
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        """完整序列化"""
+        return {
+            "request_id": self.request_id,
+            "session_id": self.session_id,
+            "created_at": self.created_at.isoformat(),
+            "summary": self.get_summary(),
+            "global_data_keys": list(self.global_data.keys()),
+        }
+
+================================================================================
+# FILE: engine/dag/edge.py
+# LINES: 106
+================================================================================
+
+"""
+dag/edge.py — DAG 执行图的边定义
+
+Edge 连接两个节点，支持：
+  - 条件边：只有条件满足时才走这条边
+  - 条件值边：与 RouterNode 的 route 输出匹配
+  - 端口映射：将源节点的某端口映射到目标节点的某端口
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, Optional
+
+class Edge:
+    """连接两个节点"""
+
+    def __init__(
+        self,
+        source: str,
+        target: str,
+        condition: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        port_map: Optional[Dict[str, str]] = None,
+    ):
+        """
+        Args:
+            source: 源节点名
+            target: 目标节点名
+            condition: 条件函数（接收源节点的 outputs，返回 True 才走这条边）
+            port_map: 端口映射 {源端口: 目标端口}
+        """
+        self.source = source
+        self.target = target
+        self.condition = condition or (lambda _: True)
+        self.port_map = port_map or {}
+
+    def evaluate(self, source_outputs: Dict[str, Any]) -> bool:
+        """判断这条边是否应该激活"""
+        try:
+            return self.condition(source_outputs)
+        except Exception:
+            return False
+
+    def map_ports(self, source_outputs: Dict[str, Any]) -> Dict[str, str]:
+        """
+        将源输出映射为 (目标端口, 源端口) 信息。
+        返回: {目标端口: 源端口}
+        """
+        if self.port_map:
+            return {v: k for k, v in self.port_map.items()}
+        # 默认：将所有非 None 输出按同名端口透传
+        mapping = {}
+        for port_name in source_outputs:
+            if source_outputs[port_name] is not None:
+                mapping[port_name] = port_name
+        return mapping
+
+    def __repr__(self) -> str:
+        return f"Edge({self.source} -> {self.target})"
+
+class ConditionalEdge(Edge):
+    """条件边——与 RouterNode 配合，根据 route 值匹配"""
+
+    def __init__(
+        self,
+        source: str,
+        condition_value: str,
+        target: str,
+        port_map: Optional[Dict[str, str]] = None,
+        route_port: str = "route",
+    ):
+        super().__init__(source=source, target=target, port_map=port_map)
+        self.condition_value = condition_value
+        self.route_port = route_port
+
+    def evaluate(self, source_outputs: Dict[str, Any]) -> bool:
+        """检查 route 端口的值是否匹配"""
+        route_data = source_outputs.get(self.route_port)
+        if route_data is None:
+            return False
+        if hasattr(route_data, "data"):
+            value = route_data.data
+        else:
+            value = route_data
+        return str(value) == self.condition_value
+
+    def __repr__(self) -> str:
+        port_info = f"@{self.route_port}" if self.route_port != "route" else ""
+        return f"ConditionalEdge({self.source}[{self.condition_value}]{port_info} -> {self.target})"
+
+class AllPassEdge(Edge):
+    """聚合边——等待所有上游节点完成后才触发（并行屏障）"""
+
+    def __init__(
+        self,
+        sources: list[str],
+        target: str,
+        port_map: Optional[Dict[str, str]] = None,
+    ):
+        super().__init__(source=",".join(sources), target=target, port_map=port_map)
+        self.sources = sources
+
+    def evaluate(self, source_outputs: Dict[str, Any]) -> bool:
+        return True  
+
+    def __repr__(self) -> str:
+        return f"AllPassEdge({','.join(self.sources)} -> {self.target})"
+
+================================================================================
+# FILE: engine/dag/executor.py
+# LINES: 685
+================================================================================
+
+"""
+dag/executor.py — DAG 执行器（核心引擎）
+
+GraphExecutor 负责：
+  1. 接收 WorkflowGraph + 初始输入
+  2. 按拓扑顺序执行节点
+  3. 管理节点间数据流（端口映射）
+  4. 支持条件边和并行执行
+  5. 追踪每个节点的执行记录
+  6. 检查点/断点恢复
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections import defaultdict, deque
+from typing import (
+    Any, Callable, Dict, List, Optional, Set,
+    Tuple, AsyncIterator, Coroutine,
+)
+from uuid import uuid4
+
+from .node import Node, NodeInput, NodeOutput, HumanInLoopNode
+from .edge import Edge, ConditionalEdge, AllPassEdge
+from .graph import WorkflowGraph
+from .context import ExecutionContext
+from .tracer import tracer as _tracer
+
+logger = logging.getLogger(__name__)
+
+class HumanInterruptError(Exception):
+    """人工中断异常（用于 HumanInLoopNode 等待审批时）"""
+    pass
+
+class GraphExecutor:
+    """
+    DAG 图执行器
+
+    使用基于就绪条件的异步调度算法：
+    - 节点就绪后立即启动，支持并行
+    - 使用 FIRST_COMPLETED 等待策略
+    - 自动管理节点间数据流
+
+    流式与非流式使用同一调度核心 _schedule_graph，
+    通过 event_callback 参数控制是否发送事件。
+    """
+
+    def __init__(
+        self,
+        llm_client: Any,
+        tool_registry: Any,
+        max_parallel: int = 10,
+        default_node_timeout: float = 60.0,
+        enable_compiler: bool = True,
+    ):
+        self.llm_client = llm_client
+        self.tool_registry = tool_registry
+        self.max_parallel = max_parallel
+        self.default_node_timeout = default_node_timeout
+        self._compiler = None
+        self._compile_history: Dict[str, float] = {}
+        self.enable_compiler = enable_compiler
+
+    def _get_compiler(self):
+        """懒加载编译器"""
+        if self._compiler is None and self.enable_compiler:
+            from .compiler import GraphCompiler
+            self._compiler = GraphCompiler(history=self._compile_history)
+        return self._compiler
+
+    # ═══════════════════════════════════════
+    #  公共 API
+    # ═══════════════════════════════════════
+
+    async def run(
+        self,
+        graph: WorkflowGraph,
+        initial_input: Any,
+        session: Optional[Any] = None,
+        checkpoint: Optional[Dict] = None,
+        timeout: Optional[float] = None,
+        enable_tracing: bool = True,
+    ) -> ExecutionContext:
+        """
+        执行 DAG（非流式）
+
+        Args:
+            graph: 要执行的图
+            initial_input: 初始输入
+            session: 可选的会话（用于存储检查点）
+            checkpoint: 可选的检查点（用于恢复执行）
+            timeout: 整体超时（秒）
+            enable_tracing: 是否启用追踪摘要输出
+
+        Returns:
+            ExecutionContext（包含所有节点输出和追踪）
+        """
+        # 编译优化
+        compiler = self._get_compiler()
+        if compiler:
+            compiled = compiler.compile(graph)
+            if compiled.dead_nodes:
+                logger.info(f"编译: 移除 {len(compiled.dead_nodes)} 个死代码节点")
+            if compiled.fused_chains:
+                logger.info(f"编译: 折叠 {len(compiled.fused_chains)} 条纯函数链")
+        else:
+            compiled = None
+
+        ctx = self._prepare_context(graph, session, checkpoint)
+        run_timeout = timeout or 300.0
+
+        # 启动追踪
+        _tracer.start_trace(ctx.request_id)
+        _tracer.start_span(ctx.request_id, graph.name, "graph")
+
+        try:
+            result = await asyncio.wait_for(
+                self._schedule_graph(ctx, graph, initial_input, session, event_callback=None),
+                timeout=run_timeout,
+            )
+
+            # 编译历史校准（记录实际耗时）
+            self._update_compile_history(result)
+
+            _tracer.end_span(ctx.request_id)
+            if enable_tracing:
+                _tracer.print_summary(ctx.request_id)
+            return result
+
+        except asyncio.TimeoutError:
+            logger.error(f"DAG 执行超时 ({run_timeout}s)")
+            ctx.record("timeout", node="__graph__", timeout=run_timeout)
+            _tracer.end_span(ctx.request_id, error=f"timeout ({run_timeout}s)")
+            return ctx
+
+    async def run_stream(
+        self,
+        graph: WorkflowGraph,
+        initial_input: Any,
+        session: Optional[Any] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        流式执行 DAG，逐步 yield 事件。
+
+        事件类型:
+          - node_start: 节点开始执行
+          - node_complete: 节点执行完成
+          - node_error: 节点出错
+          - thought: 思考状态（LLM 节点）
+          - tool_call: 工具调用事件
+          - complete: 全部完成
+        """
+        ctx = self._prepare_context(graph, session)
+
+        _tracer.start_trace(ctx.request_id)
+        _tracer.start_span(ctx.request_id, graph.name, "graph")
+
+        errors = graph.validate()
+        if errors:
+            yield {"type": "error", "content": "图验证失败: " + "; ".join(errors)}
+            return
+
+        event_queue: asyncio.Queue = asyncio.Queue()
+
+        async def execute_and_enqueue():
+            try:
+                async def event_callback(event_type: str, **kwargs):
+                    await event_queue.put({"type": event_type, **kwargs})
+                await self._schedule_graph(ctx, graph, initial_input, session, event_callback=event_callback)
+            except Exception as e:
+                await event_queue.put({"type": "error", "content": str(e)})
+            finally:
+                await event_queue.put({"type": "__done__"})
+
+        exec_task = asyncio.create_task(execute_and_enqueue())
+
+        while True:
+            event = await event_queue.get()
+            if event.get("type") == "__done__":
+                break
+            yield event
+
+        await exec_task
+        _tracer.end_span(ctx.request_id)
+        _tracer.print_summary(ctx.request_id)
+        yield {"type": "complete", "summary": ctx.get_summary()}
+
+    # ═══════════════════════════════════════
+    #  统一的调度核心
+    # ═══════════════════════════════════════
+
+    async def _schedule_graph(
+        self,
+        ctx: ExecutionContext,
+        graph: WorkflowGraph,
+        initial_input: Any,
+        session: Optional[Any],
+        event_callback: Optional[Callable[..., Coroutine]] = None,
+    ) -> ExecutionContext:
+        """
+        统一的 DAG 调度核心。
+
+        Args:
+            event_callback: 可选的事件回调，async def cb(event_type: str, **kwargs)
+                           为 None 时不发送事件（非流式模式）
+        """
+        # ── 状态管理 ──
+        pending: Set[str] = set(graph.nodes.keys())
+        completed: Set[str] = set()
+        running: Dict[str, asyncio.Task] = {}
+        node_inputs: Dict[str, Dict[str, Tuple[str, str]]] = defaultdict(dict)
+        node_outputs: Dict[str, Dict[str, NodeOutput]] = {}
+
+        # 构建邻接表和反向依赖
+        adjacency, reverse_deps = self._build_adjacency(graph)
+
+        # 就绪队列（元素为 (node_name, is_reentry)）
+        ready: deque = deque()
+
+        # 初始化入口节点
+        for entry in graph.entry_points:
+            if entry in pending:
+                if isinstance(initial_input, dict):
+                    for key in initial_input:
+                        node_inputs[entry][key] = ("__input__", key)
+                else:
+                    node_inputs[entry]["default"] = ("__input__", "default")
+                ready.append((entry, False))
+
+        # 注入初始输入
+        if isinstance(initial_input, dict):
+            ctx.set_node_output("__input__", dict(initial_input))
+        else:
+            ctx.set_node_output("__input__", {"default": initial_input})
+
+        # ── 主调度循环 ──
+        try:
+            while ready or running:
+                # 启动所有就绪节点
+                while ready:
+                    node_name, is_reentry = ready.popleft()
+                    if node_name in running:
+                        continue
+                    # 对于首次执行，从 pending 移除；重入执行直接跑
+                    if not is_reentry:
+                        if node_name not in pending:
+                            continue
+                        pending.discard(node_name)
+                    elif node_name not in completed and node_name in pending:
+                        # 重入时首次跑补移除
+                        pending.discard(node_name)
+
+                    inputs = self._collect_inputs(ctx, graph, node_name, node_inputs, node_outputs)
+
+                    if event_callback:
+                        await event_callback(
+                            "node_start",
+                            node=node_name,
+                            node_type=graph.nodes[node_name].node_type,
+                        )
+
+                    sem = asyncio.Semaphore(self.max_parallel)
+
+                    async def run_node(n_name: str, n_inputs: Dict[str, NodeInput]):
+                        async with sem:
+                            return await self._execute_node(
+                                ctx, graph, n_name, n_inputs, event_callback,
+                            )
+
+                    task = asyncio.create_task(run_node(node_name, inputs))
+                    running[node_name] = task
+
+                if not running:
+                    break
+
+                # 等待任意节点完成
+                done, _ = await asyncio.wait(
+                    running.values(),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for task in done:
+                    node_name = self._find_node_name(running, task)
+                    if node_name is None:
+                        continue
+                    del running[node_name]
+
+                    try:
+                        outputs = task.result()
+                    except HumanInterruptError as e:
+                        ctx.pending_approval = {"message": str(e), "node": node_name}
+                        if session and hasattr(session, 'checkpoint'):
+                            session.checkpoint = ctx.save_checkpoint()
+                        raise
+                    except Exception as e:
+                        logger.exception(f"节点 '{node_name}' 异常: {e}")
+                        outputs = {"output": NodeOutput(data=None, error=e)}
+                        if event_callback:
+                            await event_callback("node_error", node=node_name, error=str(e))
+
+                    # 保存节点输出
+                    node_outputs[node_name] = outputs
+                    ctx.set_node_output(node_name, {
+                        port: out.data if hasattr(out, 'data') else out
+                        for port, out in outputs.items()
+                    })
+                    completed.add(node_name)
+
+                    # 处理递归/循环场景：移除出环的节点 deb 集合
+                    # 如果后续有边要循环回去，_activate_downstream 会标记为重入
+
+                    # 人工审批节点自动保存检查点
+                    node = graph.get_node(node_name)
+                    if isinstance(node, HumanInLoopNode):
+                        ctx.checkpoint = ctx.save_checkpoint()
+
+                    # 激活下游节点
+                    self._activate_downstream(
+                        ctx, graph, node_name, outputs,
+                        adjacency, reverse_deps,
+                        node_inputs, completed, running, ready,
+                    )
+
+            # ── 执行完成 ──
+            logger.info(f"DAG 执行完成: {len(completed)}/{len(graph.nodes)} 个节点")
+            ctx.record("graph_complete", node="__graph__",
+                       node_count=len(completed), total=len(graph.nodes))
+            return ctx
+
+        except asyncio.CancelledError:
+            logger.warning("DAG 执行被取消")
+            ctx.record("cancelled", node="__graph__")
+            for task in running.values():
+                task.cancel()
+            return ctx
+
+    # ═══════════════════════════════════════
+    #  辅助方法
+    # ═══════════════════════════════════════
+
+    def _prepare_context(
+        self,
+        graph: WorkflowGraph,
+        session: Optional[Any] = None,
+        checkpoint: Optional[Dict] = None,
+    ) -> ExecutionContext:
+        """创建并初始化执行上下文"""
+        errors = graph.validate()
+        if errors:
+            raise ValueError(f"图验证失败:\n" + "\n".join(f"  - {e}" for e in errors))
+
+        ctx = ExecutionContext(
+            request_id=f"dag_{uuid4().hex[:8]}",
+            session_id=session.session_id if session and hasattr(session, 'session_id') else None,
+        )
+        ctx.llm_client = self.llm_client
+        ctx.tool_registry = self.tool_registry
+
+        if checkpoint:
+            ctx.restore_checkpoint(checkpoint)
+            if ctx.pending_approval:
+                logger.info(f"恢复执行: 等待审批 {ctx.pending_approval}")
+
+        return ctx
+
+    def _update_compile_history(self, ctx: ExecutionContext):
+        """从执行结果更新编译历史，校准预估耗时"""
+        for node_name, record in ctx.get_node_timing().items():
+            avg = self._compile_history.get(node_name, 0.0)
+            dur = record.get("duration_ms", 0.0)
+            if dur > 0:
+                # 指数移动平均（EMA），α=0.3
+                self._compile_history[node_name] = 0.3 * dur + 0.7 * avg if avg > 0 else dur
+
+    @staticmethod
+    def _build_adjacency(graph: WorkflowGraph) -> Tuple[Dict[str, List[Edge]], Dict[str, Set[str]]]:
+        """构建邻接表和反向依赖"""
+        adjacency: Dict[str, List[Edge]] = defaultdict(list)
+        reverse_deps: Dict[str, Set[str]] = defaultdict(set)
+
+        for edge in graph.edges:
+            adjacency[edge.source].append(edge)
+            if isinstance(edge, AllPassEdge):
+                for s in edge.sources:
+                    reverse_deps[edge.target].add(s)
+            else:
+                reverse_deps[edge.target].add(edge.source)
+
+        return adjacency, reverse_deps
+
+    def _activate_downstream(
+        self,
+        ctx: ExecutionContext,
+        graph: WorkflowGraph,
+        node_name: str,
+        outputs: Dict[str, NodeOutput],
+        adjacency: Dict[str, List[Edge]],
+        reverse_deps: Dict[str, Set[str]],
+        node_inputs: Dict[str, Dict[str, Tuple[str, str]]],
+        completed: Set[str],
+        running: Dict[str, asyncio.Task],
+        ready: deque,
+    ) -> None:
+        """激活下游节点（同步方法，不 await）"""
+        for edge in adjacency.get(node_name, []):
+            # 条件边检查
+            if isinstance(edge, ConditionalEdge):
+                route_output = outputs.get(edge.route_port)
+                route_val = route_output.data if hasattr(route_output, 'data') else route_output
+                if str(route_val) != edge.condition_value:
+                    continue
+            elif not edge.evaluate(outputs):
+                continue
+
+            # 端口映射
+            output_data = {
+                port: out.data if hasattr(out, 'data') else out
+                for port, out in outputs.items()
+            }
+            port_mapping = edge.map_ports(output_data)
+            for target_port, source_port in port_mapping.items():
+                node_inputs[edge.target][target_port] = (node_name, source_port)
+
+            # 检查目标节点是否所有上游都已完成
+            if self._all_upstream_completed(edge.target, reverse_deps, completed):
+                if edge.target not in running:
+                    is_reentry = edge.target in completed
+                    ready.append((edge.target, is_reentry))
+
+    async def _execute_node(
+        self,
+        ctx: ExecutionContext,
+        graph: WorkflowGraph,
+        node_name: str,
+        inputs: Dict[str, NodeInput],
+        event_callback: Optional[Callable[..., Coroutine]] = None,
+    ) -> Dict[str, NodeOutput]:
+        """执行单个节点（带追踪、超时、可选事件回调）"""
+        node = graph.nodes[node_name]
+        start = asyncio.get_event_loop().time()
+
+        # 映射节点类型到 span 类型
+        span_type_map = {
+            "LLMNode": "llm",
+            "ToolNode": "tool",
+            "RouterNode": "router",
+            "ToolDispatchNode": "tool",
+            "HumanInLoopNode": "node",
+            "ParallelNode": "node",
+            "MapNode": "node",
+        }
+        span_type = span_type_map.get(node.node_type, "node")
+
+        # 开始追踪 Span
+        _tracer.start_span(ctx.request_id, node_name, span_type)
+
+        ctx.start_node(node, inputs)
+        ctx.record("node_start", node=node_name)
+
+        # LLMNode 发送思考事件
+        if event_callback and node.node_type == "LLMNode":
+            await event_callback("thought", node=node_name, content="思考中...")
+
+        try:
+            outputs = await asyncio.wait_for(
+                node.execute(ctx, inputs),
+                timeout=self.default_node_timeout,
+            )
+
+            # 标准化输出
+            if not isinstance(outputs, dict):
+                outputs = {"output": NodeOutput.ok(outputs)}
+            else:
+                normalized = {}
+                for key, val in outputs.items():
+                    normalized[key] = val if isinstance(val, NodeOutput) else NodeOutput.ok(val)
+                outputs = normalized
+
+            elapsed = (asyncio.get_event_loop().time() - start) * 1000
+            ctx.record("node_complete", node=node_name, duration_ms=round(elapsed, 1))
+            ctx.end_node(outputs)
+
+            # 提取追踪元数据
+            tracer_kwargs = {}
+            if node.node_type == "LLMNode":
+                # 从 LLMNode 输出提取 token 和模型信息
+                usage_data = self._extract_llm_usage(outputs)
+                tracer_kwargs.update(usage_data)
+                model = getattr(node, 'model', None) or getattr(ctx, 'model', None)
+                if model:
+                    tracer_kwargs["model"] = model
+
+            if node.node_type == "RouterNode":
+                route_out = outputs.get("route")
+                route_val = route_out.data if hasattr(route_out, 'data') else route_out
+                tracer_kwargs["metadata"] = {"route": str(route_val)}
+
+            # 结束追踪 Span
+            _tracer.end_span(ctx.request_id, **tracer_kwargs)
+
+            # 发送节点特定事件
+            if event_callback:
+                await self._emit_node_events(event_callback, node, node_name, outputs, duration_ms=elapsed)
+
+            return outputs
+
+        except asyncio.TimeoutError:
+            elapsed = (asyncio.get_event_loop().time() - start) * 1000
+            error = f"节点超时 ({self.default_node_timeout}s)"
+            ctx.record("node_timeout", node=node_name, duration_ms=round(elapsed, 1))
+            ctx.end_node({}, error=TimeoutError(error))
+            await node.on_error(ctx, TimeoutError(error))
+            _tracer.end_span(ctx.request_id, error=error)
+            if event_callback:
+                await event_callback("node_error", node=node_name, error=error)
+            return {"output": NodeOutput(data=None, error=TimeoutError(error))}
+
+        except Exception as e:
+            elapsed = (asyncio.get_event_loop().time() - start) * 1000
+            ctx.record("node_error", node=node_name, error=str(e))
+            ctx.end_node({}, error=e)
+            await node.on_error(ctx, e)
+            _tracer.end_span(ctx.request_id, error=str(e))
+            if event_callback:
+                await event_callback("node_error", node=node_name, error=str(e))
+            return {"output": NodeOutput(data=None, error=e)}
+
+    async def _emit_node_events(
+        self,
+        event_callback: Callable[..., Coroutine],
+        node: Node,
+        node_name: str,
+        outputs: Dict[str, NodeOutput],
+        duration_ms: float = 0.0,
+    ) -> None:
+        """发送节点类型特定的事件"""
+        # ToolNode → tool_call 事件
+        if node.node_type == "ToolNode":
+            out = outputs.get("output")
+            await event_callback(
+                "tool_call",
+                node=node_name,
+                tool=getattr(node, 'tool_name', node_name),
+                status="done" if (out and out.is_ok) else "error",
+                result=str(out.data)[:500] if out and out.data else "",
+            )
+
+        # LLMNode → content 事件
+        if node.node_type == "LLMNode":
+            content_out = outputs.get("content") or outputs.get("output")
+            if content_out and content_out.data:
+                content = content_out.data
+                if isinstance(content, dict):
+                    content = content.get("content", "")
+                await event_callback("content", node=node_name, content=content)
+
+        # 所有节点发送完成事件
+        await event_callback(
+            "node_complete",
+            node=node_name,
+            duration_ms=round(duration_ms, 1),
+        )
+
+    def _collect_inputs(
+        self,
+        ctx: ExecutionContext,
+        graph: WorkflowGraph,
+        node_name: str,
+        node_inputs: Dict[str, Dict[str, Tuple[str, str]]],
+        node_outputs: Dict[str, Dict[str, NodeOutput]],
+    ) -> Dict[str, NodeInput]:
+        """收集节点的所有输入"""
+        result = {}
+        port_sources = node_inputs.get(node_name, {})
+
+        for target_port, (source_node, source_port) in port_sources.items():
+            source_val = None
+
+            # 从已完成的节点输出中取
+            source_outputs = node_outputs.get(source_node, {})
+            node_out = source_outputs.get(source_port)
+
+            if node_out is not None:
+                source_val = node_out.data if hasattr(node_out, 'data') else node_out
+            elif source_node == "__input__":
+                input_outputs = ctx.get_node_output("__input__")
+                if isinstance(input_outputs, dict):
+                    source_val = input_outputs.get(source_port)
+
+            if source_val is not None:
+                result[target_port] = NodeInput(
+                    data=source_val,
+                    source_node=source_node,
+                    source_port=source_port,
+                )
+
+        # 回退逻辑
+        if not result and port_sources:
+            if len(port_sources) == 1:
+                tp, (sn, sp) = next(iter(port_sources.items()))
+                src_out = node_outputs.get(sn, {})
+                val = src_out.get(sp)
+                if val is not None:
+                    d = val.data if hasattr(val, 'data') else val
+                    result["default"] = NodeInput(data=d, source_node=sn, source_port=sp)
+            if not result:
+                all_input_outs = ctx.get_node_output("__input__")
+                if isinstance(all_input_outs, dict):
+                    for val in all_input_outs.values():
+                        result["default"] = NodeInput(data=val, source_node="__input__")
+                        break
+
+        if "default" not in result:
+            if len(result) == 1:
+                only_val = next(iter(result.values()))
+                result["default"] = only_val
+            elif "output" in result:
+                result["default"] = result["output"]
+
+        return result
+
+    @staticmethod
+    def _all_upstream_completed(
+        node_name: str,
+        reverse_deps: Dict[str, Set[str]],
+        completed: Set[str],
+    ) -> bool:
+        """检查目标节点的所有上游节点是否都已完成"""
+        deps = reverse_deps.get(node_name, set())
+        if not deps:
+            return True
+        return deps.issubset(completed)
+
+    @staticmethod
+    def _extract_llm_usage(outputs: Dict[str, NodeOutput]) -> Dict[str, Any]:
+        """
+        从 LLMNode 的输出中提取 token 使用量。
+
+        支持多种输出格式：
+          - {"output": NodeOutput(data={"usage": {...}})}
+          - {"usage": NodeOutput(data={"prompt_tokens": 100})}
+          - {"content": NodeOutput(data="...")}  # fallback: 大致估算
+        """
+        result: Dict[str, Any] = {"tokens_prompt": 0, "tokens_completion": 0}
+
+        for port_name in ["output", "usage", "metadata"]:
+            out = outputs.get(port_name)
+            if out is None:
+                continue
+            data = out.data if hasattr(out, 'data') else out
+            if not isinstance(data, dict):
+                continue
+
+            usage = data.get("usage", {})
+            if isinstance(usage, dict):
+                result["tokens_prompt"] = usage.get("prompt_tokens", 0)
+                result["tokens_completion"] = usage.get("completion_tokens", 0)
+                return result
+
+            # 直接指定
+            if "prompt_tokens" in data or "completion_tokens" in data:
+                result["tokens_prompt"] = data.get("prompt_tokens", 0)
+                result["tokens_completion"] = data.get("completion_tokens", 0)
+                return result
+
+            # OpenAI 风格的 response
+            if "usage" in data and isinstance(data["usage"], dict):
+                u = data["usage"]
+                result["tokens_prompt"] = u.get("prompt_tokens", 0)
+                result["tokens_completion"] = u.get("completion_tokens", 0)
+                return result
+
+        return result
+
+    @staticmethod
+    def _find_node_name(
+        running_tasks: Dict[str, asyncio.Task],
+        task: asyncio.Task,
+    ) -> Optional[str]:
+        """根据 Task 对象找到对应的节点名"""
+        for name, t in running_tasks.items():
+            if t is task:
+                return name
+        return None
+
+================================================================================
+# FILE: engine/dag/graph.py
+# LINES: 533
+================================================================================
+
+"""
+dag/graph.py — DAG 执行图定义
+
+WorkflowGraph 是完整的执行图定义，包含：
+  - 节点集合
+  - 边集合
+  - 入口点 / 出口点
+  - 验证逻辑
+  - Mermaid 可视化导出
+"""
+
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from typing import Any, Callable, Dict, List, Optional, Set, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .node import Node
+    from .edge import Edge, ConditionalEdge
+
+logger = logging.getLogger(__name__)
+
+class WorkflowGraph:
+    """DAG 执行图"""
+
+    def __init__(self, name: str = "workflow"):
+        self.name = name
+        self.nodes: Dict[str, "Node"] = {}
+        self.edges: List["Edge"] = []
+        self.entry_points: Set[str] = set()
+        self.exit_points: Set[str] = set()
+        # 合法循环边白名单，标记为 (source, target) 的边不会被当作死循环
+        self.loop_edges: Set[Tuple[str, str]] = set()
+
+    def mark_as_loop(self, source: str, target: str) -> "WorkflowGraph":
+        """标记一条边为合法循环边（不会被死循环检测报告）"""
+        self.loop_edges.add((source, target))
+        return self
+
+    # ── 构建方法 ──
+
+    def add_node(self, node: "Node") -> "WorkflowGraph":
+        """添加节点"""
+        if node.name in self.nodes:
+            logger.warning(f"节点 '{node.name}' 已存在，将被覆盖")
+        self.nodes[node.name] = node
+        return self
+
+    def add_edge(
+        self,
+        source: str,
+        target: str,
+        condition: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        port_map: Optional[Dict[str, str]] = None,
+    ) -> "Edge":
+        """添加普通边，返回 Edge 对象"""
+        from .edge import Edge
+        if source not in self.nodes:
+            raise ValueError(f"源节点 '{source}' 不存在")
+        if target not in self.nodes:
+            raise ValueError(f"目标节点 '{target}' 不存在")
+        edge = Edge(source, target, condition, port_map)
+        self.edges.append(edge)
+        return edge
+
+    def add_conditional_edge(
+        self,
+        source: str,
+        condition_value: str,
+        target: str,
+        port_map: Optional[Dict[str, str]] = None,
+        route_port: str = "route",
+    ) -> "ConditionalEdge":
+        """添加条件边（与 RouterNode 配合），返回 ConditionalEdge 对象"""
+        from .edge import ConditionalEdge
+        if source not in self.nodes:
+            raise ValueError(f"源节点 '{source}' 不存在")
+        if target not in self.nodes:
+            raise ValueError(f"目标节点 '{target}' 不存在")
+        edge = ConditionalEdge(source, condition_value, target, port_map, route_port=route_port)
+        self.edges.append(edge)
+        return edge
+
+    def add_conditional_edges(
+        self,
+        router_node: str,
+        routes: Dict[str, str],
+    ) -> "WorkflowGraph":
+        """批量添加从路由节点出发的条件边"""
+        for condition_value, target in routes.items():
+            self.add_conditional_edge(router_node, condition_value, target)
+        return self
+
+    def set_entry(self, node_name: str) -> "WorkflowGraph":
+        """设置入口节点"""
+        if node_name not in self.nodes:
+            raise ValueError(f"入口节点 '{node_name}' 未注册")
+        self.entry_points.add(node_name)
+        return self
+
+    def set_exit(self, node_name: str) -> "WorkflowGraph":
+        """设置出口节点"""
+        if node_name not in self.nodes:
+            raise ValueError(f"出口节点 '{node_name}' 未注册")
+        self.exit_points.add(node_name)
+        return self
+
+    # ── 获取方法 ──
+
+    def get_node(self, name: str) -> Optional["Node"]:
+        return self.nodes.get(name)
+
+    def get_upstream_edges(self, node_name: str) -> List["Edge"]:
+        """获取指向该节点的所有边"""
+        result = []
+        for edge in self.edges:
+            if hasattr(edge, 'sources'):
+                if node_name in edge.sources:
+                    result.append(edge)
+            elif edge.target == node_name:
+                result.append(edge)
+        return result
+
+    def get_downstream_edges(self, node_name: str) -> List["Edge"]:
+        """获取从该节点出发的所有边"""
+        return [e for e in self.edges if e.source == node_name]
+
+    def get_downstream_nodes(self, node_name: str) -> List[str]:
+        """获取从该节点出发可达的所有下游节点"""
+        targets = set()
+        for edge in self.get_downstream_edges(node_name):
+            targets.add(edge.target)
+            if hasattr(edge, 'sources'):
+                targets.update(edge.sources)
+        return list(targets)
+
+    # ── 构建预定义模式 ──
+
+    @staticmethod
+    def create_thinking_execution_loop(
+        think_node_name: str = "think",
+        router_node_name: str = "router",
+        execute_node_name: str = "execute",
+        complete_node_name: str = "complete",
+    ) -> "WorkflowGraph":
+        """
+        创建「思考→路由→执行→反思→循环/完成」的标准 Agent 循环图
+
+        适用于需要多步推理+工具调用的场景。
+        """
+        from .node import LLMNode, RouterNode, ToolNode
+        graph = WorkflowGraph("agent_loop")
+        return graph
+
+    # ═══════════════════════════════════════
+#  语义级验证（升级版）
+# ═══════════════════════════════════════
+
+    def validate(self, strict: bool = True) -> List[str]:
+        """
+        验证图的完整性（语义感知版）。
+
+        Args:
+            strict: True=严格模式(生产)，False=宽松模式(开发中)
+
+        返回错误列表，空列表 = 通过
+
+        验证项:
+          1. 边引用的节点必须存在
+          2. 必须有入口点
+          3. 所有节点必须从入口点可达（条件边和循环边也算）
+          4. 合法循环 vs 死循环检测
+          5. 语义感知的出边检查（动态调度节点豁免）
+        """
+        errors = []
+
+        errors.extend(self._validate_edge_nodes())
+        errors.extend(self._validate_entry_points())
+        errors.extend(self._validate_reachability())
+        errors.extend(self._validate_cycles())
+        errors.extend(self._validate_downstream(strict=strict))
+
+        return errors
+
+    def is_valid(self) -> bool:
+        return len(self.validate()) == 0
+
+    # ── 验证子步骤 ──
+
+    def _validate_edge_nodes(self) -> List[str]:
+        """验证边引用的节点存在"""
+        errors = []
+        for edge in self.edges:
+            if hasattr(edge, 'sources'):
+                for s in edge.sources:
+                    if s not in self.nodes:
+                        errors.append(f"边引用源节点 '{s}' 不存在")
+            elif edge.source not in self.nodes:
+                errors.append(f"边引用源节点 '{edge.source}' 不存在")
+            if edge.target not in self.nodes:
+                errors.append(f"边引用目标节点 '{edge.target}' 不存在")
+        return errors
+
+    def _validate_entry_points(self) -> List[str]:
+        if not self.entry_points:
+            return ["至少需要一个入口点 (set_entry)"]
+        return []
+
+    def _validate_reachability(self) -> List[str]:
+        """
+        语义化可达性检查。
+
+        从入口点出发，通过所有边类型（普通边、条件边、AllPassEdge）传播。
+        条件边的目标节点即使没有遍历所有分支，也视为条件可达。
+        这样工具节点即使只被某个条件值指向，也算可达。
+        """
+        errors = []
+        reachable = self._compute_reachable()
+        for name in self.nodes:
+            if name not in reachable and name not in self.entry_points:
+                errors.append(
+                    f"节点 '{name}' ({self.nodes[name].node_type}) "
+                    f"不可达——没有从入口点 {list(self.entry_points)} 到它的路径"
+                )
+        return errors
+
+    def _compute_reachable(self) -> Set[str]:
+        """
+        从入口点出发的可达节点集合。
+
+        与旧版区别：遍历 ALL 边类型。变通的边类型通过 source 判断仍能生效：
+        - 普通边: edge.source in reachable → edge.target
+        - 条件边: edge.source in reachable → edge.target（走到哪个分支运行时才定）
+        - 循环边: 不算首次可达传播（防止无限循环），但回边的 target 应先已注册
+        """
+        reachable = set(self.entry_points)
+        changed = True
+        while changed:
+            changed = False
+            for edge in self.edges:
+                # 任何边类型的 source 字段都指向源节点
+                src = edge.source
+                if src in reachable and edge.target not in reachable:
+                    reachable.add(edge.target)
+                    changed = True
+        return reachable
+
+    def _validate_cycles(self) -> List[str]:
+        """验证死循环（合法循环 = 有出口的环）"""
+        if self._has_cycle_without_exit():
+            return ["检测到没有出口的死循环路径"]
+        return []
+
+    def _validate_downstream(self, strict: bool = True) -> List[str]:
+        """
+        语义感知的出边检查。
+
+        节点分类与出边要求:
+        ┌─────────────────┬──────────────────────────┐
+        │ 节点类型 │ 出边要求 │
+        ├─────────────────┼──────────────────────────┤
+        │ 出口节点 │ 无要求 │
+        │ 动态调度节点 │ 无要求（由上游条件激活） │
+        │ LLMNode │ 必须有出边 │
+        │ RouterNode │ 必须有出边（路由出口） │
+        │ 其他节点 │ 必须有出边 │
+        └─────────────────┴──────────────────────────┘
+
+        动态调度节点 = 有 ConditionalEdge 指向它的节点。
+        这类节点在运行时由 ToolDispatchNode / RouterNode 条件激活。
+        """
+        if not strict:
+            return []
+
+        errors = []
+        dynamic_nodes = self._get_dynamic_activated_nodes()
+
+        for name, node in self.nodes.items():
+            if name in self.exit_points:
+                continue
+            if name in dynamic_nodes:
+                continue
+
+            outgoing = self._get_all_outgoing_edges(name)
+            if not outgoing:
+                errors.append(
+                    f"非出口节点 '{name}' ({node.node_type}) 没有出边. "
+                    f"请添加边: graph.add_edge('{name}', '<target>')"
+                )
+
+        return errors
+
+    def _get_dynamic_activated_nodes(self) -> Set[str]:
+        """
+        获取所有动态调度节点。
+
+        包括:
+        1. 条件边指向的节点（ConditionalEdge target）
+        2. 名称以 tool_ 开头的节点（ToolNode，由 ToolDispatchNode 动态调度）
+        """
+        dynamic = set()
+        for edge in self.edges:
+            if hasattr(edge, 'condition_value'):
+                dynamic.add(edge.target)
+        # 工具节点本质上就是动态调度的——由 ToolDispatchNode 激活，不需要静态出边
+        for name in self.nodes:
+            if name.startswith("tool_"):
+                dynamic.add(name)
+        return dynamic
+
+    def _get_all_outgoing_edges(self, node_name: str) -> List:
+        """获取节点的所有出边（普通边 + 条件边 + AllPassEdge）"""
+        outgoing = []
+        for edge in self.edges:
+            if edge.source == node_name:
+                outgoing.append(edge)
+            elif hasattr(edge, 'sources') and node_name in edge.sources:
+                outgoing.append(edge)
+        return outgoing
+
+    def mark_as_loop_edge(self, edge: "Edge") -> "WorkflowGraph":
+        """根据 Edge 对象标记合法循环边"""
+        self.loop_edges.add((edge.source, edge.target))
+        if hasattr(edge, 'sources'):
+            for s in edge.sources:
+                self.loop_edges.add((s, edge.target))
+        return self
+
+    def _has_cycle_without_exit(self) -> bool:
+        """
+        检查是否有不经过出口节点的死循环。
+
+        改进：区分"合法循环边"（如工具→think 的回边）
+        和"死循环"（没有出口的纯环）。
+        """
+        visited = set()
+        rec_stack = set()
+        cycle_nodes: Set[str] = set()
+
+        def dfs(node: str) -> bool:
+            visited.add(node)
+            rec_stack.add(node)
+
+            downstream = self.get_downstream_nodes(node)
+            for target in downstream:
+                # 跳过被标记为合法循环的边
+                if (node, target) in self.loop_edges:
+                    continue
+                if target not in visited:
+                    if dfs(target):
+                        return True
+                elif target in rec_stack:
+                    # 发现环，记录环上所有节点
+                    cycle_nodes.update(rec_stack)
+                    return True
+
+            rec_stack.discard(node)
+            return False
+
+        for entry in self.entry_points:
+            if entry not in visited:
+                dfs(entry)
+
+        if not cycle_nodes:
+            return False
+
+        # 检查环上是否有出口节点
+        for node in cycle_nodes:
+            if node in self.exit_points:
+                return False  # 有出口 = 合法循环
+
+        # 检查环上节点是否有到出口的路径（间接出口）
+        for node in cycle_nodes:
+            if self._has_path_to_exit(node, cycle_nodes):
+                return False
+
+        return True  # 纯死循环
+
+    def _has_path_to_exit(self, node: str, cycle_nodes: Set[str]) -> bool:
+        """检查节点是否能到达出口（不经过环上节点）"""
+        visited = set()
+        stack = [node]
+
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+
+            if current in self.exit_points:
+                return True
+
+            for target in self.get_downstream_nodes(current):
+                if target not in visited and target not in cycle_nodes:
+                    stack.append(target)
+
+        return False
+
+    # ── 详细诊断 ──
+
+    def validate_verbose(self) -> str:
+        """返回详细的验证报告（用于调试）"""
+        errors = self.validate(strict=True)
+        if not errors:
+            return f"✅ 图验证通过\n📊 诊断: {self._diagnostic_line()}"
+
+        report = [
+            f"❌ 图验证失败 ({len(errors)} 个错误):",
+        ]
+        for e in errors:
+            report.append(f"  - {e}")
+
+        report.append("")
+        report.append("📊 诊断信息:")
+        report.append(f"  节点: {len(self.nodes)}")
+        report.append(f"  边: {len(self.edges)}")
+        report.append(f"  入口: {self.entry_points}")
+        report.append(f"  出口: {self.exit_points}")
+        report.append(f"  合法循环边: {len(self.loop_edges)}")
+
+        # 动态调度节点
+        dyn = self._get_dynamic_activated_nodes()
+        if dyn:
+            report.append(f"  条件激活节点: {len(dyn)} 个")
+            for dn in sorted(dyn):
+                # 找哪个条件边指向它
+                reasons = []
+                for e in self.edges:
+                    if hasattr(e, 'condition_value') and e.target == dn:
+                        reasons.append(f"{e.source}[{e.condition_value}]")
+                report.append(f"    - {dn} ({self.nodes[dn].node_type}) via {', '.join(reasons)}")
+
+        # 无出边的节点
+        for name in sorted(self.nodes.keys()):
+            if name in self.exit_points:
+                continue
+            if name in dyn:
+                continue
+            outgoing = self._get_all_outgoing_edges(name)
+            if not outgoing:
+                nt = self.nodes[name].node_type
+                report.append(f"  ⚠️ 无出边: {name} ({nt})")
+
+        return "\n".join(report)
+
+    def analyze(self) -> Dict[str, Any]:
+        """
+        分析图结构，返回完整诊断字典。
+
+        可在启动时调用，帮助快速了解图结构。
+        """
+        return {
+            "name": self.name,
+            "is_valid": self.is_valid(),
+            "errors": self.validate(strict=True),
+            "stats": {
+                "nodes": len(self.nodes),
+                "edges": len(self.edges),
+                "entry_points": len(self.entry_points),
+                "exit_points": len(self.exit_points),
+                "loop_edges": len(self.loop_edges),
+            },
+            "node_types": {
+                name: node.node_type
+                for name, node in self.nodes.items()
+            },
+            "topology": {
+                "entry": sorted(self.entry_points),
+                "exit": sorted(self.exit_points),
+                "dynamically_activated": sorted(self._get_dynamic_activated_nodes()),
+            },
+            "mermaid": self.to_mermaid(),
+        }
+
+    def _diagnostic_line(self) -> str:
+        """一行诊断摘要"""
+        dyn = self._get_dynamic_activated_nodes()
+        return (
+            f"{len(self.nodes)}节点/{len(self.edges)}边, "
+            f"入口={sorted(self.entry_points)}, 出口={sorted(self.exit_points)}, "
+            f"条件激活={len(dyn)}, 循环边={len(self.loop_edges)}"
+        )
+
+    # ── 可视化 ──
+
+    def to_mermaid(self) -> str:
+        """导出为 Mermaid 流程图"""
+        lines = ["graph TD"]
+        lines.append(f"  title[{self.name}]")
+
+        # 节点定义
+        for name, node in self.nodes.items():
+            node_id = name.replace("-", "_").replace(" ", "_")
+            if name in self.entry_points and name in self.exit_points:
+                lines.append(f"  {node_id}([\"{name}\"])")
+            elif name in self.entry_points:
+                lines.append(f"  {node_id}>\"{name}\"]")
+            elif name in self.exit_points:
+                lines.append(f"  {node_id}[\"{name}\"]")
+            else:
+                lines.append(f"  {node_id}[\"{name}\"]")
+
+        # 边定义
+        for edge in self.edges:
+            src_id = edge.source.replace("-", "_").replace(" ", "_")
+            tgt_id = edge.target.replace("-", "_").replace(" ", "_")
+            if hasattr(edge, 'condition_value'):
+                lines.append(f"  {src_id} -- \"{edge.condition_value}\" --> {tgt_id}")
+            elif hasattr(edge, 'sources'):
+                for s in edge.sources:
+                    s_id = s.replace("-", "_").replace(" ", "_")
+                    lines.append(f"  {s_id} -.-> {tgt_id}")
+            else:
+                lines.append(f"  {src_id} --> {tgt_id}")
+
+        return "\n".join(lines)
+
+    def visualize(self) -> str:
+        """获取可视化字符串（方便打印）"""
+        lines = [f"=== WorkflowGraph: {self.name} ===", f"节点 ({len(self.nodes)}):"]
+        for name in sorted(self.nodes.keys()):
+            node = self.nodes[name]
+            entry = " [入口]" if name in self.entry_points else ""
+            exit_ = " [出口]" if name in self.exit_points else ""
+            lines.append(f"  {node.node_type}: {name}{entry}{exit_}")
+        lines.append(f"边 ({len(self.edges)}):")
+        for edge in self.edges:
+            lines.append(f"  {edge}")
+        return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        return f"WorkflowGraph('{self.name}', {len(self.nodes)} nodes, {len(self.edges)} edges)"
+
