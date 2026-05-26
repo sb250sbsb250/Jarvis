@@ -153,7 +153,7 @@ def sse_event(data: dict) -> str:
 def build_agent_graph(
     user_input: str,
     system_prompt: str = "",
-    max_steps: int = 10,
+    max_steps: int = 30,
 ) -> WorkflowGraph:
     """
     构建标准 Agent 执行图（DAG）
@@ -334,7 +334,7 @@ async def chat_stream(
 
         # 3. 初始化 step 计数
         step_count = 0
-        max_steps = 10
+        max_steps = 30
 
         # 4. 构建系统提示词
         system_prompt = """你是 Jarvis，一个强大的智能助手。

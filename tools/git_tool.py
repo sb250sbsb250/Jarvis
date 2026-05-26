@@ -73,10 +73,11 @@ class GitTool(BaseTool):
                                 capture_output=True, text=True, timeout=10)
         branch = subprocess.run(["git", "branch", "--show-current"], cwd=path,
                                 capture_output=True, text=True, timeout=5)
+        branch_name = (branch.stdout or "").strip()
         return ToolResult.success(call_id, self.name, {
-            "branch": branch.stdout.strip(),
-            "status": result.stdout,
-            "dirty": bool(result.stdout.strip()),
+            "branch": branch_name,
+            "status": result.stdout or "",
+            "dirty": bool((result.stdout or "").strip()),
         })
 
     async def _commit(self, call_id: str, path: str,
@@ -89,21 +90,25 @@ class GitTool(BaseTool):
                            capture_output=True, timeout=10)
         result = subprocess.run(["git", "commit", "-m", message], cwd=path,
                                 capture_output=True, text=True, timeout=10)
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
         if result.returncode == 0:
-            return ToolResult.success(call_id, self.name,
-                                      {"output": result.stdout.strip()})
-        return ToolResult.error(call_id, self.name, result.stderr.strip())
+            return ToolResult.success(call_id, self.name, {"output": stdout})
+        return ToolResult.error(call_id, self.name, stderr or "git commit 失败（无 stderr 输出）")
 
     async def _push(self, call_id: str, path: str,
                     remote: str, branch: str) -> ToolResult:
         import subprocess
         if not branch:
-            branch = subprocess.run(["git", "branch", "--show-current"],
-                                    cwd=path, capture_output=True, text=True,
-                                    timeout=5).stdout.strip()
+            branch = (subprocess.run(["git", "branch", "--show-current"],
+                                     cwd=path, capture_output=True, text=True,
+                                     timeout=5).stdout or "").strip()
+        if not branch:
+            return ToolResult.error(call_id, self.name, "无法获取当前分支名，请提供 branch 参数")
         result = subprocess.run(["git", "push", remote, branch], cwd=path,
                                 capture_output=True, text=True, timeout=60)
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
         if result.returncode == 0:
-            return ToolResult.success(call_id, self.name,
-                                      {"output": result.stdout.strip()})
-        return ToolResult.error(call_id, self.name, result.stderr.strip())
+            return ToolResult.success(call_id, self.name, {"output": stdout})
+        return ToolResult.error(call_id, self.name, stderr or "git push 失败（无 stderr 输出）")

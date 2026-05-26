@@ -26,7 +26,7 @@ class ShellExecuteTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "执行 Shell 命令"
+        return "在服务器上执行 Shell 命令。Windows 用 dir/pwd/cd，Linux 用 ls/pwd/cd"
 
     @property
     def parameters(self) -> List[ToolParameter]:
