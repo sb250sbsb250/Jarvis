@@ -24,7 +24,17 @@ env/
 Thumbs.db
 
 # 项目缓存/临时文件
-*.dump.txt
 借款信息汇总.xlsx
 _archive/
 data/
+
+# 日志/调试/转储文件
+tools_dump.txt
+engine_dump.txt
+engine_dump_1.txt
+engine_dump_2.txt
+project_dump.txt
+
+# 测试/演示脚本
+demo.py
+dump_source.py
