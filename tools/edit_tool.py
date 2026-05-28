@@ -25,10 +25,23 @@ class EditTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return ("文本编辑工具。action 可选："
-                "replace(搜索替换)/insert(插入内容)。"
-                "replace 用旧文本精确匹配后替换；"
-                "insert 在指定行号后或指定文本后追加内容。")
+        return (
+            "文本编辑工具。action 可选："
+            "replace(搜索替换)/insert(插入内容)。"
+            "replace 用旧文本精确匹配后替换；"
+            "insert 在指定行号后或指定文本后追加内容。\n"
+            "\n"
+            "📖 使用示例：\n"
+            "  # replace — 搜索替换:\n"
+            "  edit(action='replace', path='app.py', old_text='旧代码', new_text='新代码')\n"
+            "  💡 old_text 必须是唯一匹配（不能有2处相同文本）\n"
+            "\n"
+            "  # insert — 在文本后插入:\n"
+            "  edit(action='insert', path='app.py', insert_after='def hello():', content='    return 42')\n"
+            "\n"
+            "  # insert — 在行号后插入:\n"
+            "  edit(action='insert', path='app.py', insert_line=5, content='# 新行')\n"
+        )
 
     @property
     def parameters(self) -> List[ToolParameter]:

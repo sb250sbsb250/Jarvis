@@ -4,6 +4,7 @@ LLM 客户端 - 封装 DeepSeek/OpenAI API
 
 import os
 import json
+import time
 import logging
 from typing import Any, Dict, List, Optional, AsyncIterator
 from dataclasses import dataclass, field
@@ -78,15 +79,19 @@ class LLMClient:
             OpenAI 格式响应
         """
         # 注意: 使用显式 None 检查确保合法 falsy 值（如 temperature=0.0）不被误吞
-        # kwargs.get("model", default) 在 model=None 时返回 None 而不是 default
         _model = kwargs.pop("model", None)
         _max_tokens = kwargs.pop("max_tokens", None)
         _temperature = kwargs.pop("temperature", None)
+
+        _model = _model if _model is not None else self.config.model
+        _max_tokens = _max_tokens if _max_tokens is not None else self.config.max_tokens
+        _temperature = _temperature if _temperature is not None else self.config.temperature
+
         params = {
-            "model": _model if _model is not None else self.config.model,
+            "model": _model,
             "messages": messages,
-            "max_tokens": _max_tokens if _max_tokens is not None else self.config.max_tokens,
-            "temperature": _temperature if _temperature is not None else self.config.temperature,
+            "max_tokens": _max_tokens,
+            "temperature": _temperature,
             "stream": stream,
         }
 
@@ -94,6 +99,24 @@ class LLMClient:
             params["tools"] = tools
             params["tool_choice"] = "auto"
 
+        # ⭐ LLM 请求日志
+        last_msg = messages[-1] if messages else {}
+        last_content = str(last_msg.get("content", ""))[:200] if isinstance(last_msg, dict) else str(last_msg)[:200]
+        logger.info("─" * 50)
+        logger.info(f"🤖 LLM → {_model}")
+        # 估算输入 token
+        try:
+            from .core.token_estimator import estimate_message_dict
+            total_est = 0
+            for m in messages:
+                if isinstance(m, dict):
+                    total_est += estimate_message_dict(m)
+            logger.info(f"📨 消息: {len(messages)} 条 (~{total_est} tok) | 🔧 工具: {len(tools) if tools else 0} 个")
+        except Exception:
+            logger.info(f"📨 消息: {len(messages)} 条 | 🔧 工具: {len(tools) if tools else 0} 个")
+        logger.info(f"📝 最后一条: [{last_msg.get('role', '?')}] {last_content.replace(chr(10), ' ')[:120]}")
+
+        _llm_start = time.time()
         try:
             response = await self._client.chat.completions.create(**params)
 
@@ -104,12 +127,79 @@ class LLMClient:
                     logger.info("stream tool_calls dropped, retrying with stream=False")
                     params["stream"] = False
                     non_stream_resp = await self._client.chat.completions.create(**params)
-                    return self._to_dict(non_stream_resp)
-                return result
+                    result_dict = self._to_dict(non_stream_resp)
+                else:
+                    result_dict = result if isinstance(result, dict) else {"choices": []}
 
-            return self._to_dict(response)
+                _llm_elapsed = (time.time() - _llm_start) * 1000
+                choice = result_dict.get("choices", [{}])[0] if result_dict.get("choices") else {}
+                msg = choice.get("message", {}) if isinstance(choice, dict) else {}
+                resp_content = (msg.get("content", "") or "")[:200] if isinstance(msg, dict) else ""
+                tc = msg.get("tool_calls", []) if isinstance(msg, dict) else []
+                usage = result_dict.get("usage", {})
+                logger.info(
+                    f"✅ LLM ← ({_llm_elapsed:.0f}ms | "
+                    f"↑{usage.get('prompt_tokens', '?')} ↓{usage.get('completion_tokens', '?')} "
+                    f"Σ{usage.get('total_tokens', '?')})"
+                )
+                if tc:
+                    for t in tc:
+                        fn = t.get("function", {}) if isinstance(t, dict) else {}
+                        name = fn.get("name", "?") if isinstance(fn, dict) else "?"
+                        args_raw = fn.get("arguments", "") if isinstance(fn, dict) else ""
+                        if len(str(args_raw)) > 120:
+                            args_raw = str(args_raw)[:120] + "..."
+                        logger.info(f"  🛠️  工具调用: {name}({args_raw})")
+                if resp_content:
+                    logger.info(f"  💬 回复: {resp_content.replace(chr(10), ' ')[:150]}")
+                logger.info("─" * 50)
+
+                return result if not isinstance(result, dict) else result_dict
+
+            result_dict = self._to_dict(response)
+            _llm_elapsed = (time.time() - _llm_start) * 1000
+
+            # ⭐ LLM 响应日志
+            choice = result_dict.get("choices", [{}])[0] if result_dict.get("choices") else {}
+            msg = choice.get("message", {}) if isinstance(choice, dict) else {}
+            resp_content = (msg.get("content", "") or "")[:200] if isinstance(msg, dict) else ""
+            tc = msg.get("tool_calls", []) if isinstance(msg, dict) else []
+            usage = result_dict.get("usage", {})
+            logger.info(
+                f"✅ LLM ← ({_llm_elapsed:.0f}ms | "
+                f"↑{usage.get('prompt_tokens', '?')} ↓{usage.get('completion_tokens', '?')} "
+                f"Σ{usage.get('total_tokens', '?')})"
+            )
+            if tc:
+                for t in tc:
+                    fn = t.get("function", {}) if isinstance(t, dict) else {}
+                    name = fn.get("name", "?") if isinstance(fn, dict) else "?"
+                    args_raw = fn.get("arguments", "") if isinstance(fn, dict) else ""
+                    if len(str(args_raw)) > 120:
+                        args_raw = str(args_raw)[:120] + "..."
+                    logger.info(f"  🛠️  工具调用: {name}({args_raw})")
+            if resp_content:
+                logger.info(f"  💬 回复: {resp_content.replace(chr(10), ' ')[:150]}")
+            logger.info("─" * 50)
+
+            return result_dict
 
         except Exception as e:
+            _llm_elapsed = (time.time() - _llm_start) * 1000
+            logger.error(f"❌ LLM 调用失败 ({_llm_elapsed:.0f}ms): {e}")
+            # ⭐ 消息格式错误时打印详细分析
+            error_str = str(e)
+            if "tool' must be a response" in error_str or "BadRequestError" in error_str:
+                from .message.validator import MessageDebugger, aggressive_clean
+                MessageDebugger.print_analysis(messages, e)
+                # 激进修复：移除孤立的 tool 消息后重试一次
+                if "tool' must be a response" in error_str:
+                    cleaned = aggressive_clean(messages)
+                    if len(cleaned) != len(messages):
+                        logger.warning(f"激进修复: 消息数 {len(messages)} → {len(cleaned)}")
+                        params["messages"] = cleaned
+                        non_stream_resp = await self._client.chat.completions.create(**params)
+                        return self._to_dict(non_stream_resp)
             logger.error(f"LLM 调用失败: {e}")
             raise
 
@@ -123,6 +213,8 @@ class LLMClient:
         _model = kwargs.pop("model", None)
         _max_tokens = kwargs.pop("max_tokens", None)
         _temperature = kwargs.pop("temperature", None)
+
+        # DeepSeek 思考模型要求原样传回 reasoning_content，不做过滤
         params = {
             "model": _model if _model is not None else self.config.model,
             "messages": messages,
@@ -159,14 +251,21 @@ class LLMClient:
                     },
                 })
 
+        # 保留 reasoning_content（DeepSeek 思考模型要求后续请求必须传回）
+        msg_dict = {
+            "role": msg.role,
+            "content": msg.content or "",
+        }
+        if tool_calls:
+            msg_dict["tool_calls"] = tool_calls
+        rc = getattr(msg, "reasoning_content", None)
+        if rc:
+            msg_dict["reasoning_content"] = rc
+
         return {
             "choices": [{
                 "index": choice.index,
-                "message": {
-                    "role": msg.role,
-                    "content": msg.content or "",
-                    "tool_calls": tool_calls,
-                },
+                "message": msg_dict,
                 "finish_reason": choice.finish_reason,
             }],
             "usage": {

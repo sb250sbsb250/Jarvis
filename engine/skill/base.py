@@ -6,13 +6,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Type, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from enum import Enum
 import time
 
 if TYPE_CHECKING:
-    from ..dag.graph import WorkflowGraph
-    from ..dag.context import ExecutionContext
+    from ..context import ExecutionContext
 
 
 class SkillLevel(Enum):
@@ -45,18 +44,16 @@ class SkillResult:
 
 class Skill(ABC):
     """
-    Skill 基类 — 经过验证的 DAG 执行经验
+    Skill 基类 — 纯配置驱动的 system prompt 提供者
 
     子类必须实现：
     - meta: SkillMeta
-    - required_tools: 需要的工具类列表
-    - build_graph: 构建 DAG 执行图
-    - trigger_keywords: 触发关键词列表
 
     可选实现：
-    - can_handle: 自定义触发判断（默认基于关键词）
-    - on_success: 执行成功回调
-    - on_failure: 执行失败回调
+    - get_system_prompt: 返回 domain prompt 给 AgentLoop
+    - can_handle: 自定义触发判断
+    - on_success / on_failure: 执行回调
+    - trigger_keywords: 触发关键词列表
     """
 
     def __init__(self):
@@ -73,31 +70,16 @@ class Skill(ABC):
         """Skill 元数据"""
         ...
 
-    @property
-    @abstractmethod
-    def required_tools(self) -> List[Type]:
-        """需要的工具类列表"""
-        ...
+    # ── 可选覆盖的方法 ──
 
-    @abstractmethod
-    def build_graph(self, **kwargs) -> "WorkflowGraph":
-        """
-        构建 DAG 执行图
-
-        Args:
-            **kwargs: 动态参数（如 user_input, file_path 等）
-
-        Returns:
-            WorkflowGraph（已验证的执行图）
-        """
-        ...
+    def get_system_prompt(self) -> str:
+        """返回领域系统提示（AgentLoop system_prompt 的一部分）"""
+        return ""
 
     @property
     def trigger_keywords(self) -> List[str]:
         """触发关键词列表（子类可选覆盖）"""
         return []
-
-    # ── 可选覆盖的方法 ──
 
     def can_handle(self, user_input: str) -> float:
         """
@@ -121,7 +103,6 @@ class Skill(ABC):
         exact_matched = sum(1 for kw in self.trigger_keywords if kw.lower() in user_lower)
 
         # 阶段2：子词匹配 — 仅对 >=4 字的关键词拆成 3 字窗
-        # 避免 "看看"、"代码" 这类短子词过度匹配
         sub_matched = 0
         for kw in self.trigger_keywords:
             kw_lower = kw.lower()
@@ -133,34 +114,29 @@ class Skill(ABC):
                     sub_matched += 1
                     break
 
-        # 取两阶段的最大值
         matched = max(exact_matched, sub_matched)
-
         if matched == 0:
             return 0.0
 
-        # 基础分 + 经验加成 + 最近使用加成
-        base_score = matched / len(self.trigger_keywords)
+        safe_matched = min(matched, len(self.trigger_keywords))
+        base_score = safe_matched / len(self.trigger_keywords)
         experience_bonus = min(0.3, self.experience_level.value * 0.08)
         recency_bonus = 0.1 if self.is_recently_used(3600) else 0.0
 
         return min(1.0, base_score + experience_bonus + recency_bonus)
 
     async def on_success(self, ctx: "ExecutionContext", result: SkillResult):
-        """执行成功回调（更新统计）"""
         self._success_count += 1
         self._total_duration_ms += result.duration_ms
         self._last_used_at = time.time()
 
     async def on_failure(self, error: Exception):
-        """执行失败回调"""
         self._failure_count += 1
 
     # ── 统计属性 ──
 
     @property
     def experience_level(self) -> SkillLevel:
-        """根据成功次数返回经验等级"""
         if self._success_count >= 100:
             return SkillLevel.MASTER
         elif self._success_count >= 20:
@@ -171,7 +147,6 @@ class Skill(ABC):
 
     @property
     def success_rate(self) -> float:
-        """成功率"""
         total = self._success_count + self._failure_count
         if total == 0:
             return 0.0
@@ -179,19 +154,16 @@ class Skill(ABC):
 
     @property
     def avg_duration_ms(self) -> float:
-        """平均执行时间"""
         if self._success_count == 0:
             return 0.0
         return self._total_duration_ms / self._success_count
 
     def is_recently_used(self, seconds: float = 3600) -> bool:
-        """最近是否使用过"""
         if self._last_used_at == 0:
             return False
         return (time.time() - self._last_used_at) < seconds
 
     def get_stats(self) -> Dict[str, Any]:
-        """获取统计信息"""
         return {
             "name": self.meta.name,
             "display_name": self.meta.display_name,

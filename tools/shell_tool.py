@@ -26,7 +26,20 @@ class ShellExecuteTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "在服务器上执行 Shell 命令。Windows 用 dir/pwd/cd，Linux 用 ls/pwd/cd"
+        return (
+            "在服务器上执行 Shell 命令。Windows 用 dir/pwd/cd，Linux 用 ls/pwd/cd\n"
+            "\n"
+            "📖 使用示例：\n"
+            "  # Windows 下:\n"
+            "  execute(command='dir', workdir='C:\\project')\n"
+            "  execute(command='python --version')\n"
+            "  # Linux 下:\n"
+            "  execute(command='ls -la', workdir='/home/user')\n"
+            "  # 超时控制:\n"
+            "  execute(command='long_task', timeout=60)\n"
+            "  💡 默认超时 30 秒，长任务设 timeout。\n"
+            "  💡 工作目录用 workdir 参数切换，不用 cd 命令。\n"
+        )
 
     @property
     def parameters(self) -> List[ToolParameter]:

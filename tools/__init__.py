@@ -1,12 +1,6 @@
 """
 工具包 — 注册入口（合并版）
 
-合并记录：
-  P0 git_tool (3→1): GitStatusTool+GitCommitTool+GitPushTool → GitTool
-  P0 file_tool (3→1): FileReadTool+FileWriteTool+FileListTool → FileTool
-  P0 edit_tool (2→1): EditFileTool+InsertInFileTool → EditTool
-  P3 excel_tool (26→1): ExcelAppOps+ExcelCellOps+ExcelSheetOps → ExcelTool
-
 使用方式：
     from tools import register_all_tools
     registry = ToolRegistry()
@@ -25,36 +19,41 @@ logger = logging.getLogger(__name__)
 
 
 # ── 导入所有工具类 ──
-from .file_tool import FileTool
+from .file_tool import ListFilesTool, ReadFileTool, WriteFileTool, FileRenameTool, DiffFileTool, ReadImageTool, ReadPdfTool
 from .excel_tool import ExcelTool
 from .shell_tool import ShellExecuteTool
 from .system_tool import SystemInfoTool, GetTimeTool
 from .edit_tool import EditTool
-from .search_tool import GlobFindTool, GrepSearchTool
+from .code_editor_v3 import ProjectSearchTool, CodeEditorTool
 from .web_tool import WebFetchTool, WebSearchTool
 from .git_tool import GitTool
-from .code_tool import ReadCodeTool, CodeReviewTool
-from .image_tool import ImageGenerateTool
+from .code_tool import CodeSearchTool
 from .pdf_tool import PdfReadTool
-from .schedule_tool import ScheduleAddTool, ScheduleListTool
-from .process_tool import ProcessListTool
+from .word_tool import WordTool
+from .image_recognize_tool import ImageRecognizeTool
 
 
-# ── 工具类列表 ──
+# ── 工具类列表（精简去重版） ──
 ALL_TOOL_CLASSES: List[type] = [
-    FileTool,
+    # 文件读写
+    ListFilesTool, ReadFileTool, WriteFileTool, FileRenameTool,
+    DiffFileTool, ReadImageTool, ReadPdfTool,
+    # Excel（统一版）
     ExcelTool,
-    ShellExecuteTool,
-    SystemInfoTool, GetTimeTool,
-    EditTool,
-    GlobFindTool, GrepSearchTool,
+    # 代码搜索/编辑
+    ProjectSearchTool, CodeEditorTool, CodeSearchTool,
+    # 图片识别
+    ImageRecognizeTool,
+    # 系统
+    ShellExecuteTool, SystemInfoTool, GetTimeTool,
+    # 网络
     WebFetchTool, WebSearchTool,
+    # 编辑
+    EditTool,
+    # 版本控制
     GitTool,
-    ReadCodeTool, CodeReviewTool,
-    ImageGenerateTool,
-    PdfReadTool,
-    ScheduleAddTool, ScheduleListTool,
-    ProcessListTool,
+    # Office
+    WordTool,
 ]
 
 
@@ -71,24 +70,12 @@ def register_all_tools(
     config: Optional[Dict[str, Dict[str, Any]]] = None,
     exclude: Optional[List[str]] = None,
 ) -> _ToolRegistry:
-    """
-    注册所有工具（懒加载）
-
-    Args:
-        registry: 工具注册中心
-        config: 自定义配置，格式: {"tool_name": {"key": "val"}}
-        exclude: 排除的工具名称列表
-
-    Returns:
-        registry（支持链式调用）
-    """
     exclude = exclude or []
     custom_config = config or {}
     registered = 0
     skipped = 0
 
     for tool_class in ALL_TOOL_CLASSES:
-        # 获取工具名称（临时实例化）
         try:
             default_kwargs = DEFAULT_TOOL_CONFIGS.get(tool_class, {})
             temp = tool_class(**default_kwargs)
@@ -102,7 +89,6 @@ def register_all_tools(
             skipped += 1
             continue
 
-        # 合并配置
         kwargs = dict(DEFAULT_TOOL_CONFIGS.get(tool_class, {}))
         if tool_name in custom_config:
             kwargs.update(custom_config[tool_name])

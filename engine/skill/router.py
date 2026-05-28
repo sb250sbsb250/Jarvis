@@ -1,64 +1,49 @@
 """
 skill/router.py — Skill 路由器
 
-负责：
- 1. 接收用户输入 → 路由到最合适的 Skill
- 2. 为 Skill 构建专属 DAG
- 3. 执行并收集结果
- 4. 更新 Skill 统计信息
-
-替代原来的 ExpertOrchestrator，去掉 Expert 层。
+统一走 AgentLoop 执行，不再区分 DAG multi-mode 路径。
 """
 
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional, AsyncIterator, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
 
-from ..dag.graph import WorkflowGraph
-from ..dag.executor import GraphExecutor
 from ..tool.registry import ToolRegistry
 from .registry import SkillRegistry
 from .base import Skill, SkillResult
+
+from ..agent_loop import AgentLoop
 
 logger = logging.getLogger(__name__)
 
 
 class SkillRouter:
     """
-    Skill 路由器 — 替代 ExpertOrchestrator
+    Skill 路由器 — 统一走 AgentLoop
 
     流程:
-    1. 用户输入 → SkillRegistry.route()
-    2. 找到最佳 Skill → Skill.build_graph()
-    3. 构建精简 ToolRegistry → GraphExecutor.run()
-    4. 收集结果 → 更新 Skill 统计
-
-    支持模式:
-    - single: 单 Skill 执行（默认）
-    - sequential: 多 Skill 顺序执行
-    - debate: 多 Skill 并行 → LLM 汇总
+    1. 路由 → 匹配 Skill
+    2. 构建 system_prompt（base + Skill domain）
+    3. AgentLoop.run() 执行
     """
 
     def __init__(
         self,
         llm_client: Any,
         skill_registry: Optional[SkillRegistry] = None,
-        default_mode: str = "single",
+        tool_registry: Optional[ToolRegistry] = None,
     ):
         self.llm_client = llm_client
         self.skill_registry = skill_registry or SkillRegistry()
-        self.default_mode = default_mode
-
-    # ── 公共 API ──
+        self.tool_registry = tool_registry or ToolRegistry()
 
     async def process(
         self,
         user_input: str,
         skill_name: Optional[str] = None,
-        mode: Optional[str] = None,
         history: Optional[Any] = None,
-        enable_tracing: bool = True,
+        on_event: Optional[Callable[[str, Dict], Awaitable[None]]] = None,
         **kwargs,
     ) -> SkillResult:
         """
@@ -67,282 +52,128 @@ class SkillRouter:
         Args:
             user_input: 用户输入
             skill_name: 指定 Skill 名称（None = 自动路由）
-            mode: 执行模式（single/sequential/debate）
             history: 消息历史
-            enable_tracing: 是否启用追踪
-            **kwargs: 传给 Skill.build_graph() 的额外参数
+            on_event: 事件回调 async fn(event_type, data)
+            **kwargs: 传给 AgentLoop.run() 的额外参数
 
         Returns:
             SkillResult
         """
-        mode = mode or self.default_mode
-
         # 1. 路由
         if skill_name:
             skill = self.skill_registry.route_exact(skill_name)
             if not skill:
-                return SkillResult(
-                    success=False,
-                    error=f"Skill '{skill_name}' 不存在",
-                )
-            candidates = [(skill, 1.0)]
+                logger.info(f"🎯 指定 Skill '{skill_name}' 不存在")
+                return SkillResult(success=False, error=f"Skill '{skill_name}' 不存在")
+            logger.info(f"🎯 指定 Skill: {skill.meta.display_name} ({skill.meta.name})")
         else:
-            candidates = self.skill_registry.route(user_input, top_k=3)
-            if not candidates:
-                return SkillResult(
-                    success=False,
-                    error="未找到合适的 Skill 处理该请求",
+            candidates = self.skill_registry.route(user_input, top_k=1)
+            skill = candidates[0][0] if candidates else None
+            if skill:
+                logger.info(
+                    f"🎯 Skill 匹配: {skill.meta.display_name} ({skill.meta.name}) | "
+                    f"置信度: {candidates[0][1]:.0%} | "
+                    f"候选: {[(s.meta.name, f'{c:.0%}') for s, c in candidates[:3]]}"
                 )
+            else:
+                logger.info("🎯 无匹配 Skill，走 AgentLoop 自主执行")
 
-        # 2. 执行
-        if mode == "single" or len(candidates) == 1:
-            return await self._run_single(
-                candidates[0][0], user_input, history, enable_tracing, **kwargs
-            )
-        elif mode == "sequential":
-            return await self._run_sequential(
-                candidates, user_input, history, enable_tracing, **kwargs
-            )
-        elif mode == "debate":
-            return await self._run_debate(
-                candidates, user_input, history, enable_tracing, **kwargs
-            )
+        # 2. 构建 system_prompt
+        system_prompt = self._get_base_system_prompt()
+        skill_prompt = ""
+        if skill and hasattr(skill, 'get_system_prompt'):
+            skill_prompt = skill.get_system_prompt()
+            if skill_prompt:
+                system_prompt = (
+                    f"你是 {skill.meta.display_name} 专家。\n\n"
+                    f"{skill_prompt}\n\n"
+                    f"{system_prompt}"
+                )
+                logger.debug(f"  合并技能提示: {len(skill_prompt)} 字符")
+            else:
+                logger.debug(f"  Skill {skill.meta.name}: skill.md 无 system 段")
         else:
-            return SkillResult(success=False, error=f"未知模式: {mode}")
+            logger.debug(f"  Skill 无 get_system_prompt 方法")
 
-    # ── 执行模式 ──
+        logger.info(f"📝 最终 system_prompt: ~{len(system_prompt)} 字符 | Skill: {skill.meta.display_name if skill else '无'}")
 
-    async def _run_single(
-        self,
-        skill: Skill,
-        user_input: str,
-        history: Optional[Any],
-        enable_tracing: bool,
-        **kwargs,
-    ) -> SkillResult:
-        """单 Skill 执行"""
-        start_time = time.time()
+        # 3. AgentLoop 执行
+        loop = AgentLoop(
+            llm_client=self.llm_client,
+            tool_registry=self.tool_registry,
+            system_prompt=system_prompt,
+        )
+
+        history_list: Optional[List[Dict]] = None
+        if history is not None:
+            if hasattr(history, "get_for_llm"):
+                history_list = history.get_for_llm()
+            elif isinstance(history, list):
+                history_list = history
 
         try:
-            # 构建精简工具注册表
-            mini_registry = ToolRegistry()
-            for tool_cls in skill.required_tools:
-                mini_registry.register(tool_cls)
-
-            # 构建 Skill 专属 DAG
-            graph = skill.build_graph(user_input=user_input, **kwargs)
-
-            # 准备输入
-            messages = self._prepare_messages(user_input, history)
-            openai_tools = mini_registry.get_openai_tools()
-
-            # 执行
-            executor = GraphExecutor(self.llm_client, mini_registry)
-            ctx = await executor.run(
-                graph=graph,
-                initial_input={
-                    "messages": messages,
-                    "tools": openai_tools,
-                },
-                enable_tracing=enable_tracing,
+            # AgentLoop.run() 只接受部分参数，过滤掉多余的 kwargs
+            loop_kwargs = {}
+            for k in ("working_dir",):
+                if k in kwargs:
+                    loop_kwargs[k] = kwargs[k]
+            result = await loop.run(
+                task=user_input,
+                history=history_list,
+                on_event=on_event,
+                **loop_kwargs,
             )
-
-            # 提取内容
-            content = self._extract_content(ctx)
-
-            duration_ms = (time.time() - start_time) * 1000
-
-            result = SkillResult(
-                success=True,
-                content=content,
-                data={"ctx": ctx},
-                duration_ms=duration_ms,
-            )
-
-            # 更新统计
-            await skill.on_success(ctx, result)
-
-            logger.info(
-                f"✅ Skill '{skill.meta.name}' 执行成功 "
-                f"({duration_ms:.0f}ms)"
-            )
-
-            return result
-
         except Exception as e:
-            logger.exception(f"❌ Skill '{skill.meta.name}' 执行失败: {e}")
-            await skill.on_failure(e)
-
-            return SkillResult(
-                success=False,
-                error=str(e),
-                duration_ms=(time.time() - start_time) * 1000,
-            )
-
-    async def _run_sequential(
-        self,
-        candidates: List[Tuple[Skill, float]],
-        user_input: str,
-        history: Optional[Any],
-        enable_tracing: bool,
-        **kwargs,
-    ) -> SkillResult:
-        """顺序执行多个 Skill"""
-        results = []
-        current_input = user_input
-
-        for skill, _ in candidates[:3]:  # 最多3个
-            result = await self._run_single(
-                skill, current_input, history, enable_tracing, **kwargs
-            )
-            results.append(result)
-
-            if not result.success:
-                break
-
-            # 前一个 Skill 的输出作为下一个的输入
-            current_input = (
-                f"上一个 Skill [{skill.meta.display_name}] 的处理结果:\n"
-                f"{result.content[:2000]}\n\n"
-                f"请基于以上结果继续处理。原始需求: {user_input}"
-            )
-
-        # 汇总结果
-        if results:
-            last = results[-1]
-            last.data["sequential_results"] = results
-            last.data["skills_used"] = [s.meta.name for s, _ in candidates[:len(results)]]
-            return last
-
-        return SkillResult(success=False, error="所有 Skill 执行失败")
-
-    async def _run_debate(
-        self,
-        candidates: List[Tuple[Skill, float]],
-        user_input: str,
-        history: Optional[Any],
-        enable_tracing: bool,
-        **kwargs,
-    ) -> SkillResult:
-        """辩论模式 — 多 Skill 并行执行，LLM 汇总"""
-        top_k = min(3, len(candidates))
-
-        # 并行执行
-        tasks = [
-            self._run_single(skill, user_input, history, enable_tracing, **kwargs)
-            for skill, _ in candidates[:top_k]
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # 收集有效意见
-        opinions = []
-        for (skill, confidence), result in zip(candidates[:top_k], results):
-            if isinstance(result, SkillResult) and result.success:
-                opinions.append({
-                    "skill": skill.meta.display_name,
-                    "icon": skill.meta.icon,
-                    "level": skill.experience_level.name,
-                    "confidence": confidence,
-                    "content": result.content,
-                })
-
-        if not opinions:
-            return SkillResult(success=False, error="所有 Skill 执行失败")
-
-        # LLM 汇总
-        try:
-            final_content = await self._summarize_opinions(user_input, opinions)
-        except Exception as e:
-            final_content = f"汇总失败: {e}\n\n" + "\n\n---\n\n".join(
-                f"### {o['skill']}\n{o['content'][:500]}" for o in opinions
-            )
+            logger.exception(f"AgentLoop 执行失败: {e}")
+            return SkillResult(success=False, error=f"AgentLoop 执行失败: {e}")
 
         return SkillResult(
-            success=True,
-            content=final_content,
-            data={
-                "opinions": opinions,
-                "skills_used": [o["skill"] for o in opinions],
-            },
+            success=result.get("success", False),
+            content=result.get("content", ""),
+            data={"agent_steps": result.get("rounds", 0)},
         )
 
-    # ── 辅助方法 ──
+    def _get_base_system_prompt(self) -> str:
+        """获取基础系统提示词"""
+        return """你是 Jarvis，一个强大的智能助手。
 
-    def _prepare_messages(
-        self, user_input: str, history: Optional[Any]
-    ) -> List[Dict]:
-        """准备 LLM 消息"""
-        if history is None:
-            msgs = []
-        elif hasattr(history, "get_for_llm"):
-            msgs = history.get_for_llm()
-        elif isinstance(history, list):
-            msgs = list(history)
-        else:
-            msgs = []
+## 核心能力
+你可以使用各种工具来完成任务。工具调用使用 OpenAI function calling 格式。
 
-        msgs.append({"role": "user", "content": user_input})
-        return msgs
+## 工具使用指南
+- 当需要信息时，先使用搜索/读取工具获取信息
+- 当需要修改文件时，使用编辑/写入工具
+- 工具调用后，分析结果再决定下一步
+- 如果工具失败，分析错误信息并尝试其他方式
 
-    def _extract_content(self, ctx) -> str:
-        """从执行上下文提取内容"""
-        try:
-            # 尝试多个常见节点名称
-            for node_name in ["complete", "think", "aggregate_results", "generate_report"]:
-                output = ctx.get_node_output(node_name, "output")
-                if output is not None:
-                    data = output.data if hasattr(output, "data") else output
-                    if isinstance(data, dict):
-                        content = data.get("content", "")
-                        if content:
-                            return content
-                    elif isinstance(data, str):
-                        return data
+## 效率原则（严格遵守）
+- 一次只做一件事
+- 不重复读同一个文件
+- 能一步完成的不要分两步
+- 工具调用后必须检查结果
 
-            # 回退：取最后一个节点的输出
-            all_outputs = ctx.get_all_node_outputs()
-            if all_outputs:
-                last_key = list(all_outputs.keys())[-1]
-                last_output = all_outputs[last_key]
-                if isinstance(last_output, dict):
-                    for val in last_output.values():
-                        if isinstance(val, str):
-                            return val
-                    return str(last_output)
-                return str(last_output)
+## 常见任务模式
+### 代码匹配/查找
+1. 用 project_search 或 code_search 查找目标代码
+2. 用 read_file 读取确认
+3. 用 edit 或 write_file 修改
 
-            return ""
-        except Exception:
-            return ""
+### Excel 数据处理
+1. 用 excel 工具读取/分析
+2. 处理完成后用 write_file 保存结果
 
-    async def _summarize_opinions(
-        self, user_input: str, opinions: List[dict]
-    ) -> str:
-        """LLM 汇总多个 Skill 的意见"""
-        opinions_text = "\n\n".join(
-            f"### {o['icon']} {o['skill']} ({o['level']}, 置信度:{o['confidence']:.0%})\n"
-            f"{o['content'][:1500]}"
-            for o in opinions
-        )
+### 文件分析
+1. 用 read_file / read_pdf / read_image 读文件
+2. 分析内容后给出结论
 
-        prompt = f"""你是 Supervisor，负责综合多个 Skill 的执行结果。
+### 图片处理
+1. 用 read_image 确认图片内容
+2. 用 image_recognize 识别文字
+3. 根据需求用工具处理
 
-## 用户问题
-{user_input}
+## 回答要求
+- 用中文回答
+- 给出清晰、具体的结论
+- 列出操作步骤和结果
 
-## 各 Skill 执行结果
-{opinions_text}
-
-请综合以上结果，给出最终答案。如果有分歧，说明分歧点并给出判断。"""
-
-        response = await self.llm_client.chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            tools=None,
-            stream=False,
-        )
-
-        return (
-            response.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
+请根据用户的问题，逐步思考并使用合适的工具。"""

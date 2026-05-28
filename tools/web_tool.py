@@ -24,7 +24,16 @@ class WebFetchTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "获取网页内容并转为 Markdown"
+        return (
+            "获取网页内容并转为 Markdown\n"
+            "\n"
+            "📖 使用示例：\n"
+            "  # 抓取网页内容:\n"
+            "  web_fetch(url='https://example.com')\n"
+            "  # 限制返回长度:\n"
+            "  web_fetch(url='https://example.com', max_chars=3000)\n"
+            "  💡 返回纯文本 Markdown，适合 LLM 阅读。\n"
+        )
 
     @property
     def parameters(self) -> List[ToolParameter]:
@@ -86,7 +95,18 @@ class WebSearchTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "搜索互联网信息"
+        return (
+            "搜索互联网信息\n"
+            "\n"
+            "📖 使用示例：\n"
+            "  # 基本搜索:\n"
+            "  web_search(query='Python 异步编程教程')\n"
+            "  # 限制返回结果数:\n"
+            "  web_search(query='Python 教程', count=3)\n"
+            "  # 按时间过滤:\n"
+            "  web_search(query='最新 AI 新闻', freshness='day')\n"
+            "  💡 返回标题+摘要+URL，需要详细内容再用 web_fetch 抓取。\n"
+        )
 
     @property
     def parameters(self) -> List[ToolParameter]:

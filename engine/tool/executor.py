@@ -3,6 +3,7 @@
 （懒加载触发点：这里调用 registry.get() 时才实例化）
 """
 import asyncio
+import json
 import logging
 from typing import List, Optional
 
@@ -27,8 +28,8 @@ class ToolExecutor:
     def set_max_parallel(self, max_parallel: int) -> None:
         self._max_parallel = max_parallel
 
-    async def execute_one(self, call: ToolCall, timeout: Optional[float] = None) -> ToolResult:
-        """执行单个工具调用（带超时控制 + 权限检查）"""
+    async def execute_one(self, call: ToolCall, timeout: Optional[float] = None, max_retries: int = 2) -> ToolResult:
+        """执行单个工具调用（带超时控制 + 权限检查 + 自动重试）"""
         # ── 权限检查 ──
         if self.policy:
             access = self.policy.check(call.name, call.id)
@@ -38,7 +39,6 @@ class ToolExecutor:
                     f"工具 '{call.name}' 已被禁止执行"
                 )
             elif access == AccessLevel.REQUIRE_APPROVAL:
-                # 挂起等待人类审批
                 logger.warning(f"⏸️ 工具 '{call.name}' 等待审批 (call_id={call.id[:12]})")
                 return ToolResult.error(
                     call.id, call.name,
@@ -46,33 +46,64 @@ class ToolExecutor:
                 )
 
         tool = self.registry.get(call.name)
-
         if not tool:
-            return ToolResult.error(
-                call.id, call.name,
-                f"工具 '{call.name}' 未注册"
-            )
+            return ToolResult.error(call.id, call.name, f"工具 '{call.name}' 未注册")
 
         is_valid, error_msg = tool.validate_args(call.arguments)
         if not is_valid:
             return ToolResult.error(call.id, call.name, error_msg or "参数无效")
 
-        try:
-            timeout_val = timeout if timeout is not None else self._default_timeout
-            logger.debug(f"执行工具: {call.name} (超时: {timeout_val}s)")
-            result = await asyncio.wait_for(
-                tool.execute(call.id, **call.arguments),
-                timeout=timeout_val
-            )
-            return result
-        except asyncio.TimeoutError:
-            return ToolResult.error(
-                call.id, call.name,
-                f"工具执行超时 ({timeout_val}s)"
-            )
-        except Exception as e:
-            logger.exception(f"工具 {call.name} 异常: {e}")
-            return ToolResult.error(call.id, call.name, str(e))
+        # 使用工具级重试配置（如果工具定义了的话）
+        tool_retry_errors = getattr(tool, 'retryable_exceptions', (ConnectionError, TimeoutError, OSError))
+        tool_max_retries = getattr(tool, 'max_retries', max_retries)
+
+        last_error = None
+        retryable_errors = tool_retry_errors
+        timeout_val = timeout if timeout is not None else self._default_timeout
+
+        logger.info(
+            f"🔧 执行工具: {call.name} | "
+            f"参数: {json.dumps(call.arguments, ensure_ascii=False)[:200]}"
+        )
+
+        for attempt in range(tool_max_retries + 1):
+            try:
+                if attempt > 0:
+                    backoff = 2 ** attempt  # 指数退避: 2s, 4s
+                    cause = last_error.error_message if last_error and hasattr(last_error, 'error_message') else (str(last_error) if last_error else '超时')
+                    logger.warning(f"🔄 工具 '{call.name}' 第 {attempt}/{tool_max_retries} 次重试 (原因: {cause}) (等待 {backoff}s)")
+                    await asyncio.sleep(backoff)
+
+                result = await asyncio.wait_for(
+                    tool.execute(call.id, **call.arguments),
+                    timeout=timeout_val
+                )
+
+                # 工具自身返回错误但可重试
+                if result.is_success() or attempt >= tool_max_retries:
+                    return result
+
+                last_error = result
+                logger.warning(f"工具 '{call.name}' 返回错误: {result.error_message}, 准备重试")
+
+            except asyncio.TimeoutError:
+                last_error = ToolResult.error(call.id, call.name, f"工具执行超时 ({timeout_val}s)")
+                if attempt >= tool_max_retries:
+                    return last_error
+                logger.warning(f"工具 '{call.name}' 超时，准备重试 (attempt {attempt + 1})")
+
+            except retryable_errors as e:
+                last_error = ToolResult.error(call.id, call.name, str(e))
+                if attempt >= tool_max_retries:
+                    return last_error
+                logger.warning(f"工具 '{call.name}' 可重试异常: {e}, 准备重试")
+
+            except Exception as e:
+                # 非可重试异常，直接返回
+                logger.exception(f"工具 {call.name} 异常: {e}")
+                return ToolResult.error(call.id, call.name, str(e))
+
+        return last_error or ToolResult.error(call.id, call.name, "执行失败: 未知错误")
 
     async def execute_parallel(
         self,

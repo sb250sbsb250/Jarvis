@@ -2,15 +2,99 @@
 会话管理器 - 管理多个会话的生命周期
 """
 
+import json
 import logging
+import os
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+from pathlib import Path
 
 from .session import Session
 from ..storage.store import MessageStore
-from ..storage.file_store import FileMessageStore
+from ..message.message_list import MessageList
 
 logger = logging.getLogger(__name__)
+
+
+class JsonFileStore(MessageStore):
+    """基于 JSON 文件的会话存储"""
+
+    def __init__(self, store_dir: str):
+        self._dir = Path(store_dir)
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._logger = logging.getLogger(__name__)
+
+    def _session_path(self, sid: str) -> Path:
+        return self._dir / f"{sid}.json"
+
+    async def save_session(self, session: Session) -> None:
+        path = self._session_path(session.session_id)
+        data = {
+            "session_id": session.session_id,
+            "messages": session.messages.to_dict_list()
+            if hasattr(session.messages, 'to_dict_list')
+            else [{"role": m.role, "content": m.content}
+                  for m in getattr(session.messages, '_messages', [])],
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    async def load_session(self, sid: str) -> Optional[Session]:
+        path = self._session_path(sid)
+        if not path.exists():
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            session = Session(session_id=data["session_id"])
+            for m in data.get("messages", []):
+                role = m["role"]
+                if role == "user":
+                    session.messages.add_user(m.get("content", ""))
+                elif role == "assistant":
+                    session.messages.add_assistant(m.get("content", ""))
+                elif role == "tool":
+                    session.messages.add_tool(
+                        call_id=m.get("tool_call_id", ""),
+                        content=m.get("content", ""),
+                    )
+                else:
+                    session.messages._messages.append(
+                        type(session.messages._messages[0])(
+                            role=role,
+                            content=m.get("content", ""),
+                        )
+                    )
+            return session
+        except Exception as e:
+            self._logger.error(f"加载会话失败 {sid}: {e}")
+            return None
+
+    async def delete_session(self, sid: str) -> None:
+        path = self._session_path(sid)
+        if path.exists():
+            path.unlink()
+
+    async def list_sessions(self, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """返回会话摘要列表，与 MessageStore 接口一致"""
+        summaries = []
+        for p in self._dir.glob("*.json"):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                summaries.append({
+                    "session_id": data.get("session_id", p.stem),
+                    "messages": len(data.get("messages", [])),
+                })
+            except Exception:
+                summaries.append({
+                    "session_id": p.stem,
+                    "messages": 0,
+                })
+        return summaries
+
+    async def session_exists(self, sid: str) -> bool:
+        return self._session_path(sid).exists()
 
 
 class SessionManager:
@@ -28,11 +112,16 @@ class SessionManager:
         """
         Args:
             store: 存储实例
-            storage_dir: 存储目录（如果使用默认文件存储）
+            storage_dir: 存储目录（如果不传 store，自动创建 JSON 文件存储）
         """
-        self._store = store or FileMessageStore(storage_dir)
+        self._store = store or self._create_default_store(storage_dir)
         self._sessions: Dict[str, Session] = {}
         self._current_session_id: Optional[str] = None
+
+    @staticmethod
+    def _create_default_store(storage_dir: str) -> "MessageStore":
+        """创建默认的 JSON 文件消息存储"""
+        return JsonFileStore(storage_dir)
 
     async def create_session(
         self,

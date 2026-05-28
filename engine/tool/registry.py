@@ -1,7 +1,9 @@
 """
 工具注册中心 - 纯懒加载模式
 """
+import json
 import logging
+import time
 from typing import Dict, Optional, List, Type, Any, Callable
 from threading import Lock
 
@@ -22,6 +24,7 @@ class ToolRegistry:
     """
 
     _instance: Optional["ToolRegistry"] = None
+    _cache_version: int = 0
 
     def __new__(cls):
         if cls._instance is None:
@@ -42,11 +45,34 @@ class ToolRegistry:
         # Schema 缓存: {name: ToolSchema}
         self._schema_cache: Dict[str, ToolSchema] = {}
 
+        # OpenAI 格式缓存
+        self._openai_tools_cache: Optional[List[Dict]] = None
+
+        # 调用结果缓存: {cache_key: (timestamp, ToolResult)}
+        self._result_cache: Dict[str, tuple] = {}
+        self._result_cache_ttl: float = 300.0  # 5 分钟
+
         # 线程锁
         self._lock = Lock()
 
         self._initialized = True
         logger.debug("ToolRegistry 初始化（纯懒加载模式）")
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """重置单例（仅用于测试）"""
+        if cls._instance:
+            cls._instance.clear()
+        cls._instance = None
+        cls._cache_version += 1
+
+    @classmethod
+    def create_new(cls) -> "ToolRegistry":
+        """创建新的独立实例（用于测试）"""
+        instance = super(ToolRegistry, cls).__new__(cls)
+        instance._initialized = False
+        instance.__init__()
+        return instance
 
     # ========== 注册（只存类，不实例化） ==========
 
@@ -75,6 +101,7 @@ class ToolRegistry:
             self._registry[name] = (tool_class, dict(init_kwargs))
             self._cache.pop(name, None)
             self._schema_cache.pop(name, None)
+            self._openai_tools_cache = None
 
             logger.debug(f"注册工具类: {name} (懒加载)")
         return self
@@ -129,8 +156,12 @@ class ToolRegistry:
         return schemas
 
     def get_openai_tools(self) -> List[Dict]:
-        """获取 OpenAI 格式的工具列表"""
-        return [schema.to_openai_tool() for schema in self.get_all_schemas()]
+        """获取 OpenAI 格式的工具列表（带缓存）"""
+        if self._openai_tools_cache is not None:
+            return self._openai_tools_cache
+        result = [schema.to_openai_tool() for schema in self.get_all_schemas()]
+        self._openai_tools_cache = result
+        return result
 
     # ========== 获取实例（真正使用时才实例化并缓存） ==========
 
@@ -169,6 +200,35 @@ class ToolRegistry:
     def cached_count(self) -> int:
         return len(self._cache)
 
+    # ========== 结果缓存 ==========
+
+    def get_cached_result(self, tool_name: str, args: Dict) -> Optional[Any]:
+        """从结果缓存获取，过期返回 None"""
+        import json
+        key = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
+        entry = self._result_cache.get(key)
+        if not entry:
+            return None
+        cached_at, result = entry
+        if time.monotonic() - cached_at > self._result_cache_ttl:
+            self._result_cache.pop(key, None)
+            return None
+        return result
+
+    def cache_result(self, tool_name: str, args: Dict, result: Any) -> None:
+        """缓存调用结果"""
+        import json
+        key = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
+        self._result_cache[key] = (time.monotonic(), result)
+        # 简单清理：超过 1000 条时清理 50%
+        if len(self._result_cache) > 1000:
+            sorted_items = sorted(
+                self._result_cache.items(),
+                key=lambda x: x[1][0],
+            )
+            for k, _ in sorted_items[:len(sorted_items) // 2]:
+                self._result_cache.pop(k, None)
+
     def get_status(self) -> Dict:
         return {
             "registered": self.count(),
@@ -192,6 +252,7 @@ class ToolRegistry:
             count = len(self._cache)
             self._cache.clear()
             self._schema_cache.clear()
+            self._openai_tools_cache = None
             logger.debug(f"清除 {count} 个工具实例缓存")
 
     def clear(self) -> "ToolRegistry":

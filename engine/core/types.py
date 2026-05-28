@@ -127,6 +127,7 @@ class Message:
     """消息实体"""
     role: Role
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
@@ -136,6 +137,8 @@ class Message:
         result = {"role": self.role.value}
         if self.content is not None:
             result["content"] = self.content
+        if self.reasoning_content:
+            result["reasoning_content"] = self.reasoning_content
         if self.tool_calls:
             result["tool_calls"] = [
                 tc.to_openai_format() if hasattr(tc, 'to_openai_format')
@@ -157,6 +160,7 @@ class Message:
         return cls(
             role=Role(data.get("role", "user")),
             content=data.get("content"),
+            reasoning_content=data.get("reasoning_content"),
             tool_calls=tool_calls,
             tool_call_id=data.get("tool_call_id"),
             name=data.get("name"),
@@ -167,7 +171,7 @@ class Message:
         return cls(role=Role.USER, content=content)
 
     @classmethod
-    def assistant(cls, content: str, tool_calls: Optional[List] = None) -> "Message":
+    def assistant(cls, content: str, tool_calls: Optional[List] = None, reasoning_content: Optional[str] = None) -> "Message":
         """创建助手消息，自动将原始 dict 转换为 ToolCall 对象"""
         if tool_calls:
             converted = []
@@ -177,7 +181,7 @@ class Message:
                 else:
                     converted.append(tc)
             tool_calls = converted
-        return cls(role=Role.ASSISTANT, content=content, tool_calls=tool_calls)
+        return cls(role=Role.ASSISTANT, content=content, tool_calls=tool_calls, reasoning_content=reasoning_content)
 
     @classmethod
     def tool(cls, call_id: str, content: str) -> "Message":

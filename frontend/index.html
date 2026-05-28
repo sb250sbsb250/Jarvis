@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Jarvis V3 - 智能助手</title>
-    <link rel="stylesheet" href="/static/style.css">
-    <script src="/static/vue.global.js"></script>
+    <link rel="stylesheet" href="/static/style.css?v=1779765141">
+    <script src="/static/vue.global.js?v=1779765141"></script>
     <script>
         window.__vClickOutside = {
             mounted(el, binding) {
@@ -51,8 +51,17 @@
         <main class="main-content">
             <div class="chat-container">
                 <div class="chat-header">
-                    <h1>与 Jarvis 对话</h1>
-                    <p>基于四层状态机架构的智能助手</p>
+                    <div class="chat-header-left">
+                        <h1>与 Jarvis 对话</h1>
+                        <p>基于四层状态机架构的智能助手</p>
+                    </div>
+                    <div class="chat-header-right">
+                        <label class="toggle-switch model-toggle-top" title="切换模型">
+                            <input type="checkbox" v-model="isProModel" @change="toggleModel">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="model-badge" :class="modelName === 'deepseek-v4-pro' ? 'pro' : 'flash'">{{ modelName === 'deepseek-v4-pro' ? 'Pro' : 'Flash' }}</span>
+                    </div>
                 </div>
 
                 <div class="chat-messages" ref="msgContainer">
@@ -95,14 +104,7 @@
         <div v-if="showSettings" v-click-outside="() => showSettings = false" class="settings-panel">
             <button class="close-settings" @click="showSettings = false">✕</button>
             <h3>⚙️ 设置</h3>
-            <div class="settings-group">
-                <label>模型选择</label>
-                <select v-model="modelName">
-                    <option value="deepseek-chat">DeepSeek Chat</option>
-                    <option value="deepseek-reasoner">DeepSeek Reasoner</option>
-                </select>
-                <div class="mode-description">使用 DeepSeek API 作为 LLM 后端</div>
-            </div>
+
             <hr style="border-color:var(--border-subtle);margin:16px 0;">
             <div class="api-key-header">🔑 API Key 配置</div>
             <div v-for="p in apiProviders" :key="p.id" class="api-key-section">
@@ -116,7 +118,7 @@
         </div>
     </div>
 
-    <script src="/static/api.js"></script>
-    <script src="/static/app.js"></script>
+    <script src="/static/api.js?v=1779765141"></script>
+    <script src="/static/app.js?v=1779765141"></script>
 </body>
 </html>

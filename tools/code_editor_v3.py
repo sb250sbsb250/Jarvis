@@ -44,7 +44,15 @@ class ProjectSearchTool(BaseTool):
             "用法:\n"
             "  - 传 keyword 搜索文件内容（返回匹配行）\n"
             "  - 传 file_path 直接读取文件内容\n"
-            "支持通配符 file_pattern 过滤文件类型（默认 *.py）"
+            "支持通配符 file_pattern 过滤文件类型（默认 *.py）\n"
+            "\n"
+            "📖 使用示例：\n"
+            "  # 搜索关键字:\n"
+            "  search_code(keyword='def hello', file_pattern='*.py')\n"
+            "  # 读取文件（比 read_file 更轻量，适合快速看代码摘要）:\n"
+            "  search_code(file_path='app.py')\n"
+            "  # 搜索所有 .txt 文件:\n"
+            "  search_code(keyword='error', file_pattern='*.txt')\n"
         )
 
     @property
@@ -152,8 +160,23 @@ class CodeEditorTool(BaseTool):
             "  - diff:     预览修改（安全，不写入文件）\n"
             "  - write:    写入修改（自动备份，支持 edit_id 回滚）\n"
             "  - rollback: 回滚修改（传 edit_id 回滚指定编辑，不传回滚最后一步）\n"
-            "  - append:   追加内容到文件末尾\n\n"
-            "安全流程: read → diff → write（确认 diff 后）"
+            "  - append:   追加内容到文件末尾\n"
+            "\n"
+            "安全流程: read → diff → write（确认 diff 后）\n"
+            "\n"
+            "📖 使用示例：\n"
+            "  # 读文件（支持分页）:\n"
+            "  code_editor(action='read', path='app.py')\n"
+            "  code_editor(action='read', path='app.py', offset=50, limit=100)\n"
+            "  # 预览替换效果（不改文件）:\n"
+            "  code_editor(action='diff', path='app.py', old_text='def foo():', new_text='def bar():')\n"
+            "  # 实际写入（确认 diff 无误后）:\n"
+            "  code_editor(action='write', path='app.py', old_text='def foo():', new_text='def bar():')\n"
+            "  # 回滚:\n"
+            "  code_editor(action='rollback', path='app.py')\n"
+            "  # 追加:\n"
+            "  code_editor(action='append', path='app.py', new_text='\\n# 新行')\n"
+            "  💡 write 操作会自动备份（.bak），rollback 可以恢复。\n"
         )
 
     @property

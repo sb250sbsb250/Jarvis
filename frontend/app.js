@@ -17,7 +17,12 @@ const app = createApp({
 
     const conversations = ref([]);
     const currentSessionId = ref(null);
-    const modelName = ref('deepseek-chat');
+    const modelName = ref('deepseek-v4-pro');
+    const isProModel = ref(true);
+    
+    function toggleModel() {
+      modelName.value = isProModel.value ? 'deepseek-v4-pro' : 'deepseek-v4-flash';
+    }
 
     const showSettings = ref(false);
     const apiProviders = ref([]);
@@ -144,6 +149,11 @@ const app = createApp({
       }
 
       msg.html = html;
+      
+      // ✅ 强制触发 Vue 响应式更新：替换整个 messages 数组引用
+      // Vue 3 无法追踪普通对象数组的 push/splice 变更，
+      // 但重新赋值 ref.value 能触发重新渲染
+      messages.value = [...messages.value];
     }
 
     // ── 滚动到底部 ──
@@ -160,86 +170,79 @@ const app = createApp({
 
     // ── SSE 事件处理 ──
     function handleSSEEvent(data) {
-      const msg = messages.value[_currentMsgIndex];
-      if (!msg) return;
+      // 服务端事件: tool_call, tool_result, tool_error, planning, round_start, done, session, info, chunk
+      function getAssistantMsg() {
+        for (let i = messages.value.length - 1; i >= 0; i--) {
+          if (messages.value[i].role === 'assistant') return messages.value[i];
+        }
+        return null;
+      }
 
-      switch (data.type) {
-        case 'step': {
-          // 工具调用步骤
+      switch (true) {
+        // ── 工具调用/结果/错误 ──
+        case data.type === 'tool_call' || data.type === 'tool_result' || data.type === 'tool_error': {
+          const msg = getAssistantMsg();
+          if (!msg) { console.log('no msg for', data.type); break; }
           const stepName = data.name || data.tool || '';
-          const stepState = data.status || 'running';
-          const stepIcon = stepState === 'done' ? '✅' : stepState === 'error' ? '❌' : '⏳';
-          msg.steps.push({
-            tool: stepName,
-            icon: stepIcon,
-            state: stepState,
-            args: data.args || {},
-            result: data.result || ''
-          });
-          if (stepState === 'done') {
-            statusText.value = `✅ 完成: ${stepName}`;
-            statusClass.value = '';
-          } else if (stepState === 'error') {
-            statusText.value = `❌ 失败: ${stepName}`;
-            statusClass.value = 'error';
-          } else {
-            statusText.value = `🔧 执行: ${stepName}`;
-            statusClass.value = 'executing';
-          }
+          const state = data.status || (data.type === 'tool_result' ? 'done' : data.type === 'tool_error' ? 'error' : 'running');
+          const icon = state === 'done' ? '✅' : state === 'error' ? '❌' : '⚡';
+          msg.steps.push({ tool: stepName, icon, state, args: data.args || {}, result: data.result || '' });
+          statusText.value = state === 'done' ? `✅ 完成: ${stepName}` : state === 'error' ? `❌ 失败: ${stepName}` : `🔧 执行: ${stepName}`;
+          statusClass.value = state === 'done' ? '' : state === 'error' ? 'error' : 'executing';
           renderMessage(msg);
           scrollToBottom();
           break;
         }
 
-        case 'thought': {
-          // 思考过程
-          statusText.value = '🧠 ' + (data.content || '思考中...');
+        // ── 规划/轮次 ──
+        case data.type === 'planning' || data.type === 'round_start': {
+          const text = data.content || (data.type === 'round_start' ? `第 ${data.round || '?'} 轮` : '分析任务中...');
+          statusText.value = '🧠 ' + text;
           statusClass.value = 'executing';
           break;
         }
 
-        case 'content':
-        case 'delta': {
-          // 流式内容
-          msg.content = (msg.content || '') + (data.content || '');
-          renderMessage(msg);
-          statusText.value = '✅ 生成回答中...';
-          statusClass.value = 'executing';
-          scrollToBottom();
-          break;
-        }
-
-        case 'complete': {
-          // 完成
-          if (data.content) {
-            msg.content = data.content;
-          }
+        // ── 完成 ──
+        case data.type === 'done': {
+          const msg = getAssistantMsg();
+          if (msg && data.content) msg.content = data.content;
           statusText.value = '✅ 回答完成';
           statusClass.value = 'done';
-          renderMessage(msg);
+          if (msg) renderMessage(msg);
           scrollToBottom();
-          // 刷新对话列表
           loadConversations();
           break;
         }
 
-        case 'error': {
+        // ── 错误 ──
+        case data.type === 'error': {
+          const msg = getAssistantMsg();
+          if (!msg) { statusText.value = '❌ ' + (data.content || '错误'); break; }
           statusText.value = '❌ 错误: ' + (data.content || data.error || '未知错误');
           statusClass.value = 'error';
-          msg.steps.push({
-            tool: '错误',
-            icon: '❌',
-            state: 'error',
-            args: {},
-            result: data.content || data.error || '未知错误'
-          });
+          msg.steps.push({ tool: '错误', icon: '❌', state: 'error', args: {}, result: data.content || data.error || '未知错误' });
           renderMessage(msg);
           scrollToBottom();
           break;
         }
 
+        // ── info / session / chunk ──
         default: {
-          console.log('Unknown SSE event:', data);
+          if (data.type === 'info') {
+            statusText.value = data.content || '⏳ 处理中...';
+            statusClass.value = 'executing';
+          } else if (data.type === 'session') {
+            currentSessionId.value = data.session_id;
+            loadConversations();
+          } else if (data.type === 'chunk') {
+            const msg = getAssistantMsg();
+            if (!msg) break;
+            msg.content = (msg.content || '') + (data.content || '');
+            renderMessage(msg);
+            scrollToBottom();
+          } else {
+            console.log('Unknown SSE event:', data);
+          }
         }
       }
     }
@@ -261,11 +264,10 @@ const app = createApp({
       inputText.value = '';
       sending.value = true;
       interrupting.value = false;
-      _currentMsgIndex = messages.value.length;
       statusText.value = '🧠 Jarvis 正在思考...';
       statusClass.value = 'executing';
 
-      // 空白助手消息
+      // 空白助手消息（先 push 再设索引）
       messages.value.push({
         _uid: ++_msgUid,
         role: 'assistant',
@@ -273,11 +275,12 @@ const app = createApp({
         html: '<div class="thinking-text">🧠 Jarvis 正在思考...</div>',
         steps: []
       });
+      _currentMsgIndex = messages.value.length - 1;
 
       await nextTick();
 
       // SSE 连接
-      const { stream, controller } = API.createChatStream(text, currentSessionId.value);
+      const { stream, controller } = API.createChatStream(text, currentSessionId.value, modelName.value);
       _abortController = controller;
 
       try {
@@ -286,7 +289,7 @@ const app = createApp({
         let buffer = '';
 
         while (true) {
-          const { done, value } = await reader.read();
+          let { done, value } = await reader.read();
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
@@ -296,8 +299,14 @@ const app = createApp({
           for (const part of parts) {
             for (const line of part.split('\n')) {
               if (line.startsWith('data: ')) {
+                const payload = line.slice(6);
+                if (payload === '[DONE]') {
+                  console.log('SSE stream done');
+                  done = true;
+                  break;
+                }
                 try {
-                  handleSSEEvent(JSON.parse(line.slice(6)));
+                  handleSSEEvent(JSON.parse(payload));
                 } catch (e) {
                   console.error('SSE parse error:', e);
                 }
@@ -363,6 +372,7 @@ const app = createApp({
 
     // ── 切换对话 ──
     async function switchConversation(sid) {
+      if (!sid) return;
       if (sending.value) return;
       currentSessionId.value = sid;
       try {
@@ -486,7 +496,10 @@ const app = createApp({
       ]);
 
       if (conversations.value.length > 0) {
-        await switchConversation(conversations.value[0].session_id);
+        const firstId = conversations.value[0].id || conversations.value[0].session_id;
+        if (firstId) {
+          await switchConversation(firstId);
+        }
       }
 
       // 复制按钮事件委托
@@ -517,7 +530,7 @@ const app = createApp({
 
     return {
       messages, inputText, sending, statusText, statusClass,
-      conversations, currentSessionId, modelName,
+      conversations, currentSessionId, modelName, isProModel, toggleModel,
       showSettings, apiProviders,
       sendMessage, interruptSession, newConversation,
       switchConversation, deleteConversation,

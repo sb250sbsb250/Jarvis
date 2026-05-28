@@ -51,9 +51,10 @@ const API = {
   },
 
   // ── 聊天 SSE ──
-  createChatStream(message, sessionId) {
+  createChatStream(message, sessionId, model) {
     const params = new URLSearchParams({ message });
     if (sessionId) params.set('session_id', sessionId);
+    if (model) params.set('model', model);
 
     const controller = new AbortController();
     const url = '/api/chat/stream?' + params.toString();

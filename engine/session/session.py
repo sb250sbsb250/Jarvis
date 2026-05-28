@@ -42,6 +42,10 @@ class Session:
     is_active: bool = True
     is_archived: bool = False
 
+    def __post_init__(self):
+        """初始化后预留"""
+        pass
+
     def touch(self) -> None:
         """更新访问时间"""
         self.updated_at = datetime.now()
@@ -57,9 +61,9 @@ class Session:
         self.messages.add_user(content)
         self.updated_at = datetime.now()
 
-    def add_assistant_message(self, content: str, tool_calls: Optional[List] = None) -> None:
+    def add_assistant_message(self, content: str, tool_calls: Optional[List] = None, reasoning_content: Optional[str] = None) -> None:
         """添加助手消息"""
-        self.messages.add_assistant(content, tool_calls)
+        self.messages.add_assistant(content, tool_calls, reasoning_content)
         self.updated_at = datetime.now()
 
     def add_tool_message(self, call_id: str, content: str) -> None:
