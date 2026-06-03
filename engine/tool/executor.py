@@ -1,6 +1,5 @@
 """
-工具执行器 - 执行工具调用
-（懒加载触发点：这里调用 registry.get() 时才实例化）
+engine/tool/executor.py — 工具执行器（懒加载触发点）
 """
 import asyncio
 import json
@@ -53,7 +52,7 @@ class ToolExecutor:
         if not is_valid:
             return ToolResult.error(call.id, call.name, error_msg or "参数无效")
 
-        # 使用工具级重试配置（如果工具定义了的话）
+        # 使用工具级重试配置
         tool_retry_errors = getattr(tool, 'retryable_exceptions', (ConnectionError, TimeoutError, OSError))
         tool_max_retries = getattr(tool, 'max_retries', max_retries)
 
@@ -99,7 +98,6 @@ class ToolExecutor:
                 logger.warning(f"工具 '{call.name}' 可重试异常: {e}, 准备重试")
 
             except Exception as e:
-                # 非可重试异常，直接返回
                 logger.exception(f"工具 {call.name} 异常: {e}")
                 return ToolResult.error(call.id, call.name, str(e))
 

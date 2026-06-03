@@ -1,14 +1,16 @@
 """
-tools/excel_tool.py — Excel 文件操作工具（统一版）
+tools/excel_tool.py — Excel 操作工具（xlwings 版）
 
-单工具多 action 设计，LLM 只需记住一个工具名 `excel`。
-所有操作通过 action 参数区分。
+单工具多 action，所有操作通过 action 参数区分。
 
-功能合并：
- - 原 ExcelOpTool（单格操作）
- - 原 ExcelBatchWriteTool（批量写入）
+为什么用 xlwings 而不是 openpyxl：
+  - 合并单元格天然支持（审计底稿必备）
+  - 行插入不丢格式
+  - 格式设置（字体/边框/数字格式）
+  - 自动列宽
+  - 保存时保留所有原始格式
 
-依赖: openpyxl
+依赖: xlwings + Excel（Windows）
 """
 
 import json
@@ -16,49 +18,49 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+import xlwings as xw
+
 from engine.tool.base import BaseTool, ToolParameter, ToolResult
 
 logger = logging.getLogger(__name__)
 
 # ── 全局状态 ──
-_open_workbooks: Dict[str, Any] = {}
-_file_aliases: Dict[str, str] = {}
+_open_apps: Dict[str, Any] = {}     # alias → xlwings App
+_open_books: Dict[str, Any] = {}    # alias → xlwings Book
+_file_aliases: Dict[str, str] = {}  # alias → real_path
 
 
-def _get_openpyxl():
-    try:
-        import openpyxl
-        return openpyxl
-    except ImportError:
-        raise ImportError("需要 openpyxl，请运行: pip install openpyxl")
+def _safe_quit():
+    """安全清理所有 Excel 进程"""
+    for alias in list(_open_books.keys()):
+        try:
+            _open_books[alias].close()
+        except Exception:
+            pass
+    for alias in list(_open_apps.keys()):
+        try:
+            _open_apps[alias].quit()
+        except Exception:
+            pass
+    _open_apps.clear()
+    _open_books.clear()
+    _file_aliases.clear()
 
 
-def _resolve_path(path_or_alias: str) -> str:
-    """解析别名 → 真实路径"""
-    if path_or_alias in _file_aliases:
-        return _file_aliases[path_or_alias]
-    return path_or_alias
+import atexit
+atexit.register(_safe_quit)
 
 
 class ExcelTool(BaseTool):
-    """
-    Excel 操作工具（统一版）
+    """Excel 操作工具（xlwings 版）"""
 
-    所有操作通过 action 参数区分，一个工具覆盖全部 Excel 场景。
+    @property
+    def is_read(self) -> bool:
+        return False
 
-    操作列表：
-      connect — 打开文件（需 file_path，可选 alias）
-      list_sheets — 列出所有工作表
-      read_sheet — 读取工作表（支持分页、智能表头检测）
-      get_sheet_info — 获取表头、列数、行数
-      find_column — 按列名查找列索引
-      write_cell — 写入单个单元格
-      write_row — 写入一行
-      write_batch — 批量写入多行（原 ExcelBatchWriteTool 功能）
-      write_dict — 按字典写入（自动匹配表头）
-      save — 保存文件
-      close — 关闭文件
-    """
+    @property
+    def is_write(self) -> bool:
+        return True
 
     @property
     def name(self) -> str:
@@ -67,675 +69,518 @@ class ExcelTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Excel 文件操作工具（基于 openpyxl）。\n"
-            "⚠️ 每次调用必须提供 action 参数！\n"
-            "\n"
-            "📌 标准流程: connect → read_sheet → [分析/修改] → save → close\n"
-            "📌 写入流程: connect → read_sheet(了解结构) → write_cell/write_row/write_batch → save\n"
-            "\n"
-            "操作列表：\n"
-            "  connect — 打开文件（需 file_path，可选 alias 设置别名）\n"
-            "  list_sheets — 列出所有工作表名称和行列数\n"
-            "  read_sheet — 读取工作表（支持分页、智能跳过空列）\n"
-            "  get_sheet_info — 获取表头详细信息和数据类型\n"
-            "  find_column — 按列名模糊查找列索引\n"
+            "Excel 操作（xlwings），保留格式和合并单元格。\n"
+            "标准流程: connect → read_sheet → [修改] → save → close\n"
+            "操作:\n"
+            "  connect — 打开文件（file_path，可选 alias）\n"
+            "  list_sheets — 列出工作表名称和行列数\n"
+            "  read_sheet — 读取工作表（分页、智能跳过空列）\n"
+            "  get_sheet_info — 表头/数据类型/合并单元格检测\n"
+            "  find_column — 按列名查找列索引\n"
             "  write_cell — 写入单个单元格\n"
-            "  write_row — 写入一行（按列号）\n"
-            "  write_batch — 批量写入多行（按列号，适合大量数据迁移）\n"
-            "  write_dict — 按字典写入（自动匹配表头名称，适合按字段名写入）\n"
-            "  save — 保存文件\n"
-            "  close — 关闭文件\n"
-            "\n"
-            "📌 路径别名：connect 时设置 alias，后续操作用别名代替完整路径。\n"
-            "\n"
-            "📖 使用示例：\n"
-            "  # 读 Excel：\n"
-            "  1. excel(action='connect', file_path='data.xlsx', alias='x')\n"
-            "  2. excel(action='list_sheets', file_path='x')\n"
-            "  3. excel(action='read_sheet', file_path='x', sheet_name='Sheet1', header_row=1)\n"
-            "  4. excel(action='close', file_path='x')\n"
-            "\n"
-            "  # 写 Excel（保留格式）：\n"
-            "  1. excel(action='connect', file_path='output.xlsx', alias='x')\n"
-            "  2. excel(action='write_cell', file_path='x', sheet_name='Sheet1', row=2, column=1, value='Hello')\n"
-            "  3. excel(action='write_row', file_path='x', sheet_name='Sheet1', row=3, columns='[1,2,3]', values='[\"a\",\"b\",\"c\"]')\n"
-            "  4. excel(action='save', file_path='x')\n"
-            "  5. excel(action='close', file_path='x')\n"
-            "\n"
-            "  # 批量写入（大量数据，省轮次）：\n"
-            "  excel(action='write_batch', file_path='x', data='[{\"row\":2,\"columns\":{1:\"A1\",2:\"B1\"}}]')\n"
-            "\n"
-            "  # 按字典写入（自动匹配表头列名）：\n"
-            "  1. read_sheet 先看表头列名\n"
-            "  2. excel(action='write_dict', file_path='x', row_data='{\"row\":5,\"data\":{\"姓名\":\"张三\",\"金额\":100}}')\n"
-            "  💡 如果 save/close 前忘记写数据，数据不会保存！"
+            "  write_row — 写入一行\n"
+            "  write_batch — 批量写入\n"
+            "  write_dict — 按列名写入\n"
+            "  insert_rows — 在指定行前插入行（自动复制上一行格式，支持一次多行）\n"
+            "  format_range — 设置字体/边框/数字格式\n"
+            "  auto_fit — 自动调整列宽\n"
+            "  save — 保存\n"
+            "  close — 关闭"
         )
 
     @property
     def parameters(self) -> List[ToolParameter]:
         return [
-            ToolParameter("action", "string",
-                          description="⚠️ 必需！操作类型",
-                          required=True,
+            ToolParameter("action", "string", "操作类型", required=True,
                           enum=["connect", "list_sheets", "read_sheet", "get_sheet_info",
                                 "find_column", "write_cell", "write_row", "write_batch",
-                                "write_dict", "save", "close"]),
-            ToolParameter("file_path", "string",
-                          description="文件路径或别名。connect 时传真实路径，后续可用别名",
-                          required=False),
-            ToolParameter("alias", "string",
-                          description="文件别名（action=connect 时设置）",
-                          required=False),
-            ToolParameter("sheet_name", "string",
-                          description="工作表名称",
-                          required=False),
-            ToolParameter("start_row", "number",
-                          description="起始行号（从1开始，read_sheet 用，默认1）",
-                          required=False, default=1),
-            ToolParameter("max_rows", "number",
-                          description="最大返回行数（read_sheet 用，默认 20，设 0 返回全部）",
-                          required=False, default=20),
-            ToolParameter("header_row", "number",
-                          description="表头行号（read_sheet 用，默认1，设0表示无表头）",
-                          required=False, default=1),
-            ToolParameter("column_name", "string",
-                          description="要查找的列名（find_column 用）",
-                          required=False),
-            ToolParameter("row", "number",
-                          description="行号（从1开始，write_cell/write_row 用）",
-                          required=False),
-            ToolParameter("column", "number",
-                          description="列号（从1开始，write_cell 用）",
-                          required=False),
-            ToolParameter("columns", "string",
-                          description="列号数组 JSON（write_row 用，如 '[1,3,5]'）",
-                          required=False),
-            ToolParameter("value", "string",
-                          description="要写入的值（write_cell 用）",
-                          required=False),
-            ToolParameter("values", "string",
-                          description="值数组 JSON（write_row 用，如 '[\"a\",\"b\",\"c\"]'）",
-                          required=False),
-            ToolParameter("data", "string",
-                          description=(
-                              "批量写入数据 JSON（write_batch 用）。\n"
-                              "格式: '[{\"row\": 2, \"columns\": {1: \"值\", 3: \"值\"}}, ...]'\n"
-                              "每项指定行号和列号→值的映射"
-                          ),
-                          required=False),
-            ToolParameter("row_data", "string",
-                          description=(
-                              "字典格式数据 JSON（write_dict 用）。\n"
-                              "格式: '{\"row\": 5, \"data\": {\"姓名\": \"张三\", \"金额\": 100}}'\n"
-                              "自动根据表头名称匹配列号"
-                          ),
-                          required=False),
+                                "write_dict", "insert_rows", "format_range", "auto_fit",
+                                "save", "close"]),
+            ToolParameter("file_path", "string", "文件路径或别名", required=False),
+            ToolParameter("alias", "string", "文件别名（connect时设置）", required=False),
+            ToolParameter("sheet_name", "string", "工作表名", required=False),
+            ToolParameter("header_row", "number", "表头行号", required=False),
+            ToolParameter("start_row", "number", "起始行(read_sheet用)", required=False),
+            ToolParameter("end_row", "number", "结束行(read_sheet用)", required=False),
+            ToolParameter("row", "number", "行号", required=False),
+            ToolParameter("column", "number", "列号", required=False),
+            ToolParameter("columns", "string", "列号列表(JSON数组)", required=False),
+            ToolParameter("values", "string", "值列表(JSON数组)", required=False),
+            ToolParameter("value", "string", "值", required=False),
+            ToolParameter("data", "string", "批量数据(JSON)", required=False),
+            ToolParameter("row_data", "string", "行数据(JSON)", required=False),
+            ToolParameter("count", "number", "插入行数", required=False),
+            ToolParameter("format", "string", "格式配置(JSON)", required=False),
+            ToolParameter("target", "string", "查找目标(列名)", required=False),
         ]
 
-    # ═══════════════════════════════════════
-    # 主入口
-    # ═══════════════════════════════════════
-
     async def execute(self, call_id: str, **kwargs) -> ToolResult:
-        openpyxl = _get_openpyxl()
-
-        if not kwargs:
-            return ToolResult.error(call_id, self.name,
-                                    self._help_message())
-
-        action = kwargs.get("action", "")
-
-        # 自动推断 action
-        if not action:
-            action = self._infer_action(kwargs)
-
-        # 解析别名
-        raw_path = kwargs.get("file_path", "")
-        resolved = _resolve_path(raw_path) if raw_path else raw_path
-        if resolved != raw_path:
-            logger.info(f"[excel] 别名解析: {raw_path} → {resolved}")
-        kwargs["file_path"] = resolved
-
-        # 需要文件的操作：检查是否已连接
-        if action in self._actions_need_file() and not resolved:
-            return ToolResult.error(call_id, self.name,
-                                    self._connect_required_message())
-
-        if action in self._actions_need_file() and resolved and resolved not in _open_workbooks:
-            return ToolResult.error(call_id, self.name,
-                                    f"❌ 文件未打开: {resolved}\n"
-                                    f"📌 请先执行 connect\n"
-                                    f"💡 已连接的别名: {list(_file_aliases.keys())}")
-
-        try:
-            handler = getattr(self, f"_action_{action}", None)
-            if handler is None:
-                return ToolResult.error(call_id, self.name,
-                                        f"未知 action: {action}。可用: connect, list_sheets, read_sheet, "
-                                        f"get_sheet_info, find_column, write_cell, write_row, "
-                                        f"write_batch, write_dict, save, close")
-            return await handler(call_id, openpyxl, **kwargs)
-        except Exception as e:
-            logger.exception(f"[excel] {action} 失败")
-            return ToolResult.error(call_id, self.name, f"操作失败: {e}")
-
-    # ═══════════════════════════════════════
-    # connect — 打开文件
-    # ═══════════════════════════════════════
-
-    async def _action_connect(self, call_id: str, openpyxl, **kwargs) -> ToolResult:
-        path = kwargs.get("file_path", "")
-        alias = kwargs.get("alias", "")
-
-        if not path or not os.path.exists(path):
-            return ToolResult.error(call_id, self.name, f"文件不存在: {path}")
-
-        wb = openpyxl.load_workbook(path, data_only=True)
-        _open_workbooks[path] = wb
-
-        sheets = []
-        for name in wb.sheetnames:
-            ws = wb[name]
-            sheets.append({
-                "name": name,
-                "rows": ws.max_row,
-                "cols": ws.max_column,
-            })
-
-        alias_name = alias or os.path.basename(path)
-        _file_aliases[alias_name] = path
-        if alias_name != path:
-            _open_workbooks[alias_name] = wb
-
-        return ToolResult.success(call_id, self.name, {
-            "path": path,
-            "alias": alias_name,
-            "sheets": sheets,
-            "sheet_count": len(sheets),
-            "hint": f"已连接。后续操作可用 file_path='{alias_name}' 代替完整路径",
-        })
-
-    # ═══════════════════════════════════════
-    # list_sheets — 列出工作表
-    # ═══════════════════════════════════════
-
-    async def _action_list_sheets(self, call_id: str, openpyxl, **kwargs) -> ToolResult:
-        path = _resolve_path(kwargs.get("file_path", ""))
-        if path not in _open_workbooks:
-            return ToolResult.error(call_id, self.name, f"文件未打开: {path}")
-
-        wb = _open_workbooks[path]
-        sheets = []
-        for name in wb.sheetnames:
-            ws = wb[name]
-            sheets.append({"name": name, "rows": ws.max_row, "cols": ws.max_column})
-
-        return ToolResult.success(call_id, self.name, {"sheets": sheets, "count": len(sheets)})
-
-    # ═══════════════════════════════════════
-    # read_sheet — 读取工作表
-    # ═══════════════════════════════════════
-
-    async def _action_read_sheet(self, call_id: str, openpyxl, **kwargs) -> ToolResult:
-        path = _resolve_path(kwargs.get("file_path", ""))
-        sheet_name = kwargs.get("sheet_name", "")
-        start_row = int(kwargs.get("start_row", 1))
-        max_rows = int(kwargs.get("max_rows", 20))
-        header_row = int(kwargs.get("header_row", 1))
-
-        if path not in _open_workbooks:
-            return ToolResult.error(call_id, self.name, f"文件未打开: {path}")
-
-        wb = _open_workbooks[path]
-        if sheet_name not in wb.sheetnames:
-            return ToolResult.error(call_id, self.name,
-                                    f"Sheet 不存在: '{sheet_name}'，可用: {wb.sheetnames}")
-
-        ws = wb[sheet_name]
-        max_row = ws.max_row
-        max_col = ws.max_column
-
-        # 智能检测有效列
-        valid_cols, valid_headers = self._detect_valid_columns(ws, header_row, max_col, max_row)
-
-        # 分页读取
-        data_start = max(start_row, header_row + 1 if header_row > 0 else 1)
-        if max_rows > 0:
-            data_end = min(max_row, data_start + max_rows - 1)
-            has_more = data_end < max_row
-        else:
-            data_end = max_row
-            has_more = False
-
-        rows = []
-        for r in range(data_start, data_end + 1):
-            row_data = {}
-            for idx, c in enumerate(valid_cols):
-                val = ws.cell(row=r, column=c).value
-                if val is not None:
-                    header_name = valid_headers[idx] if idx < len(valid_headers) else f"列{c}"
-                    row_data[header_name] = val
-            if row_data:
-                rows.append(row_data)
-
-        result = {
-            "sheet": sheet_name,
-            "total_rows": max_row,
-            "total_cols": len(valid_cols),
-            "headers": valid_headers,
-            "rows": rows,
-            "row_count": len(rows),
+        action = kwargs.get("action", "read_sheet")
+        handlers = {
+            "connect": self._connect, "list_sheets": self._list_sheets,
+            "read_sheet": self._read_sheet, "get_sheet_info": self._sheet_info,
+            "find_column": self._find_column,
+            "write_cell": self._write_cell, "write_row": self._write_row,
+            "write_batch": self._write_batch, "write_dict": self._write_dict,
+            "insert_rows": self._insert_rows, "format_range": self._format_range,
+            "auto_fit": self._auto_fit, "save": self._save, "close": self._close,
         }
+        handler = handlers.get(action)
+        if not handler:
+            return ToolResult.error(call_id, self.name, f"未知操作: {action}")
+        try:
+            return handler(call_id, kwargs)
+        except Exception as e:
+            logger.exception(f"Excel {action} 失败")
+            return ToolResult.error(call_id, self.name, str(e))
 
-        if has_more:
-            result["hint"] = (
-                f"还有 {max_row - data_end} 行未显示。"
-                f"用 start_row={data_end + 1} 继续翻页，或用 max_rows=0 读取全部"
-            )
+    # ── connect ──
 
-        return ToolResult.success(call_id, self.name, result)
+    def _connect(self, call_id, args):
+        file_path = args.get("file_path", "")
+        alias = args.get("alias", file_path)
+        if not file_path:
+            return ToolResult.error(call_id, self.name, "connect 需要 file_path")
 
-    # ═══════════════════════════════════════
-    # get_sheet_info — 表头详情
-    # ═══════════════════════════════════════
+        if not os.path.isabs(file_path):
+            file_path = os.path.abspath(file_path)
 
-    async def _action_get_sheet_info(self, call_id: str, openpyxl, **kwargs) -> ToolResult:
-        path = _resolve_path(kwargs.get("file_path", ""))
-        sheet_name = kwargs.get("sheet_name", "")
-
-        if path not in _open_workbooks:
-            return ToolResult.error(call_id, self.name, f"文件未打开: {path}")
-
-        wb = _open_workbooks[path]
-        if sheet_name not in wb.sheetnames:
-            return ToolResult.error(call_id, self.name, f"Sheet 不存在: '{sheet_name}'")
-
-        ws = wb[sheet_name]
-        headers = []
-        for c in range(1, ws.max_column + 1):
-            val = ws.cell(row=1, column=c).value
-            sample = ws.cell(row=2, column=c).value
-            sample_type = type(sample).__name__ if sample is not None else "empty"
-            headers.append({
-                "col_index": c,
-                "col_letter": openpyxl.utils.get_column_letter(c),
-                "name": str(val).strip() if val else f"列{c}",
-                "sample_type": sample_type,
-            })
-
-        return ToolResult.success(call_id, self.name, {
-            "sheet": sheet_name,
-            "rows": ws.max_row,
-            "cols": ws.max_column,
-            "headers": headers,
-        })
-
-    # ═══════════════════════════════════════
-    # find_column — 查找列
-    # ═══════════════════════════════════════
-
-    async def _action_find_column(self, call_id: str, openpyxl, **kwargs) -> ToolResult:
-        path = _resolve_path(kwargs.get("file_path", ""))
-        sheet_name = kwargs.get("sheet_name", "")
-        column_name = kwargs.get("column_name", "")
-
-        if path not in _open_workbooks:
-            return ToolResult.error(call_id, self.name, f"文件未打开: {path}")
-
-        wb = _open_workbooks[path]
-        if sheet_name not in wb.sheetnames:
-            return ToolResult.error(call_id, self.name, f"Sheet 不存在: '{sheet_name}'")
-
-        ws = wb[sheet_name]
-        found = []
-        for c in range(1, ws.max_column + 1):
-            val = ws.cell(row=1, column=c).value
-            if val and column_name.lower() in str(val).lower():
-                found.append({
-                    "col_index": c,
-                    "col_letter": openpyxl.utils.get_column_letter(c),
-                    "name": str(val).strip(),
-                })
-
-        if found:
-            return ToolResult.success(call_id, self.name, {
-                "keyword": column_name,
-                "matches": found,
-                "best_match": found[0],
-            })
+        if not os.path.exists(file_path):
+            # 新文件：创建
+            app = xw.App(visible=False, add_book=True)
+            wb = app.books.active
+            wb.save(file_path)
         else:
-            all_headers = [str(ws.cell(row=1, column=c).value or f"列{c}")
-                           for c in range(1, ws.max_column + 1)]
-            return ToolResult.error(call_id, self.name,
-                                    f"未找到匹配 '{column_name}' 的列。可用列: {all_headers}")
+            app = xw.App(visible=False)
+            app.display_alerts = False
+            wb = app.books.open(file_path)
 
-    # ═══════════════════════════════════════
-    # write_cell — 写入单格
-    # ═══════════════════════════════════════
+        _file_aliases[alias] = file_path
+        _open_apps[alias] = app
+        _open_books[alias] = wb
 
-    async def _action_write_cell(self, call_id: str, openpyxl, **kwargs) -> ToolResult:
-        path = _resolve_path(kwargs.get("file_path", ""))
-        sheet_name = kwargs.get("sheet_name", "")
-        row = int(kwargs.get("row", 0))
-        column = int(kwargs.get("column", 0))
-        value = kwargs.get("value", "")
-
-        if path not in _open_workbooks:
-            return ToolResult.error(call_id, self.name, f"文件未打开: {path}")
-        if not row or not column:
-            return ToolResult.error(call_id, self.name, "需要 row 和 column 参数")
-
-        wb = _open_workbooks[path]
-        if sheet_name not in wb.sheetnames:
-            return ToolResult.error(call_id, self.name, f"Sheet 不存在: '{sheet_name}'")
-
-        ws = wb[sheet_name]
-        ws.cell(row=row, column=column, value=value)
-
+        sheets = [s.name for s in wb.sheets]
         return ToolResult.success(call_id, self.name, {
-            "cell": f"{openpyxl.utils.get_column_letter(column)}{row}",
-            "value": str(value)[:100],
-            "status": "已写入，请用 save 保存",
+            "file_path": file_path, "alias": alias,
+            "sheets": sheets, "status": "已打开",
+            "_hint": f"已打开 {file_path}，别名 '{alias}'。下一步: list_sheets 或 read_sheet"
         })
 
-    # ═══════════════════════════════════════
-    # write_row — 写入一行
-    # ═══════════════════════════════════════
+    # ── list_sheets ──
 
-    async def _action_write_row(self, call_id: str, openpyxl, **kwargs) -> ToolResult:
-        path = _resolve_path(kwargs.get("file_path", ""))
-        sheet_name = kwargs.get("sheet_name", "")
-        row = int(kwargs.get("row", 0))
-
-        try:
-            columns = json.loads(kwargs.get("columns", "[]"))
-            values = json.loads(kwargs.get("values", "[]"))
-        except json.JSONDecodeError:
-            return ToolResult.error(call_id, self.name, "columns/values 必须是合法的 JSON 数组")
-
-        if path not in _open_workbooks:
-            return ToolResult.error(call_id, self.name, f"文件未打开: {path}")
-        if not row:
-            return ToolResult.error(call_id, self.name, "需要 row 参数")
-
-        wb = _open_workbooks[path]
-        if sheet_name not in wb.sheetnames:
-            return ToolResult.error(call_id, self.name, f"Sheet 不存在: '{sheet_name}'")
-
-        if len(columns) != len(values):
-            return ToolResult.error(call_id, self.name,
-                                    f"列数({len(columns)})与值数({len(values)})不匹配")
-
-        ws = wb[sheet_name]
-        written = []
-        for col, val in zip(columns, values):
-            ws.cell(row=row, column=int(col), value=val)
-            written.append(f"{openpyxl.utils.get_column_letter(int(col))}{row}={str(val)[:50]}")
-
+    def _list_sheets(self, call_id, args):
+        wb = self._get_book(args)
+        if not wb:
+            return self._need_connect(call_id)
+        sheets = []
+        for s in wb.sheets:
+            used = s.used_range
+            sheets.append({
+                "name": s.name,
+                "rows": used.last_cell.row if used else 0,
+                "cols": used.last_cell.column if used else 0,
+            })
         return ToolResult.success(call_id, self.name, {
-            "row": row,
-            "cells_written": len(written),
-            "preview": written[:10],
-            "status": "已写入，请用 save 保存",
+            "sheets": sheets,
+            "_hint": "用 read_sheet 读取指定工作表"
         })
 
-    # ═══════════════════════════════════════
-    # write_batch — 批量写入（原 ExcelBatchWriteTool）
-    # ═══════════════════════════════════════
+    # ── read_sheet ──
 
-    async def _action_write_batch(self, call_id: str, openpyxl, **kwargs) -> ToolResult:
-        path = _resolve_path(kwargs.get("file_path", ""))
-        sheet_name = kwargs.get("sheet_name", "")
+    def _read_sheet(self, call_id, args):
+        wb = self._get_book(args)
+        if not wb:
+            return self._need_connect(call_id)
 
-        try:
-            data = json.loads(kwargs.get("data", "[]"))
-        except json.JSONDecodeError:
-            return ToolResult.error(call_id, self.name,
-                                    "data 参数必须是合法的 JSON 数组。\n"
-                                    "格式: [{\"row\": 2, \"columns\": {1: \"值\", 3: \"值\"}}, ...]")
+        sheet = self._get_sheet(wb, args)
+        if not sheet:
+            return ToolResult.error(call_id, self.name, "sheet_name 不存在")
 
-        if path not in _open_workbooks:
-            return ToolResult.error(call_id, self.name, f"文件未打开: {path}")
-        if not sheet_name:
-            return ToolResult.error(call_id, self.name, "需要 sheet_name 参数")
-        if not data:
-            return ToolResult.error(call_id, self.name, "data 为空，没有要写入的数据")
+        used = sheet.used_range
+        total_rows = used.last_cell.row if used else 0
+        total_cols = used.last_cell.column if used else 0
 
-        wb = _open_workbooks[path]
-        if sheet_name not in wb.sheetnames:
-            return ToolResult.error(call_id, self.name, f"Sheet 不存在: '{sheet_name}'")
+        start = max(1, int(args.get("start_row", 1)))
+        end = min(total_rows, int(args.get("end_row", total_rows)))
+        if end < start:
+            end = min(start + 200, total_rows)
 
-        ws = wb[sheet_name]
-        total_cells = 0
-        errors = []
+        header_row = int(args.get("header_row", 1))
+        has_header = header_row >= 1
 
-        for row_spec in data:
-            row_num = row_spec.get("row")
-            columns = row_spec.get("columns", {})
-            if not row_num or not columns:
-                errors.append(f"跳过无效行定义: {row_spec}")
-                continue
+        # 读取数据
+        raw = sheet.range((start, 1), (end, total_cols)).value
+        if not isinstance(raw, list):
+            raw = [[raw]]
 
-            for col_idx, value in columns.items():
-                try:
-                    ws.cell(row=int(row_num), column=int(col_idx), value=value)
-                    total_cells += 1
-                except Exception as e:
-                    errors.append(f"写入失败 row={row_num}, col={col_idx}: {e}")
+        # 智能跳过空列
+        valid_cols, col_names = [], {}
+        for c in range(total_cols):
+            col_data = [raw[r][c] for r in range(len(raw)) if r < len(raw) and c < len(raw[r])]
+            if any(v is not None for v in col_data):
+                valid_cols.append(c)
+                if has_header and start <= header_row <= end:
+                    hdr_val = None
+                    for r in range(len(raw)):
+                        if start + r == header_row and c < len(raw[r]):
+                            hdr_val = raw[r][c]
+                            break
+                    col_names[c] = str(hdr_val) if hdr_val is not None else f"Col{c+1}"
+                else:
+                    col_names[c] = f"Col{c+1}"
+
+        # 格式化输出
+        rows = []
+        for r_idx, row_data in enumerate(raw):
+            cells = {}
+            for c in valid_cols:
+                if c < len(row_data):
+                    cells[col_names[c]] = row_data[c]
+            rows.append({"row": start + r_idx, "data": cells})
 
         return ToolResult.success(call_id, self.name, {
-            "cells_written": total_cells,
-            "rows_affected": len(data),
-            "errors": errors,
-            "error_count": len(errors),
-            "status": f"已写入 {total_cells} 个单元格，请用 save 保存",
+            "sheet": sheet.name, "total_rows": total_rows, "total_cols": total_cols,
+            "start_row": start, "end_row": end, "header_row": header_row,
+            "columns": col_names, "rows": rows,
+            "_hint": f"读取 {sheet.name} 第 {start}-{end} 行（共 {total_rows} 行）。用 start_row/end_row 翻页"
         })
 
-    # ═══════════════════════════════════════
-    # write_dict — 按字段名写入
-    # ═══════════════════════════════════════
+    # ── get_sheet_info ──
 
-    async def _action_write_dict(self, call_id: str, openpyxl, **kwargs) -> ToolResult:
-        path = _resolve_path(kwargs.get("file_path", ""))
-        sheet_name = kwargs.get("sheet_name", "")
+    def _sheet_info(self, call_id, args):
+        wb = self._get_book(args)
+        if not wb:
+            return self._need_connect(call_id)
+        sheet = self._get_sheet(wb, args)
+        if not sheet:
+            return ToolResult.error(call_id, self.name, "sheet_name 不存在")
 
+        used = sheet.used_range
+        total_rows = used.last_cell.row if used else 0
+        total_cols = used.last_cell.column if used else 0
+
+        # 表头（默认第一行）
+        header_row = int(args.get("header_row", 1))
+        headers = []
+        for c in range(1, total_cols + 1):
+            v = sheet.range((header_row, c)).value
+            headers.append({"col": c, "name": str(v) if v is not None else f"Col{c}"})
+
+        # 合并单元格检测
+        merged = []
         try:
-            row_data = json.loads(kwargs.get("row_data", "{}"))
-        except json.JSONDecodeError:
-            return ToolResult.error(call_id, self.name,
-                                    "row_data 参数必须是合法的 JSON 对象。\n"
-                                    "格式: {\"row\": 5, \"data\": {\"姓名\": \"张三\", \"金额\": 100}}")
+            for mg in sheet.used_range.api.MergeAreas:
+                addr = mg.Address.replace("$", "")
+                merged.append(addr)
+        except Exception:
+            pass
 
-        if path not in _open_workbooks:
-            return ToolResult.error(call_id, self.name, f"文件未打开: {path}")
-        if not sheet_name:
-            return ToolResult.error(call_id, self.name, "需要 sheet_name 参数")
+        return ToolResult.success(call_id, self.name, {
+            "sheet": sheet.name, "total_rows": total_rows, "total_cols": total_cols,
+            "header_row": header_row, "headers": headers,
+            "merged_cells": merged[:20],
+            "_hint": f"共有 {len(merged)} 个合并区域。用 find_column 查找特定列"
+        })
 
-        row_num = row_data.get("row")
+    # ── find_column ──
+
+    def _find_column(self, call_id, args):
+        wb = self._get_book(args)
+        if not wb:
+            return self._need_connect(call_id)
+        sheet = self._get_sheet(wb, args)
+        target = args.get("target", "")
+        if not target:
+            return ToolResult.error(call_id, self.name, "需要 target（要查找的列名）")
+
+        header_row = int(args.get("header_row", 1))
+        used = sheet.used_range
+        total_cols = used.last_cell.column if used else 0
+
+        matches = []
+        for c in range(1, total_cols + 1):
+            v = sheet.range((header_row, c)).value
+            if v is not None and target.lower() in str(v).lower():
+                matches.append({"col": c, "name": str(v)})
+
+        if not matches:
+            return ToolResult.success(call_id, self.name, {
+                "target": target, "found": False,
+                "_hint": f"未找到包含 '{target}' 的列。用 get_sheet_info 查看所有列名"
+            })
+        return ToolResult.success(call_id, self.name, {
+            "target": target, "found": True, "matches": matches
+        })
+
+    # ── write_cell ──
+
+    def _write_cell(self, call_id, args):
+        wb = self._get_book(args)
+        if not wb:
+            return self._need_connect(call_id)
+        sheet = self._get_sheet(wb, args)
+        row, col = int(args.get("row", 1)), int(args.get("column", 1))
+        value = args.get("value", "")
+        sheet.range((row, col)).value = value
+        return ToolResult.success(call_id, self.name, {
+            "sheet": sheet.name, "row": row, "col": col, "value": str(value)[:100],
+            "_hint": "写入成功。记得 save + close"
+        })
+
+    # ── write_row ──
+
+    def _write_row(self, call_id, args):
+        wb = self._get_book(args)
+        if not wb:
+            return self._need_connect(call_id)
+        sheet = self._get_sheet(wb, args)
+        row = int(args.get("row", 1))
+        columns = self._parse_json(args.get("columns", "[]"))
+        values = self._parse_json(args.get("values", "[]"))
+        for c, v in zip(columns, values):
+            sheet.range((row, c)).value = v
+        return ToolResult.success(call_id, self.name, {
+            "sheet": sheet.name, "row": row, "written": len(columns)
+        })
+
+    # ── write_batch ──
+
+    def _write_batch(self, call_id, args):
+        wb = self._get_book(args)
+        if not wb:
+            return self._need_connect(call_id)
+        sheet = self._get_sheet(wb, args)
+        data = self._parse_json(args.get("data", "[]"))
+        for entry in data:
+            r = int(entry.get("row", 1))
+            for col_str, val in entry.get("columns", {}).items():
+                sheet.range((r, int(col_str))).value = val
+        return ToolResult.success(call_id, self.name, {
+            "sheet": sheet.name, "entries": len(data)
+        })
+
+    # ── write_dict ──
+
+    def _write_dict(self, call_id, args):
+        wb = self._get_book(args)
+        if not wb:
+            return self._need_connect(call_id)
+        sheet = self._get_sheet(wb, args)
+        row_data = self._parse_json(args.get("row_data", "{}"))
+        row = int(row_data.get("row", 1))
         data = row_data.get("data", {})
-        if not row_num or not data:
-            return ToolResult.error(call_id, self.name,
-                                    "row_data 格式错误，需要 {\"row\": 行号, \"data\": {\"列名\": 值, ...}}")
+        header_row = int(args.get("header_row", 1))
 
-        wb = _open_workbooks[path]
-        if sheet_name not in wb.sheetnames:
-            return ToolResult.error(call_id, self.name, f"Sheet 不存在: '{sheet_name}'")
+        # 建立表头映射
+        used = sheet.used_range
+        max_col = used.last_cell.column if used else 0
+        col_map = {}
+        for c in range(1, max_col + 1):
+            v = sheet.range((header_row, c)).value
+            if v is not None:
+                col_map[str(v)] = c
 
-        ws = wb[sheet_name]
-
-        # 读取表头，建立 列名 → 列号 映射
-        header_map = {}
-        for c in range(1, ws.max_column + 1):
-            val = ws.cell(row=1, column=c).value
-            if val:
-                header_map[str(val).strip()] = c
-
-        written = []
-        not_found = []
-        for field_name, value in data.items():
-            if field_name in header_map:
-                col = header_map[field_name]
-                ws.cell(row=int(row_num), column=col, value=value)
-                written.append(f"{field_name}={str(value)[:50]}")
+        written = 0
+        for col_name, val in data.items():
+            if col_name in col_map:
+                sheet.range((row, col_map[col_name])).value = val
+                written += 1
             else:
                 # 模糊匹配
-                matched = self._fuzzy_match_header(field_name, list(header_map.keys()))
-                if matched:
-                    col = header_map[matched]
-                    ws.cell(row=int(row_num), column=col, value=value)
-                    written.append(f"{field_name}→{matched}={str(value)[:50]}")
-                else:
-                    not_found.append(field_name)
+                for hdr, ci in col_map.items():
+                    if col_name.lower() in hdr.lower() or hdr.lower() in col_name.lower():
+                        sheet.range((row, ci)).value = val
+                        written += 1
+                        break
 
-        result = {
-            "row": row_num,
-            "written": written,
-            "written_count": len(written),
-        }
-        if not_found:
-            result["not_found"] = not_found
-            result["available_headers"] = list(header_map.keys())
-            result["hint"] = f"以下字段在表头中未找到: {not_found}。请检查列名是否正确"
-
-        result["status"] = "已写入，请用 save 保存" if written else "未写入任何数据"
-        return ToolResult.success(call_id, self.name, result)
-
-    # ═══════════════════════════════════════
-    # save — 保存
-    # ═══════════════════════════════════════
-
-    async def _action_save(self, call_id: str, openpyxl, **kwargs) -> ToolResult:
-        path = _resolve_path(kwargs.get("file_path", ""))
-        if path not in _open_workbooks:
-            return ToolResult.error(call_id, self.name, f"文件未打开: {path}")
-
-        wb = _open_workbooks[path]
-        wb.save(path)
-        size = os.path.getsize(path) if os.path.exists(path) else 0
         return ToolResult.success(call_id, self.name, {
-            "path": path,
-            "saved": True,
-            "size_kb": round(size / 1024, 1),
+            "sheet": sheet.name, "row": row, "written": written
         })
 
-    # ═══════════════════════════════════════
-    # close — 关闭
-    # ═══════════════════════════════════════
+    # ── insert_rows ──
 
-    async def _action_close(self, call_id: str, openpyxl, **kwargs) -> ToolResult:
-        path = _resolve_path(kwargs.get("file_path", ""))
-        if path not in _open_workbooks:
-            return ToolResult.error(call_id, self.name, f"文件未打开: {path}")
+    def _insert_rows(self, call_id, args):
+        """
+        插入行并复制上一行格式（边框/字体/数字格式）。
+        支持一次插入多行。
+        """
+        wb = self._get_book(args)
+        if not wb:
+            return self._need_connect(call_id)
+        sheet = self._get_sheet(wb, args)
+        start_row = int(args.get("start_row", args.get("row", 1)))
+        count = int(args.get("count", 1))
 
-        wb = _open_workbooks[path]
-        wb.close()
-        del _open_workbooks[path]
+        if start_row <= 1:
+            start_row = 2  # 不能在第1行前插入
 
-        # 清理别名
-        to_remove = [k for k, v in _file_aliases.items() if v == path]
-        for k in to_remove:
-            del _file_aliases[k]
-            _open_workbooks.pop(k, None)
+        # 先复制上一行的格式（在插入前复制，插入后粘贴）
+        source_row = start_row - 1
+        sheet.range(f"{source_row}:{source_row}").copy()
 
-        return ToolResult.success(call_id, self.name, {"path": path, "closed": True})
+        # 插入空行
+        sheet.range(f"{start_row}:{start_row + count - 1}").api.Insert()
 
-    # ═══════════════════════════════════════
-    # 辅助方法
-    # ═══════════════════════════════════════
+        # 粘贴格式到新插入的行（xlPasteFormats = -4122）
+        target = sheet.range(f"{start_row}:{start_row + count - 1}")
+        target.api.PasteSpecial(Paste=-4122)
+
+        # 清除粘贴后可能残留的选中状态
+        try:
+            wb.app.api.CutCopyMode = False
+        except Exception:
+            pass
+
+        return ToolResult.success(call_id, self.name, {
+            "sheet": sheet.name, "start_row": start_row, "count": count,
+            "format_from": source_row,
+            "_hint": f"已在第 {start_row} 行插入 {count} 行（已复制第 {source_row} 行格式），记得 save"
+        })
+
+    # ── format_range ──
+
+    def _format_range(self, call_id, args):
+        wb = self._get_book(args)
+        if not wb:
+            return self._need_connect(call_id)
+        sheet = self._get_sheet(wb, args)
+        rng_str = args.get("format", "{}")
+        fmt = self._parse_json(rng_str)
+
+        addr = fmt.get("range", "")
+        if not addr:
+            return ToolResult.error(call_id, self.name, "需要 range（如 'A1:C10'）")
+
+        rng = sheet.range(addr)
+
+        # 字体
+        font = fmt.get("font", {})
+        if font:
+            if "bold" in font:
+                rng.api.Font.Bold = font["bold"]
+            if "size" in font:
+                rng.api.Font.Size = font["size"]
+            if "name" in font:
+                rng.api.Font.Name = font["name"]
+            if "color" in font:
+                rng.api.Font.Color = self._rgb(font["color"])
+
+        # 边框
+        border = fmt.get("border", {})
+        if border:
+            for side in ["Left", "Right", "Top", "Bottom"]:
+                if side.lower() in border:
+                    b = border[side.lower()]
+                    edge = getattr(rng.api.Borders, getattr(
+                        getattr(rng.api.Borders, f"xlEdge{side}"), "xlEdge" + side, None
+                    ), None)
+
+        # 数字格式
+        num_fmt = fmt.get("number_format", "")
+        if num_fmt:
+            rng.api.NumberFormat = num_fmt
+
+        # 对齐
+        align = fmt.get("alignment", {})
+        if align:
+            if "horizontal" in align:
+                h_map = {"left": -4131, "center": -4108, "right": -4152}
+                rng.api.HorizontalAlignment = h_map.get(align["horizontal"], -4108)
+            if "vertical" in align:
+                v_map = {"top": -4160, "center": -4108, "bottom": -4107}
+                rng.api.VerticalAlignment = v_map.get(align["vertical"], -4108)
+
+        return ToolResult.success(call_id, self.name, {
+            "range": addr, "sheet": sheet.name,
+            "_hint": f"已设置 {addr} 格式"
+        })
 
     @staticmethod
-    def _actions_need_file() -> set:
-        return {"list_sheets", "read_sheet", "get_sheet_info", "find_column",
-                "write_cell", "write_row", "write_batch", "write_dict", "save", "close"}
+    def _rgb(color):
+        """颜色转 RGB"""
+        if isinstance(color, int):
+            return color
+        if isinstance(color, str) and color.startswith("#"):
+            r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+            return r + (g << 8) + (b << 16)
+        return 0
+
+    # ── auto_fit ──
+
+    def _auto_fit(self, call_id, args):
+        wb = self._get_book(args)
+        if not wb:
+            return self._need_connect(call_id)
+        sheet = self._get_sheet(wb, args)
+        sheet.used_range.autofit()
+        return ToolResult.success(call_id, self.name, {
+            "sheet": sheet.name, "status": "已自动调整列宽"
+        })
+
+    # ── save ──
+
+    def _save(self, call_id, args):
+        wb = self._get_book(args)
+        if not wb:
+            return self._need_connect(call_id)
+        wb.save()
+        return ToolResult.success(call_id, self.name, {
+            "status": "已保存", "file_path": wb.fullname
+        })
+
+    # ── close ──
+
+    def _close(self, call_id, args):
+        alias = args.get("file_path", "")
+        if alias not in _open_books:
+            return ToolResult.error(call_id, self.name, "文件未打开")
+
+        wb = _open_books.pop(alias, None)
+        app = _open_apps.pop(alias, None)
+        _file_aliases.pop(alias, None)
+
+        if wb:
+            try:
+                wb.save()
+            except Exception:
+                pass
+            try:
+                wb.close()
+            except Exception:
+                pass
+        if app:
+            try:
+                app.quit()
+            except Exception:
+                pass
+
+        return ToolResult.success(call_id, self.name, {
+            "alias": alias, "status": "已关闭"
+        })
+
+    # ── helpers ──
+
+    def _get_book(self, args):
+        alias = args.get("file_path", "")
+        return _open_books.get(alias)
+
+    def _get_sheet(self, wb, args):
+        name = args.get("sheet_name", "")
+        if name:
+            try:
+                return wb.sheets[name]
+            except Exception:
+                pass
+        # 默认第一个工作表
+        return wb.sheets[0] if wb.sheets else None
+
+    def _need_connect(self, call_id):
+        return ToolResult.error(call_id, self.name,
+                                "文件未打开。请先 excel(action='connect', file_path='xxx.xlsx', alias='x')")
 
     @staticmethod
-    def _infer_action(kwargs: dict) -> str:
-        """自动推断 action（未传 action 时的智能回退）"""
-        if kwargs.get("data"):
-            return "write_batch"
-        if kwargs.get("row_data"):
-            return "write_dict"
-        if kwargs.get("column_name"):
-            return "find_column"
-        if kwargs.get("columns") and kwargs.get("values"):
-            return "write_row"
-        if kwargs.get("row") and kwargs.get("column"):
-            return "write_cell"
-        if kwargs.get("alias"):
-            return "connect"
-        if kwargs.get("sheet_name"):
-            return "read_sheet"
-        if kwargs.get("file_path"):
-            return "connect"
-        return "read_sheet"
-
-    @staticmethod
-    def _detect_valid_columns(ws, header_row: int, max_col: int, max_row: int) -> tuple:
-        """智能检测有效列：跳过无意义列名和全空列"""
-        valid_cols = []
-        valid_headers = []
-
-        for c in range(1, max_col + 1):
-            cell_val = ws.cell(row=header_row, column=c).value if header_row > 0 else None
-            str_val = str(cell_val).strip() if cell_val else ""
-
-            # 跳过 openpyxl 自动生成的 "列N" 格式
-            is_meaningful = str_val and not str_val.startswith("列")
-
-            # 检查该列是否有数据
-            has_data = False
-            check_start = header_row + 1 if header_row > 0 else 1
-            for r in range(check_start, min(check_start + 3, max_row + 1)):
-                if ws.cell(row=r, column=c).value is not None:
-                    has_data = True
-                    break
-
-            if is_meaningful or has_data:
-                valid_cols.append(c)
-                valid_headers.append(str_val if is_meaningful else f"列{c}")
-
-        # 如果全部被过滤，回退到全部列
-        if not valid_cols:
-            valid_cols = list(range(1, max_col + 1))
-            if header_row > 0:
-                valid_headers = [str(ws.cell(row=header_row, column=c).value or f"列{c}")
-                                 for c in valid_cols]
-            else:
-                valid_headers = [f"列{c}" for c in valid_cols]
-
-        return valid_cols, valid_headers
-
-    @staticmethod
-    def _fuzzy_match_header(target: str, headers: List[str]) -> Optional[str]:
-        """模糊匹配表头（包含/被包含关系）"""
-        target_lower = target.lower().strip()
-        for h in headers:
-            h_lower = h.lower().strip()
-            if target_lower in h_lower or h_lower in target_lower:
-                return h
-        return None
-
-    def _help_message(self) -> str:
-        aliases = list(_file_aliases.keys())
-        return (
-            "❌ 参数为空！请提供 action 参数。\n\n"
-            "常用操作:\n"
-            "  connect → {\"action\": \"connect\", \"file_path\": \"/path/to/file.xlsx\", \"alias\": \"别名\"}\n"
-            "  read_sheet → {\"action\": \"read_sheet\", \"file_path\": \"别名\", \"sheet_name\": \"Sheet1\"}\n"
-            "  write_cell → {\"action\": \"write_cell\", \"file_path\": \"别名\", \"sheet_name\": \"Sheet1\", \"row\": 2, \"column\": 1, \"value\": \"内容\"}\n"
-            "  write_batch → {\"action\": \"write_batch\", \"file_path\": \"别名\", \"sheet_name\": \"Sheet1\", \"data\": [{\"row\": 2, \"columns\": {1: \"值\"}}]}\n"
-            "  write_dict → {\"action\": \"write_dict\", \"file_path\": \"别名\", \"sheet_name\": \"Sheet1\", \"row_data\": {\"row\": 2, \"data\": {\"姓名\": \"张三\"}}}\n"
-            "  find_column → {\"action\": \"find_column\", \"file_path\": \"别名\", \"sheet_name\": \"Sheet1\", \"column_name\": \"金额\"}\n"
-            "  save → {\"action\": \"save\", \"file_path\": \"别名\"}\n"
-            "  close → {\"action\": \"close\", \"file_path\": \"别名\"}\n"
-            + (f"\n📌 已连接的文件别名: {aliases}" if aliases else "\n📌 尚未连接任何文件，请先 connect")
-        )
-
-    def _connect_required_message(self) -> str:
-        aliases = list(_file_aliases.keys())
-        return (
-            "❌ 尚未连接任何 Excel 文件！\n"
-            "📌 请先执行 connect:\n"
-            '  {"action": "connect", "file_path": "/path/to/file.xlsx", "alias": "源文件"}\n'
-            + (f"💡 已连接的别名: {aliases}" if aliases else "")
-        )
+    def _parse_json(s):
+        try:
+            return json.loads(s) if isinstance(s, str) else s
+        except (json.JSONDecodeError, TypeError):
+            return {}

@@ -36,7 +36,7 @@ class MessageList:
     # 工具操作类型（用于重要性标记，只影响展示排序，不影响存储）
     TOOL_ACTIONS_LOW_IMPORTANCE = {"read", "list", "search", "get"}
 
-    def __init__(self, max_tokens: int = 1_000_000, min_working_reserve: int = 500):
+    def __init__(self, max_tokens: int = 1_000_000, min_working_reserve: int = 200):
         self._messages: List[Message] = []    # 完整存储（扁平列表）
         self._round_counter: int = 0           # 当前轮次 ID
         self._round_map: Dict[int, List[Message]] = {}  # round_id → [messages]
@@ -227,8 +227,8 @@ class MessageList:
             for m in non_system_rounds[rid]:
                 result.append(m.to_dict())
 
-        # 验证最小保留量
-        if total_tokens < self.min_working_reserve and sorted_rounds:
+        # 只有多轮对话且 token 过低才警告（单条消息的短对话是正常的）
+        if total_tokens < self.min_working_reserve and len(sorted_rounds) > 1:
             preview = " | ".join(
                 f"[{m.get('role','?')}] {str(m.get('content',''))[:80]}"
                 for m in result[:5]
@@ -245,10 +245,6 @@ class MessageList:
         )
 
         return result
-
-    def _estimate_tokens(self, d: Dict) -> int:
-        """估算单条消息 token 数"""
-        return estimate_message_tokens(d)
 
     # ── 修改 ──
 

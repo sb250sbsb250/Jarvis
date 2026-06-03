@@ -1,5 +1,5 @@
 """
-工具包 — 注册入口（合并版）
+工具包 — 注册入口（合并版：27→9）
 
 使用方式：
     from tools import register_all_tools
@@ -18,50 +18,39 @@ from engine.tool.registry import ToolRegistry as _ToolRegistry
 logger = logging.getLogger(__name__)
 
 
-# ── 导入所有工具类 ──
-from .file_tool import ListFilesTool, ReadFileTool, WriteFileTool, FileRenameTool, DiffFileTool, ReadImageTool, ReadPdfTool
+# ── 11 个统一工具 ──
+from .file_tool import FileTool
 from .excel_tool import ExcelTool
+from .code_graph import CodeGraphTool      # 代码理解（只读）: search/read/grep/analyze/symbol/deps/quality/style
+from .code_edit import CodeEditTool        # 代码编辑（写入）: diff/write/rollback
+from .pentest_tool import PentestTool
 from .shell_tool import ShellExecuteTool
-from .system_tool import SystemInfoTool, GetTimeTool
-from .edit_tool import EditTool
-from .code_editor_v3 import ProjectSearchTool, CodeEditorTool
-from .web_tool import WebFetchTool, WebSearchTool
+from .web_tool import WebTool
 from .git_tool import GitTool
-from .code_tool import CodeSearchTool
-from .pdf_tool import PdfReadTool
-from .word_tool import WordTool
-from .image_recognize_tool import ImageRecognizeTool
+from .system_tool import SystemTool
+from .image_tool import ImageTool
+from .office_tool import OfficeTool
 
 
-# ── 工具类列表（精简去重版） ──
+# ── 工具类列表 ──
 ALL_TOOL_CLASSES: List[type] = [
-    # 文件读写
-    ListFilesTool, ReadFileTool, WriteFileTool, FileRenameTool,
-    DiffFileTool, ReadImageTool, ReadPdfTool,
-    # Excel（统一版）
-    ExcelTool,
-    # 代码搜索/编辑
-    ProjectSearchTool, CodeEditorTool, CodeSearchTool,
-    # 图片识别
-    ImageRecognizeTool,
-    # 系统
-    ShellExecuteTool, SystemInfoTool, GetTimeTool,
-    # 网络
-    WebFetchTool, WebSearchTool,
-    # 编辑
-    EditTool,
-    # 版本控制
-    GitTool,
-    # Office
-    WordTool,
+    FileTool,          # 文件: list/read/write/append/rename/diff
+    ExcelTool,         # Excel: connect/read/write/migrate...
+    CodeGraphTool,     # 代码理解（只读）: search/read/grep/analyze/symbol/deps/quality/style
+    CodeEditTool,      # 代码编辑（写入）: diff/write/rollback
+    PentestTool,       # 渗透测试: 18工具 via WSL（只读）
+    ShellExecuteTool,  # Shell: 命令执行 + 输出恢复
+    WebTool,           # 网络: fetch/search
+    GitTool,           # 版本控制: status/commit/push
+    SystemTool,        # 系统: info/time/cwd
+    ImageTool,         # 图片: read/ocr
+    OfficeTool,        # Office: read_pdf/read_docx/write_docx
 ]
 
 
 # ── 默认配置 ──
 DEFAULT_TOOL_CONFIGS: Dict[type, Dict[str, Any]] = {
     ShellExecuteTool: {"timeout": 30},
-    WebFetchTool: {"timeout": 10},
-    WebSearchTool: {"max_results": 5},
 }
 
 
@@ -96,6 +85,7 @@ def register_all_tools(
         registry.register(tool_class, **kwargs)
         registered += 1
 
+    logger.info(f"工具注册完成: {registered} 个注册, {skipped} 个跳过")
     return registry
 
 
@@ -113,6 +103,6 @@ def print_tool_list(registry: Optional[_ToolRegistry] = None):
             try:
                 kwargs = DEFAULT_TOOL_CONFIGS.get(tc, {})
                 temp = tc(**kwargs)
-                logger.info(f"  🔧 {temp.name}: {temp.description[:50]}")
+                logger.info(f"  🔧 {temp.name}: {temp.description[:60]}")
             except:
                 logger.info(f"  🔧 {tc.__name__}")

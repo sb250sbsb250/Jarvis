@@ -42,7 +42,7 @@ for d in [DATA_DIR, SESSION_DIR, STATIC_DIR, WORKSPACE_DIR]:
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-MODEL = os.getenv("MODEL", "deepseek-chat")
+MODEL = os.getenv("MODEL", "deepseek-v4-pro")
 
 # ───────────── FastAPI 应用 ─────────────
 app = FastAPI(title="Jarvis V3")
@@ -246,14 +246,14 @@ async def event_generator(
 
         # 轮询 sse_queue 直到任务完成
         while True:
-            done_flag = False
             # 取出所有已积累的事件
             while sse_queue:
                 payload = sse_queue.pop(0)
                 yield f"data: {payload}\n\n"
             # 检查任务是否完成
             if process_task.done():
-                # 再取一次防止遗漏
+                # 再取一次防止遗漏（done 事件可能刚刚加入）
+                await asyncio.sleep(0.05)  # 稍微等待确保事件已入队
                 while sse_queue:
                     payload = sse_queue.pop(0)
                     yield f"data: {payload}\n\n"
@@ -269,8 +269,6 @@ async def event_generator(
         # 保存助手回复
         history.add_assistant(answer)
         await session_manager.save_session(session)
-
-        yield f"data: {json.dumps({'type': 'chunk', 'content': answer})}\n\n"
 
     except Exception as e:
         elapsed = time.time() - start_time

@@ -1,146 +1,148 @@
 """
-网页工具 — 获取网页内容
+tools/web_tool.py — 网络工具（合并版）
+
+合并 web_fetch + web_search
 """
 
+import re
 import logging
 from typing import List
+from urllib.parse import quote
 
-from engine.tool.base import BaseTool, ToolParameter
-from engine.core.types import ToolResult
+from engine.tool.base import BaseTool, ToolParameter, ToolResult
 
-logger = logging.getLogger("jarvis.tools.web")
+logger = logging.getLogger(__name__)
 
 
-class WebFetchTool(BaseTool):
-
-    def __init__(self, **kwargs):
-        self._timeout = kwargs.get("timeout", 10)
-
-    """获取网页内容"""
+class WebTool(BaseTool):
+    """网络工具 — fetch + search"""
 
     @property
     def name(self) -> str:
-        return "web_fetch"
+        return "web"
 
     @property
     def description(self) -> str:
         return (
-            "获取网页内容并转为 Markdown\n"
-            "\n"
-            "📖 使用示例：\n"
-            "  # 抓取网页内容:\n"
-            "  web_fetch(url='https://example.com')\n"
-            "  # 限制返回长度:\n"
-            "  web_fetch(url='https://example.com', max_chars=3000)\n"
-            "  💡 返回纯文本 Markdown，适合 LLM 阅读。\n"
+            "网络操作。action: fetch(抓取网页)/search(搜索)\n"
+            "- fetch: url='https://...', max_chars=5000\n"
+            "- search: query='关键词', count=5\n"
+            "先 search 找信息源，再 fetch 获取详情"
         )
 
     @property
     def parameters(self) -> List[ToolParameter]:
         return [
-            ToolParameter(name="url", type="string", description="网页 URL", required=True),
-            ToolParameter(name="max_chars", type="number", description="最大字符数", required=False, default=50000),
+            ToolParameter("action", "string", "fetch/search", required=True,
+                          enum=["fetch", "search"]),
+            ToolParameter("url", "string", "网页URL(fetch用)", required=False),
+            ToolParameter("query", "string", "搜索关键词(search用)", required=False),
+            ToolParameter("max_chars", "number", "最大字符数(fetch用，默认5000)", required=False),
+            ToolParameter("count", "number", "结果数(search用，默认5)", required=False),
         ]
 
-    async def execute(self, call_id, **kwargs) -> ToolResult:
-        url = kwargs.get("url", "")
-        max_chars = kwargs.get("max_chars", 50000)
+    async def execute(self, call_id: str, **kwargs) -> ToolResult:
+        action = kwargs.get("action", "search")
+
+        if action == "fetch":
+            return await self._fetch(call_id, kwargs)
+        elif action == "search":
+            return await self._search(call_id, kwargs)
+        else:
+            return ToolResult.error(call_id, self.name, f"未知操作: {action}")
+
+    async def _fetch(self, call_id, args):
+        url = args.get("url", "")
+        max_chars = int(args.get("max_chars", 5000))
+
+        if not url:
+            return ToolResult.error(call_id, self.name, "fetch 需要 url")
+
         try:
             import aiohttp
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                async with session.get(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
                     html = await resp.text()
-            # 简单提取文本
-            import re
-            text = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
-            text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL)
-            text = re.sub(r'<[^>]+>', ' ', text)
-            text = re.sub(r'\s+', ' ', text).strip()
-            text = text[:max_chars]
-            return ToolResult.success(call_id, self.name, {
-                "url": url,
-                "content": text,
-                "size": len(text),
-                "status": resp.status,
-            })
+                    status = resp.status
         except ImportError:
-            # fallback 到 urllib
-            try:
-                from urllib.request import urlopen
-                with urlopen(url, timeout=15) as resp:
-                    html = resp.read().decode("utf-8", errors="replace")
-                import re
-                text = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
-                text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL)
-                text = re.sub(r'<[^>]+>', ' ', text)
-                text = re.sub(r'\s+', ' ', text).strip()
-                text = text[:max_chars]
-                return ToolResult.success(call_id, self.name, {
-                    "url": url, "content": text, "size": len(text),
-                })
-            except Exception as e2:
-                return ToolResult.error(call_id, self.name, str(e2))
+            from urllib.request import urlopen, Request
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+                status = resp.status
         except Exception as e:
-            return ToolResult.error(call_id, self.name, str(e))
+            return ToolResult.error(call_id, self.name, f"抓取失败: {e}。检查 URL 是否正确")
 
+        # 提取文本
+        text = re.sub(r'<(script|style|noscript|iframe|svg)[^>]*>.*?</\1>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'&[a-z]+;', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
 
-class WebSearchTool(BaseTool):
+        truncated = len(text) > max_chars
+        text = text[:max_chars]
 
-    def __init__(self, **kwargs):
-        self._max_results = kwargs.get("max_results", 5)
+        return ToolResult.success(call_id, self.name, {
+            "url": url,
+            "status": status,
+            "size": len(text),
+            "content": text,
+            "_hint": "内容已截断" if truncated else "如需更多内容，增大 max_chars",
+        })
 
-    @property
-    def name(self) -> str:
-        return "web_search"
+    async def _search(self, call_id, args):
+        query = args.get("query", "")
+        count = int(args.get("count", 5))
 
-    @property
-    def description(self) -> str:
-        return (
-            "搜索互联网信息\n"
-            "\n"
-            "📖 使用示例：\n"
-            "  # 基本搜索:\n"
-            "  web_search(query='Python 异步编程教程')\n"
-            "  # 限制返回结果数:\n"
-            "  web_search(query='Python 教程', count=3)\n"
-            "  # 按时间过滤:\n"
-            "  web_search(query='最新 AI 新闻', freshness='day')\n"
-            "  💡 返回标题+摘要+URL，需要详细内容再用 web_fetch 抓取。\n"
-        )
+        if not query:
+            return ToolResult.error(call_id, self.name, "search 需要 query")
 
-    @property
-    def parameters(self) -> List[ToolParameter]:
-        return [
-            ToolParameter(name="query", type="string", description="搜索关键词", required=True),
-            ToolParameter(name="count", type="number", description="返回结果数", required=False, default=5),
-        ]
-
-    async def execute(self, call_id, **kwargs) -> ToolResult:
-        query = kwargs.get("query", "")
-        count = kwargs.get("count", 5)
         try:
             import aiohttp
-            search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
-            headers = {"User-Agent": "Mozilla/5.0"}
+            search_url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
             async with aiohttp.ClientSession() as session:
-                async with session.get(search_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.get(
+                    search_url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
                     html = await resp.text()
-            import re
-            results = []
-            for match in re.finditer(r'<h3[^>]*>.*?<a[^>]*href="(/url\?q=[^"&]+)', html, re.DOTALL):
-                url_match = re.search(r'href="(/url\?q=([^"&]+))', match.group(0))
-                if url_match:
-                    from urllib.parse import unquote
-                    url = unquote(url_match.group(2))
-                    title_match = re.search(r'<h3[^>]*>(.*?)</h3>', match.group(0))
-                    title = re.sub(r'<[^>]+>', '', title_match.group(1)) if title_match else ""
-                    results.append({"title": title, "url": url})
-                    if len(results) >= count:
-                        break
-            if not results:
-                results.append({"title": "无结果", "url": ""})
-            return ToolResult.success(call_id, self.name, {"query": query, "results": results})
+        except ImportError:
+            from urllib.request import urlopen, Request
+            req = Request(
+                f"https://html.duckduckgo.com/html/?q={quote(query)}",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urlopen(req, timeout=10) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
         except Exception as e:
             return ToolResult.error(call_id, self.name, f"搜索失败: {e}")
 
+        results = []
+        for match in re.finditer(
+            r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            html, re.DOTALL,
+        ):
+            url = match.group(1)
+            title = re.sub(r'<[^>]+>', '', match.group(2)).strip()
+            if url and title and not url.startswith("//duckduckgo.com"):
+                results.append({"title": title, "url": url})
+                if len(results) >= count:
+                    break
 
+        if not results:
+            return ToolResult.success(call_id, self.name, {
+                "query": query,
+                "results": [],
+                "_hint": "未找到结果。尝试: 1)简化关键词 2)用英文搜索 3)用 web(action='fetch') 直接访问已知网站",
+            })
+
+        return ToolResult.success(call_id, self.name, {
+            "query": query,
+            "results": results,
+            "_hint": f"找到 {len(results)} 条结果。用 web(action='fetch', url='...') 获取详情",
+        })

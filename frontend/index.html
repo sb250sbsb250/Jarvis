@@ -77,6 +77,10 @@
                          :class="msg.role">
                         <div class="message-avatar">{{ msg.role === 'user' ? '👤' : msg.role === 'tool_result' ? '🔧' : '🤖' }}</div>
                         <div class="message-content" v-html="msg.html" :id="'msg-' + msg._uid + '-content'"></div>
+                        <div class="msg-actions" v-if="msg.content">
+                            <button class="msg-act-btn" @click="copyMessage(msg)" title="复制">📋</button>
+                            <button v-if="msg.role === 'user'" class="msg-act-btn" @click="resendMessage(msg)" title="重新发送">🔄</button>
+                        </div>
                     </div>
                 </div>
 

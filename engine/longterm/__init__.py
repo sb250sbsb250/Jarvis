@@ -7,14 +7,20 @@
 └── topic_inject.py      — 记忆注入 + 反馈闭环 + 做梦整合
 """
 
+# Topic 系统（活跃）
 from .topic_store import TopicStore, BM25Index
 from .topic_search import search_topics, build_injection_block, search_simple
 from .topic_compress import compress_dialogue, should_compress
 from .topic_inject import Injector, get_injector
 
 __all__ = [
-    "TopicStore", "BM25Index",
-    "search_topics", "build_injection_block", "search_simple",
-    "compress_dialogue", "should_compress",
-    "Injector", "get_injector",
+    "TopicStore",
+    "BM25Index",
+    "search_topics",
+    "build_injection_block",
+    "search_simple",
+    "compress_dialogue",
+    "should_compress",
+    "Injector",
+    "get_injector",
 ]

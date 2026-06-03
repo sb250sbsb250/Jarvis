@@ -1,91 +1,19 @@
 """
-skill/registry.py — Skill 注册中心（支持按需加载）
+skill/registry.py — Skill 注册中心
 
 负责：
  1. 注册/注销 Skill
- 2. 按目录绑定延迟加载
- 3. 根据用户输入路由到最合适的 Skill
- 4. 收集 Skill 需要的工具
- 5. 维护 Skill 统计信息
+ 2. 根据用户输入路由到最合适的 Skill
+ 3. 维护 Skill 统计信息
 """
 
-import importlib
+import difflib
 import logging
-import os
-import re
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Type, Set, Callable
+from typing import Dict, List, Optional, Tuple, Set, Callable, Type, Any
 
 from .base import Skill, SkillMeta
 
 logger = logging.getLogger(__name__)
-
-
-class SkillDirectory:
-    """
-    按目录绑定的延迟加载 Skill 组。
-
-    用法:
-      dir = SkillDirectory("./my_skills")
-      dir.load_all()  # 加载 my_skills/ 下的所有 Skill 类
-    """
-
-    def __init__(self, directory: str, label: str = "", enabled: bool = True):
-        self.directory = Path(directory).resolve()
-        self.label = label or self.directory.name
-        self.enabled = enabled
-        self._loaded = False
-        self._skills: List[Skill] = []
-
-    def load_all(self) -> List[Skill]:
-        """加载目录下的所有 Skill"""
-        if self._loaded:
-            return self._skills
-
-        if not self.directory.exists():
-            logger.warning(f"Skill 目录不存在: {self.directory}")
-            return []
-
-        self._skills = []
-        sys_path_backup = list(type.__module__ for type in type.__subclasses__(type))  # 无关
-
-        # 遍历目录下的 .py 文件
-        for child in sorted(self.directory.iterdir()):
-            if child.suffix == ".py" and not child.name.startswith("__"):
-                try:
-                    # 动态导入
-                    spec = importlib.util.spec_from_file_location(
-                        f"skill_lazy_{self.directory.name}.{child.stem}",
-                        child
-                    )
-                    if spec and spec.loader:
-                        module = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(module)
-
-                        # 找到模块中所有 Skill 子类
-                        for attr_name in dir(module):
-                            attr = getattr(module, attr_name)
-                            if (isinstance(attr, type) and
-                                issubclass(attr, Skill) and
-                                attr is not Skill):
-                                try:
-                                    skill = attr()
-                                    self._skills.append(skill)
-                                    logger.info(
-                                        f"  按需加载 [{self.label}]: "
-                                        f"{skill.meta.icon} {skill.meta.display_name}"
-                                    )
-                                except Exception as e:
-                                    logger.warning(
-                                        f"  ⚠️ 实例化失败 {attr_name}: {e}"
-                                    )
-                except Exception as e:
-                    logger.warning(f"  ⚠️ 加载失败 {child.name}: {e}")
-
-        self._loaded = True
-        logger.info(f"📂 Skill 目录 [{self.label}]: "
-                     f"已加载 {len(self._skills)} 个 Skill")
-        return self._skills
 
 
 class SkillRegistry:
@@ -93,79 +21,7 @@ class SkillRegistry:
 
     def __init__(self):
         self._skills: Dict[str, Skill] = {}
-        self._directories: List[SkillDirectory] = []
         self._load_callbacks: List[Callable] = []
-
-    # ── 按目录注册（延迟加载） ──
-
-    def register_directory(
-        self,
-        directory: str,
-        label: str = "",
-        enabled: bool = True,
-        auto_load: bool = False,
-    ) -> SkillDirectory:
-        """
-        按目录注册 Skill（延迟加载）。
-
-        Args:
-            directory: Skill 目录路径
-            label: 目录标签（用于日志）
-            enabled: 是否启用
-            auto_load: 注册后立即加载
-
-        Returns:
-            SkillDirectory 实例
-        """
-        sd = SkillDirectory(directory, label, enabled)
-        self._directories.append(sd)
-
-        if auto_load:
-            for skill in sd.load_all():
-                self.register(skill)
-
-        logger.info(f"📂 注册 Skill 目录: {sd.label} ({sd.directory})")
-        return sd
-
-    def load_directory(self, label: str) -> int:
-        """
-        延迟加载指定标签的目录。
-
-        Returns:
-            加载的 Skill 数量
-        """
-        count = 0
-        for sd in self._directories:
-            if sd.label == label and sd.enabled and not sd._loaded:
-                for skill in sd.load_all():
-                    self.register(skill)
-                    count += 1
-        return count
-
-    def load_all_directories(self) -> int:
-        """加载所有已注册的目录"""
-        count = 0
-        for sd in self._directories:
-            if sd.enabled and not sd._loaded:
-                for skill in sd.load_all():
-                    self.register(skill)
-                    count += 1
-        return count
-
-    def list_directories(self) -> List[Dict]:
-        """列出所有注册的目录"""
-        return [
-            {
-                "label": sd.label,
-                "directory": str(sd.directory),
-                "enabled": sd.enabled,
-                "loaded": sd._loaded,
-                "skill_count": len(sd._skills),
-            }
-            for sd in self._directories
-        ]
-
-    # ── 普通注册 ──
 
     def register(self, skill: Skill) -> "SkillRegistry":
         """注册一个 Skill"""
@@ -213,18 +69,7 @@ class SkillRegistry:
     # ── 查询 ──
 
     def get(self, name: str) -> Optional[Skill]:
-        """按名称获取 Skill"""
-        if name in self._skills:
-            return self._skills[name]
-
-        # 尝试从目录延迟加载
-        for sd in self._directories:
-            if sd.enabled and not sd._loaded:
-                for skill in sd.load_all():
-                    self.register(skill)
-                    if skill.meta.name == name:
-                        return skill
-        return None
+        return self._skills.get(name)
 
     def find(self, keyword: str) -> List[Skill]:
         """按关键词查找 Skill"""
@@ -255,32 +100,46 @@ class SkillRegistry:
     @staticmethod
     def _keyword_match(text: str, keywords: List[str]) -> float:
         """关键词预筛：快速过滤不匹配的 Skill"""
-        text_lower = text.lower()
+        if not keywords:
+            return 0.0
+
+        text_lower = text.lower().strip()
+
+        # 计算匹配得分
         max_score = 0.0
-        words = set(re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}', text.lower()))
+        matched_count = 0
 
         for kw in keywords:
-            kw_lower = kw.lower()
+            kw_lower = kw.lower().strip()
+            if not kw_lower:
+                continue
+            if len(kw_lower) < 2:
+                continue
+
             if kw_lower in text_lower:
-                score = 1.0 + (len(kw_lower) / max(len(text_lower), 1))
+                # 完整匹配：长度越长权重越大
+                score = min(1.0, len(kw_lower) / 10.0)
                 max_score = max(max_score, score)
+                matched_count += 1
             else:
-                # 模糊：用户输入词与关键词子串匹配
-                for w in words:
-                    if kw_lower in w or w in kw_lower:
-                        max_score = max(max_score, 0.5)
+                # 部分匹配：关键词的某个子串出现在输入中
+                for i in range(max(1, len(kw_lower) - 2), len(kw_lower)):
+                    sub = kw_lower[:i]
+                    if len(sub) >= 2 and sub in text_lower:
+                        max_score = max(max_score, 0.4)
                         break
+
+        # 多个关键词匹配加分
+        if matched_count >= 2:
+            max_score = min(1.0, max_score + 0.15)
 
         return max_score
 
     def route(self, user_input: str, top_k: int = 3) -> List[Tuple[Skill, float]]:
         """
-        根据用户输入路由到最合适的 Skill
+        根据用户输入路由到最合适的 Skill（纯关键词匹配，无 LLM 调用）。
 
-        策略：
-          1. 关键词预筛快速排除不匹配的 Skill
-          2. 对候选 Skill 调用 can_handle() 精确评分
-          3. 按经验等级 + 成功率排序
+        如需 LLM 语义回退，使用 route_with_fallback()。
         """
         # 1. 关键词预筛
         candidates: List[Skill] = []
@@ -311,6 +170,110 @@ class SkillRegistry:
         )
 
         return scored[:top_k]
+
+    async def route_with_fallback(
+        self,
+        user_input: str,
+        llm_client: Any = None,
+        top_k: int = 1,
+        min_confidence: float = 0.4,
+    ) -> List[Tuple[Skill, float]]:
+        """
+        关键词路由 + LLM 语义回退。
+
+        流程：
+          1. 先走纯关键词匹配（快、免费）
+          2. 如果最佳匹配置信度 >= min_confidence，直接返回
+          3. 如果置信度不足或无匹配，调用 LLM 做语义路由
+
+        Args:
+            user_input: 用户输入
+            llm_client: LLM 客户端（有 chat_completion 方法）
+            top_k: 返回前 k 个结果
+            min_confidence: 关键词匹配的最低置信度阈值
+        """
+        # 先走关键词
+        results = self.route(user_input, top_k=top_k)
+
+        if results and results[0][1] >= min_confidence:
+            return results
+
+        # 置信度不足 → LLM 语义回退
+        if llm_client:
+            skill = await self._llm_route(user_input, llm_client)
+            if skill:
+                logger.info(
+                    f"🔮 LLM 路由: {skill.meta.display_name} ({skill.meta.name})"
+                )
+                return [(skill, 0.85)]
+
+        return results
+
+    async def _llm_route(self, user_input: str, llm_client: Any) -> Optional[Skill]:
+        """
+        LLM 语义路由：用 LLM 选择最合适的 Skill。
+
+        发送所有 Skill 的名称和描述，让 LLM 做语义匹配。
+        用 difflib 对 LLM 返回做模糊修正。
+        """
+        skills = self.list_skills()
+        if not skills:
+            return None
+
+        # 构建 Skill 列表（取前 15 个，避免 prompt 过长）
+        skill_list = "\n".join(
+            f"  {s.meta.name}: {s.meta.description[:80]}"
+            for s in skills[:15]
+        )
+
+        prompt = (
+            f"根据用户请求，从以下 Skill 中选择最适合的一个。\n"
+            f"如果没有合适的，回答 'none'。\n\n"
+            f"Skill 列表:\n{skill_list}\n\n"
+            f"用户请求: {user_input[:200]}\n\n"
+            f"只回答 Skill 名称（如 'excel_fill'），或 'none':"
+        )
+
+        try:
+            response = await llm_client.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=50,
+            )
+            answer = (
+                response.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+                .lower()
+            )
+
+            if answer == "none" or not answer:
+                return None
+
+            # 1. 精确匹配
+            skill = self.get(answer)
+            if skill:
+                return skill
+
+            # 2. 格式修正（空格→下划线）
+            skill = self.get(answer.replace(" ", "_").replace("-", "_"))
+            if skill:
+                return skill
+
+            # 3. 编辑距离模糊匹配
+            names = [s.meta.name for s in skills]
+            matches = difflib.get_close_matches(
+                answer, names, n=1, cutoff=0.6
+            )
+            if matches:
+                logger.info(f"🔍 模糊匹配: '{answer}' → '{matches[0]}'")
+                return self.get(matches[0])
+
+        except Exception as e:
+            logger.debug(f"LLM 路由失败: {e}")
+
+        return None
 
     def route_exact(self, skill_name: str) -> Optional[Skill]:
         """精确路由"""
@@ -351,14 +314,5 @@ class SkillRegistry:
                   f"✅{stat['success_count']:3d} ❌{stat['failure_count']:2d} "
                   f"成功率:{stat['success_rate']} "
                   f"平均耗时:{stat['avg_duration_ms']}ms")
-
-        # 显示目录信息
-        if self._directories:
-            print(f"{'─'*60}")
-            print(f"📂 按需加载目录 ({len(self._directories)} 个)")
-            for sd in self._directories:
-                status = "✅ 已加载" if sd._loaded else "💤 延迟加载"
-                enabled = "开启" if sd.enabled else "关闭"
-                print(f"  {status} [{sd.label}] ({enabled}) → {sd.directory}")
 
         print(f"{'='*60}\n")

@@ -11,7 +11,7 @@ from enum import Enum
 import time
 
 if TYPE_CHECKING:
-    from ..context import ExecutionContext
+    from .context import ExecutionContext
 
 
 class SkillLevel(Enum):
@@ -30,6 +30,8 @@ class SkillMeta:
     description: str                # 一句话描述
     icon: str = "⚡"                 # 图标
     tags: List[str] = field(default_factory=list)  # 标签（用于检索）
+    tool_hints: List[str] = field(default_factory=list)  # 推荐工具列表
+    fallback: Optional[str] = None  # 降级 Skill 名称
 
 
 @dataclass
@@ -85,45 +87,52 @@ class Skill(ABC):
         """
         判断是否能处理用户输入
 
-        策略（两阶段匹配）：
+        策略（三阶段匹配）：
         1. 完整关键词匹配 — 关键词原文出现在用户输入中
-        2. 子词匹配 — 将关键词拆成单个中文字词，看有多少命中
+        2. 标签匹配 — 在 meta.tags 中匹配
+        3. 描述匹配 — 在 meta.description 中匹配
 
-        两阶段结果取最大值，加上经验加成。
+        三阶段取最大值，加上经验加成。
 
         Returns:
             0.0-1.0 的置信度
         """
-        if not self.trigger_keywords:
-            return 0.0
-
         user_lower = user_input.lower()
+        best = 0.0
 
         # 阶段1：完整关键词匹配
-        exact_matched = sum(1 for kw in self.trigger_keywords if kw.lower() in user_lower)
+        if self.trigger_keywords:
+            exact = sum(1 for kw in self.trigger_keywords if kw.lower() in user_lower)
+            if exact > 0:
+                best = max(best, exact / len(self.trigger_keywords))
 
-        # 阶段2：子词匹配 — 仅对 >=4 字的关键词拆成 3 字窗
-        sub_matched = 0
-        for kw in self.trigger_keywords:
-            kw_lower = kw.lower()
-            if len(kw_lower) < 4:
-                continue
-            for i in range(len(kw_lower) - 2):
-                sub = kw_lower[i:i+3]
-                if len(sub) >= 3 and sub in user_lower:
-                    sub_matched += 1
+        # 阶段2：标签匹配（标签通常是最精准的描述）
+        for tag in self.meta.tags:
+            tag_lower = tag.lower()
+            if tag_lower in user_lower:
+                best = max(best, 0.7)
+                break
+            # 模糊：用户输入包含标签的子串，或标签包含用户输入的子串
+            for word in user_lower.split():
+                if len(word) >= 2 and (word in tag_lower or tag_lower in word):
+                    best = max(best, 0.4)
                     break
 
-        matched = max(exact_matched, sub_matched)
-        if matched == 0:
+        # 阶段3：描述匹配
+        desc = self.meta.description.lower()
+        for word in user_lower.split():
+            if len(word) >= 2 and word in desc:
+                best = max(best, 0.3)
+                break
+
+        if best == 0.0:
             return 0.0
 
-        safe_matched = min(matched, len(self.trigger_keywords))
-        base_score = safe_matched / len(self.trigger_keywords)
+        # 经验加成
         experience_bonus = min(0.3, self.experience_level.value * 0.08)
         recency_bonus = 0.1 if self.is_recently_used(3600) else 0.0
 
-        return min(1.0, base_score + experience_bonus + recency_bonus)
+        return min(1.0, best + experience_bonus + recency_bonus)
 
     async def on_success(self, ctx: "ExecutionContext", result: SkillResult):
         self._success_count += 1

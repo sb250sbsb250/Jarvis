@@ -77,6 +77,15 @@ class BaseTool(ABC):
         """参数列表"""
         ...
 
+    @property
+    def is_read(self) -> bool:
+        """是否为只读工具（不修改文件/状态）。默认 False，子类按需覆盖。"""
+        return False
+
+    @property
+    def is_write(self) -> bool:
+        """是否为写入工具（会修改文件/状态）。默认 False，子类按需覆盖。"""
+        return False
     def get_schema(self) -> ToolSchema:
         return ToolSchema(
             name=self.name,

@@ -13,6 +13,11 @@ from openai import AsyncOpenAI
 logger = logging.getLogger(__name__)
 
 
+class InsufficientBalanceError(Exception):
+    """API 余额不足，不可自动重试"""
+    pass
+
+
 @dataclass
 class LLMConfig:
     """LLM 配置"""
@@ -47,12 +52,37 @@ class LLMClient:
             timeout=self.config.timeout_seconds,
         )
 
+        # ── 加载备用提供商（Fallback） ──
+        self._fallbacks: List[tuple[str, AsyncOpenAI, str]] = []
+        self._load_fallback_providers()
+
+    def _load_fallback_providers(self):
+        """从环境变量加载备用 LLM 提供商"""
+        fallback_configs = [
+            ("qwen",    "DASHSCOPE_API_KEY",    "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
+            ("kimi",    "MOONSHOT_API_KEY",      "https://api.moonshot.cn/v1",                       "moonshot-v1-128k"),
+            ("deepseek2", "DEEPSEEK_API_KEY_2",  "https://api.deepseek.com/v1",                      "deepseek-chat"),
+        ]
+        for name, env_key, base_url, model in fallback_configs:
+            key = os.environ.get(env_key, "")
+            if key:
+                self._fallbacks.append((
+                    name,
+                    AsyncOpenAI(api_key=key, base_url=base_url, timeout=self.config.timeout_seconds),
+                    model,
+                ))
+                logger.info(f"🔁 Fallback 提供商已加载: {name} ({model})")
+
+        if self._fallbacks:
+            names = [fb[0] for fb in self._fallbacks]
+            logger.info(f"🔁 共 {len(self._fallbacks)} 个 Fallback 提供商: {', '.join(names)}")
+
     @staticmethod
     def _load_config_from_env() -> LLMConfig:
         """从环境变量加载配置"""
         api_key = os.environ.get("DEEPSEEK_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
         base_url = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")
-        model = os.environ.get("LLM_MODEL", "deepseek-chat")
+        model = os.environ.get("LLM_MODEL", "deepseek-v4-pro")
 
         return LLMConfig(
             api_key=api_key,
@@ -201,6 +231,46 @@ class LLMClient:
                         non_stream_resp = await self._client.chat.completions.create(**params)
                         return self._to_dict(non_stream_resp)
             logger.error(f"LLM 调用失败: {e}")
+
+            # ── 永久性错误检查（余额不足、认证失败） → 尝试 Fallback ──
+            if LLMClient._is_permanent_error(e):
+                provider_name = "deepseek"
+                logger.warning(f"⚠️ {provider_name} 永久性错误，尝试 Fallback 提供商...")
+
+                for fb_name, fb_client, fb_model in self._fallbacks:
+                    try:
+                        logger.info(f"🔄 切换到 Fallback: {fb_name} ({fb_model})")
+                        fb_params = dict(params)
+                        fb_params["model"] = fb_model
+                        fb_params["messages"] = messages  # 用原始消息
+                        fb_response = await fb_client.chat.completions.create(**fb_params)
+                        result_dict = self._to_dict(fb_response)
+
+                        # 日志
+                        usage = result_dict.get("usage", {})
+                        logger.info(
+                            f"✅ Fallback {fb_name} 成功 "
+                            f"(↑{usage.get('prompt_tokens', '?')} "
+                            f"↓{usage.get('completion_tokens', '?')})"
+                        )
+                        return result_dict
+                    except Exception as fb_e:
+                        fb_elapsed = (time.time() - _llm_start) * 1000
+                        logger.warning(
+                            f"⚠️ Fallback {fb_name} 也失败 ({fb_elapsed:.0f}ms): {fb_e}"
+                        )
+                        if LLMClient._is_permanent_error(fb_e):
+                            continue  # 也是永久错误，试下一个
+                        raise  # 临时错误直接抛
+
+                # 所有 Fallback 都失败了
+                raise InsufficientBalanceError(
+                    "所有 LLM 提供商均不可用。请至少充值一个账户：\n"
+                    "  1. DeepSeek:  https://platform.deepseek.com/\n"
+                    "  2. 通义千问:  https://dashscope.aliyuncs.com/\n"
+                    "  3. Kimi:      https://kimi.moonshot.cn/"
+                )
+
             raise
 
     async def stream_chunks(
@@ -231,6 +301,21 @@ class LLMClient:
 
         async for chunk in response:
             yield self._chunk_to_dict(chunk)
+
+    @staticmethod
+    def _is_permanent_error(e: Exception) -> bool:
+        """判断是否为永久性错误（不应重试）"""
+        error_str = str(e).lower()
+        keywords = [
+            "402", "insufficient balance", "insufficient_quota",
+            "401", "invalid_api_key", "authentication",
+            "403", "forbidden",
+            "exceeded", "rate limit exceeded",  # 真正的限流可重试，但这里算上更安全
+        ]
+        # 排除可重试的限流
+        if "rate limit" in error_str and "retry after" not in error_str:
+            return False
+        return any(kw in error_str for kw in keywords)
 
     def _to_dict(self, response: Any) -> Dict:
         """OpenAI 响应 → 字典"""
@@ -263,6 +348,7 @@ class LLMClient:
             msg_dict["reasoning_content"] = rc
 
         return {
+            "model": response.model,
             "choices": [{
                 "index": choice.index,
                 "message": msg_dict,

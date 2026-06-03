@@ -486,6 +486,18 @@ const app = createApp({
       return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
     }
 
+    // ── 消息操作 ──
+    function copyMessage(msg) {
+      if (!msg || !msg.content) return;
+      navigator.clipboard.writeText(msg.content).catch(() => {});
+    }
+
+    function resendMessage(msg) {
+      if (!msg || !msg.content) return;
+      inputText.value = msg.content;
+      sendMessage();
+    }
+
     // ── 初始化 ──
     async function init() {
       document.addEventListener('keydown', onGlobalKeydown);
@@ -534,6 +546,7 @@ const app = createApp({
       showSettings, apiProviders,
       sendMessage, interruptSession, newConversation,
       switchConversation, deleteConversation,
+      copyMessage, resendMessage,
       saveApiKey,
       formatTime, escapeHtml,
       onInputKeydown, msgContainer, inputEl, interrupting

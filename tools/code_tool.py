@@ -1,303 +1,482 @@
 """
-tool/code_tool.py — 代码操作工具
+code_tool.py — 统一代码操作工具
 
-从 engine/dag/node.py 迁移：
-  - CodeSearchNode → CodeSearchTool
-  - CodeEditorNode → ReadCodeTool + WriteCodeTool + RollbackCodeTool
+单一 CodeTool 类，9 个 action：
+ - search  : 搜索代码关键字
+ - read    : 读取文件（支持分页、智能摘要）
+ - diff    : 预览差异（不改文件）
+ - edit    : 编辑代码（精确替换，自动备份）
+ - rollback: 回滚编辑
+ - append  : 追加内容
+ - quality : 代码质量评分
+ - style   : 检测项目代码规范
+ - grep    : 正则搜索代码
+
+安全原则：read → diff → edit → rollback（需要时）
 """
 
-import difflib
-import fnmatch
 import os
+import re
+import ast
+import difflib
 import shutil
-import time
+import fnmatch
+import logging
 from typing import Any, Dict, List, Optional
 
 from engine.tool.base import BaseTool, ToolParameter
 from engine.core.types import ToolResult
 
+logger = logging.getLogger(__name__)
 
-class CodeSearchTool(BaseTool):
-    """在项目中搜索关键字"""
+
+class CodeTool(BaseTool):
+    """统一代码操作工具"""
+
+    _edit_history: List[Dict] = []
+
+    @property
+    def is_read(self) -> bool:
+        """code 负责修改代码，不判断为只读"""
+        return False
+
+    @property
+    def is_write(self) -> bool:
+        """code 负责 edit/append/rollback 等写入操作"""
+        return True
 
     @property
     def name(self) -> str:
-        return "code_search"
-
-    @property
-    def description(self) -> str:
-        return "在项目中搜索关键字，返回匹配的文件路径、行号、代码片段"
-
-    @property
-    def parameters(self) -> List[ToolParameter]:
-        return [
-            ToolParameter("keyword", "string", "要搜索的关键字", required=True),
-            ToolParameter("file_pattern", "string", "文件匹配模式，如 *.py", required=False, default="*.py"),
-            ToolParameter("base_dir", "string", "搜索根目录", required=False, default="."),
-            ToolParameter("max_results", "number", "最大结果数", required=False, default=100),
-        ]
-
-    async def execute(self, call_id: str, **kwargs) -> ToolResult:
-        keyword = kwargs.get("keyword", "")
-        file_pattern = kwargs.get("file_pattern", "*.py")
-        base_dir = kwargs.get("base_dir", ".")
-        max_results = kwargs.get("max_results", 100)
-
-        if not keyword:
-            return ToolResult.error(call_id, self.name, "缺少搜索关键字")
-
-        exclude_dirs = {'.venv', 'venv', '__pycache__', '.git', 'node_modules', '.idea', '.vscode'}
-        results = []
-
-        for root, dirs, fnames in os.walk(base_dir):
-            dirs[:] = [d for d in dirs if d not in exclude_dirs]
-            for fname in fnames:
-                if not fnmatch.fnmatch(fname, file_pattern):
-                    continue
-                fpath = os.path.join(root, fname)
-                try:
-                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                        for i, line in enumerate(f, 1):
-                            if keyword in line:
-                                rel = os.path.relpath(fpath, base_dir)
-                                results.append({
-                                    "file": rel,
-                                    "line": i,
-                                    "content": line.strip()[:200],
-                                })
-                                if len(results) >= max_results:
-                                    return ToolResult.success(call_id, self.name, {
-                                        "results": results,
-                                        "count": len(results),
-                                        "truncated": True,
-                                    })
-                except Exception:
-                    pass
-
-        return ToolResult.success(call_id, self.name, {
-            "results": results,
-            "count": len(results),
-        })
-
-
-class ReadCodeTool(BaseTool):
-    """读取代码文件内容（支持分页，智能摘要模式大文件自动截断）"""
-
-    @property
-    def name(self) -> str:
-        return "read_code"
+        return "code"
 
     @property
     def description(self) -> str:
         return (
-            "读取源码文件，返回结构化摘要（行数、类/函数结构、预览）。"
-            "大文件（>200行）自动返回摘要+结构索引，"
-            "通过 offset 参数分页读取后续内容。"
+            "代码操作工具。action 可选:\n"
+            "search : 搜索关键字，返回匹配行和上下文\n"
+            "read   : 读取文件，支持分页和智能摘要（大文件自动截断）\n"
+            "edit   : 编辑代码（精确替换，自动备份 .bak）\n"
+            "diff   : 预览修改差异（不写入文件）\n"
+            "rollback: 回滚编辑（无参数回滚最后一步）\n"
+            "append : 追加内容到文件末尾\n"
+            "quality: 代码质量评分（类型注解/异常处理/docstring/安全）\n"
+            "style  : 检测项目代码规范（pyproject.toml/ruff配置）\n"
+            "grep   : 正则搜索代码（支持通配符）\n"
+            "安全流程: read → diff → edit"
         )
 
     @property
     def parameters(self) -> List[ToolParameter]:
         return [
-            ToolParameter("path", "string", "文件路径", required=True),
-            ToolParameter("offset", "number", "起始行号（从1开始），不传则返回摘要+前200行", required=False),
-            ToolParameter("limit", "number", "读取行数", required=False, default=200),
+            ToolParameter("action", "string",
+                          "search/read/edit/diff/rollback/append/quality/style/grep",
+                          required=True,
+                          enum=["search", "read", "edit", "diff", "rollback",
+                                "append", "quality", "style", "grep"]),
+            ToolParameter("path", "string", "文件或目录路径", required=False),
+            ToolParameter("keyword", "string", "搜索关键词(search用)", required=False),
+            ToolParameter("pattern", "string", "文件匹配模式(search用)，默认*.py", required=False),
+            ToolParameter("context_lines", "number", "上下文行数(search用)，默认2", required=False),
+            ToolParameter("start_line", "number", "起始行号(read用)", required=False),
+            ToolParameter("end_line", "number", "结束行号(read用)", required=False),
+            ToolParameter("limit", "number", "读取行数(read用)，默认200", required=False),
+            ToolParameter("old_text", "string", "旧文本(edit/diff用)", required=False),
+            ToolParameter("new_text", "string", "新文本(edit/diff用)", required=False),
+            ToolParameter("content", "string", "追加内容(append用)", required=False),
+            ToolParameter("threshold", "number", "质量阈值(quality用)，默认70", required=False),
+            ToolParameter("glob", "string", "文件匹配模式(grep用)，默认**/*.py", required=False),
+            ToolParameter("base_dir", "string", "搜索根目录，默认.", required=False),
         ]
 
     async def execute(self, call_id: str, **kwargs) -> ToolResult:
-        path = kwargs.get("path", "")
-        offset = kwargs.get("offset")
-        limit = int(kwargs.get("limit", 200))
+        action = kwargs.get("action", "read")
+        handlers = {
+            "search": self._search, "read": self._read,
+            "edit": self._edit, "diff": self._diff,
+            "rollback": self._rollback, "append": self._append,
+            "quality": self._quality, "style": self._style, "grep": self._grep,
+        }
+        handler = handlers.get(action)
+        if not handler:
+            return ToolResult.error(call_id, self.name, f"未知操作: {action}")
+        return await handler(call_id, kwargs)
 
-        # ⭐ 参数验证
-        if not path or not path.strip():
-            return ToolResult.error(
-                call_id, self.name,
-                "path 参数不能为空。请提供要读取的代码文件完整路径。"
-            )
-        if not os.path.exists(path):
+    # ── search ──
+
+    async def _search(self, call_id, args):
+        keyword = args.get("keyword", "")
+        pattern = args.get("pattern", "*.py")
+        context_lines = int(args.get("context_lines", 2))
+        base_dir = args.get("base_dir", ".")
+        if not keyword:
+            return ToolResult.error(call_id, self.name, "search 需要 keyword")
+
+        exclude = {'.venv', 'venv', '__pycache__', '.git', 'node_modules',
+                   '.idea', '.vscode', 'dist', 'build'}
+        results = []
+        for root, dirs, files in os.walk(base_dir):
+            dirs[:] = [d for d in dirs if d not in exclude and not d.startswith(".")]
+            for fname in files:
+                if not fnmatch.fnmatch(fname, pattern):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.readlines()
+                    for i, line in enumerate(lines):
+                        if keyword in line:
+                            ctx_start = max(0, i - context_lines)
+                            ctx_end = min(len(lines), i + context_lines + 1)
+                            results.append({
+                                "file": os.path.relpath(fpath, base_dir),
+                                "line": i + 1,
+                                "match": line.strip()[:200],
+                                "context": "".join(
+                                    f"{'>' if j==i else ' '} {j+1}: {lines[j].rstrip()}\n"
+                                    for j in range(ctx_start, ctx_end)
+                                ),
+                            })
+                            if len(results) >= 30:
+                                break
+                except Exception:
+                    pass
+                if len(results) >= 30:
+                    break
+            if len(results) >= 30:
+                break
+
+        if not results:
+            return ToolResult.success(call_id, self.name, {
+                "keyword": keyword, "matches": 0,
+                "_hint": f"未找到 '{keyword}'。换关键词或扩大 pattern",
+            })
+        return ToolResult.success(call_id, self.name, {
+            "keyword": keyword, "matches": len(results), "results": results,
+            "_hint": f"找到 {len(results)} 处匹配。用 action='read' 查看上下文",
+        })
+
+    # ── read ──
+
+    async def _read(self, call_id, args):
+        path = args.get("path", "")
+        start_line = int(args.get("start_line", 1))
+        end_line = args.get("end_line")
+        limit = int(args.get("limit", 200))
+        if not path:
+            return ToolResult.error(call_id, self.name, "read 需要 path")
+
+        full_path = os.path.abspath(path)
+        if not os.path.exists(full_path):
             return ToolResult.error(call_id, self.name, f"文件不存在: {path}")
 
-        with open(path, "r", encoding="utf-8") as f:
+        with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
-
         total = len(lines)
-        total_chars = sum(len(l) for l in lines)
+        if end_line is None:
+            end_line = min(total, start_line + limit - 1)
+        else:
+            end_line = int(end_line)
+        start_idx, end_idx = max(0, start_line - 1), min(total, end_line)
+        content = "".join(lines[start_idx:end_idx])
 
-        # ── 分页模式：指定了 offset ──
-        if offset is not None:
-            start = max(0, int(offset) - 1)
-            end = min(total, start + limit)
-            content = "".join(lines[start:end])
-            has_more = end < total
-            return ToolResult.success(call_id, self.name, {
-                "path": path,
-                "total_lines": total,
-                "start_line": int(offset),
-                "end_line": end,
-                "has_more": has_more,
-                "next_offset": end + 1 if has_more else None,
-                "content": content,
-            })
-
-        # ── 首次读取：智能摘要 ──
-        preview_lines = min(limit, total)
-        preview = "".join(lines[:preview_lines])
-        ext = os.path.splitext(path)[1].lower()
-
-        # 提取结构
+        is_large = total > 300
         structure = []
-        for i, line in enumerate(lines[:500], 1):
-            stripped = line.strip()
-            if any(stripped.startswith(kw) for kw in
-                   ["class ", "def ", "async def ", "@", "import ", "from "]):
-                if len(stripped) < 120:
-                    structure.append(f"L{i}: {stripped}")
-
-        is_large = total > 500 or total_chars > 10000
-
-        result = {
-            "path": path,
-            "total_lines": total,
-            "total_chars": total_chars,
-            "extension": ext,
-            "preview": preview,
-            "preview_lines": preview_lines,
-        }
-
         if is_large:
-            result.update({
-                "is_large": True,
-                "has_more": True,
-                "next_offset": preview_lines + 1,
-                "structure": structure[:30],
-                "how_to_read_more": (
-                    f"文件较大（{total_chars} 字符，{total} 行）。"
-                    f"调用 read_code path={path} offset={preview_lines + 1} limit=200 读取后续"
-                ),
-            })
+            for i, line in enumerate(lines[:300]):
+                s = line.strip()
+                if any(s.startswith(kw) for kw in ["class ", "def ", "async def ", "import ", "from ", "@"]):
+                    if len(s) < 120:
+                        structure.append(f"L{i+1}: {s}")
 
+        result = {"path": path, "total_lines": total,
+                   "start_line": start_line, "end_line": end_idx, "content": content}
+        if is_large:
+            result["structure"] = structure[:30]
+            result["_hint"] = f"文件共 {total} 行，第 {start_line}-{end_idx} 行。用 start_line/end_line 翻页"
+        else:
+            result["_hint"] = "如需修改，先用 action='diff' 预览差异"
         return ToolResult.success(call_id, self.name, result)
 
+    # ── diff ──
 
-class EditCodeTool(BaseTool):
-    """编辑代码文件（精确替换，带备份和回滚能力）"""
-
-    # 类级别编辑历史
-    _edit_history: Dict[str, List[Dict]] = {}
-
-    @property
-    def name(self) -> str:
-        return "edit_code"
-
-    @property
-    def description(self) -> str:
-        return "对代码文件做精确替换编辑。必须提供 old_text 精确定位要替换的原文。自动备份，支持回滚。"
-
-    @property
-    def parameters(self) -> List[ToolParameter]:
-        return [
-            ToolParameter("path", "string", "文件路径", required=True),
-            ToolParameter("old_text", "string", "要替换的原文（必须是唯一定位）", required=True),
-            ToolParameter("new_text", "string", "替换后的新文本", required=True),
-            ToolParameter("create_backup", "boolean", "是否创建备份", required=False, default=True),
-        ]
-
-    async def execute(self, call_id: str, **kwargs) -> ToolResult:
-        path = kwargs["path"]
-        old_text = kwargs["old_text"]
-        new_text = kwargs.get("new_text", "")
-        create_backup = kwargs.get("create_backup", True)
-
-        if not os.path.exists(path):
+    async def _diff(self, call_id, args):
+        path, old_text, new_text = args.get("path", ""), args.get("old_text", ""), args.get("new_text", "")
+        if not path or not old_text:
+            return ToolResult.error(call_id, self.name, "diff 需要 path 和 old_text")
+        full_path = os.path.abspath(path)
+        if not os.path.exists(full_path):
             return ToolResult.error(call_id, self.name, f"文件不存在: {path}")
 
-        with open(path, "r", encoding="utf-8") as f:
+        with open(full_path, "r", encoding="utf-8") as f:
             content = f.read()
-
         count = content.count(old_text)
         if count == 0:
-            return ToolResult.error(call_id, self.name, "未找到匹配文本")
+            return ToolResult.error(call_id, self.name, "未找到匹配文本。用 action='read' 确认原文")
         if count > 1:
-            return ToolResult.error(call_id, self.name, f"匹配到 {count} 处，请提供更精确的定位")
-
-        bak = None
-        if create_backup:
-            bak = path + ".bak"
-            shutil.copy2(path, bak)
-
-        new_content = content.replace(old_text, new_text, 1)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(new_content)
-
-        edit_id = hash(path + old_text) & 0xFFFFFFFF
-        if path not in self._edit_history:
-            self._edit_history[path] = []
-        self._edit_history[path].append({
-            "id": edit_id,
-            "path": path,
-            "backup": bak,
-            "old_text": old_text,
-            "new_text": new_text,
-            "time": time.time(),
-        })
-
+            return ToolResult.error(call_id, self.name,
+                                    f"匹配到 {count} 处。请扩大 old_text 使其唯一")
+        diff = difflib.unified_diff(
+            content.splitlines(keepends=True),
+            content.replace(old_text, new_text, 1).splitlines(keepends=True),
+            fromfile=f"a/{path}", tofile=f"b/{path}", n=3,
+        )
         return ToolResult.success(call_id, self.name, {
-            "path": path,
-            "edit_id": edit_id,
-            "backup": bak,
+            "path": path, "diff": "".join(diff),
+            "_hint": "确认 diff 无误后，用 action='edit' 提交修改",
         })
 
+    # ── edit ──
 
-class RollbackCodeTool(BaseTool):
-    """回滚代码编辑"""
+    async def _edit(self, call_id, args):
+        path, old_text, new_text = args.get("path", ""), args.get("old_text", ""), args.get("new_text", "")
+        if not path or not old_text:
+            return ToolResult.error(call_id, self.name, "edit 需要 path 和 old_text")
+        full_path = os.path.abspath(path)
+        if not os.path.exists(full_path):
+            return ToolResult.error(call_id, self.name, f"文件不存在: {path}")
 
-    @property
-    def name(self) -> str:
-        return "rollback_code"
-
-    @property
-    def description(self) -> str:
-        return "回滚之前的代码编辑。不传 edit_id 则回滚最后一次编辑。"
-
-    @property
-    def parameters(self) -> List[ToolParameter]:
-        return [
-            ToolParameter("path", "string", "文件路径", required=True),
-            ToolParameter("edit_id", "number", "要回滚的编辑 ID（不传则回滚最后一次）", required=False),
-        ]
-
-    async def execute(self, call_id: str, **kwargs) -> ToolResult:
-        path = kwargs.get("path", "")
-        edit_id = kwargs.get("edit_id")
-
-        history = EditCodeTool._edit_history.get(path, [])
-        if not history:
-            return ToolResult.error(call_id, self.name, f"没有可回滚的编辑记录: {path}")
-
-        if edit_id:
-            entries = [e for e in history if e["id"] == edit_id]
-        else:
-            entries = [history[-1]]
-
-        if not entries:
-            return ToolResult.error(call_id, self.name, "未找到指定的编辑记录")
-
-        entry = entries[0]
-        bak = entry.get("backup")
-
-        if bak and os.path.exists(bak):
-            shutil.copy2(bak, path)
-            return ToolResult.success(call_id, self.name, {
-                "path": path, "rolled_back": True, "method": "backup"
-            })
-
-        # 没有备份则反向替换
-        with open(path, "r", encoding="utf-8") as f:
+        with open(full_path, "r", encoding="utf-8") as f:
             content = f.read()
-        new_content = content.replace(entry["new_text"], entry["old_text"], 1)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(new_content)
+        count = content.count(old_text)
+        if count == 0:
+            return ToolResult.error(call_id, self.name, "未找到匹配文本。用 action='diff' 预览确认")
+        if count > 1:
+            return ToolResult.error(call_id, self.name,
+                                    f"匹配到 {count} 处。请扩大 old_text 使其唯一")
+        bak_path = full_path + ".bak"
+        shutil.copy2(full_path, bak_path)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content.replace(old_text, new_text, 1))
+
+        edit_id = len(self._edit_history) + 1
+        self._edit_history.append({"id": edit_id, "path": path, "backup": bak_path,
+                                    "old_text": old_text, "new_text": new_text})
+        return ToolResult.success(call_id, self.name, {
+            "path": path, "edit_id": edit_id, "backup": bak_path, "status": "已修改",
+            "_hint": f"编辑 #{edit_id} 已应用。回滚用 action='rollback'",
+        })
+
+    # ── rollback ──
+
+    async def _rollback(self, call_id, args):
+        path = args.get("path", "")
+        if not path:
+            return ToolResult.error(call_id, self.name, "rollback 需要 path")
+        path_history = [e for e in self._edit_history if e["path"] == path]
+        if not path_history:
+            return ToolResult.error(call_id, self.name, f"没有 {path} 的编辑记录")
+
+        entry = path_history[-1]
+        full_path = os.path.abspath(entry["path"])
+        if os.path.exists(entry["backup"]):
+            shutil.copy2(entry["backup"], full_path)
+        else:
+            with open(full_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(content.replace(entry["new_text"], entry["old_text"], 1))
+        self._edit_history.remove(entry)
+        return ToolResult.success(call_id, self.name,
+                                   {"path": entry["path"], "status": "已回滚"})
+
+    # ── append ──
+
+    async def _append(self, call_id, args):
+        path = args.get("path", "")
+        content = args.get("content", args.get("new_text", ""))
+        if not path or not content:
+            return ToolResult.error(call_id, self.name, "append 需要 path 和 content")
+        full_path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
+        with open(full_path, "a", encoding="utf-8") as f:
+            f.write(content)
+            if not content.endswith("\n"):
+                f.write("\n")
+        return ToolResult.success(call_id, self.name, {"path": path, "appended": True})
+
+    # ── quality ──
+
+    async def _quality(self, call_id, args):
+        path = args.get("path", "")
+        threshold = int(args.get("threshold", 70))
+        if not path:
+            return ToolResult.error(call_id, self.name, "quality 需要 path")
+        full_path = os.path.abspath(path)
+        if not os.path.exists(full_path):
+            return ToolResult.error(call_id, self.name, f"文件不存在: {path}")
+
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                code = f.read()
+        except Exception as e:
+            return ToolResult.error(call_id, self.name, f"读取失败: {e}")
+
+        lines = code.split("\n")
+        score, issues = 100, []
+
+        # 类型注解
+        func_defs = [l for l in lines if l.strip().startswith("def ") or l.strip().startswith("async def ")]
+        if func_defs:
+            annotated = sum(1 for l in func_defs if " -> " in l)
+            rate = annotated / len(func_defs)
+            if rate < 0.5:
+                score -= 20
+                issues.append({"severity": "major", "type": "typing",
+                               "desc": f"类型注解覆盖率仅 {rate:.0%}",
+                               "fix": f"为 {len(func_defs) - annotated} 个函数添加返回类型注解"})
+            elif rate < 0.8:
+                score -= 10
+                issues.append({"severity": "minor", "type": "typing",
+                               "desc": f"部分函数缺少返回类型注解",
+                               "fix": f"补充类型注解"})
+
+        # I/O 异常
+        io_ps = ["open(", "requests.", "httpx.", ".read()", ".write("]
+        if any(p in code for p in io_ps) and "try:" not in code:
+            score -= 15
+            issues.append({"severity": "major", "type": "error_handling",
+                           "desc": "存在I/O操作但无异常处理",
+                           "fix": "用 try-except 包裹 I/O 操作"})
+
+        # docstring
+        if any(l.strip().startswith("def ") for l in lines) and '"""' not in code:
+            score -= 10
+            issues.append({"severity": "minor", "type": "documentation",
+                           "desc": "函数缺少 docstring"})
+
+        # 安全
+        danger = {"eval(": ("critical", "用 ast.literal_eval"),
+                  "exec(": ("critical", "避免使用 exec"),
+                  "shell=True": ("major", "使用 subprocess.run 参数列表"),
+                  "password": ("warning", "从环境变量读取密码")}
+        for p, (sev, fix) in danger.items():
+            if p.lower() in code.lower():
+                score -= 20 if sev == "critical" else 15 if sev == "major" else 10
+                issues.append({"severity": sev, "type": "security",
+                               "desc": f"发现 {p}", "fix": fix})
+
+        # 函数长度
+        cur, cnt = None, 0
+        for l in lines:
+            s = l.strip()
+            if s.startswith("def ") or s.startswith("async def "):
+                if cur and cnt > 50:
+                    issues.append({"severity": "minor", "type": "maintainability",
+                                   "desc": f"函数过长: {cur} ({cnt}行)", "fix": "拆分"})
+                    score -= 5
+                cur, cnt = s[:60], 0
+            elif cur is not None:
+                cnt += 1
+        if cur and cnt > 50:
+            score -= 5
+            issues.append({"severity": "minor", "type": "maintainability",
+                           "desc": f"函数过长: {cur} ({cnt}行)", "fix": "拆分"})
+
+        score = max(0, score)
+        passed = score >= threshold
+        sev_order = {"critical": 0, "major": 1, "minor": 2, "warning": 3}
+        return ToolResult.success(call_id, self.name, {
+            "path": path, "score": score, "passed": passed, "threshold": threshold,
+            "issues": sorted(issues, key=lambda x: sev_order.get(x["severity"], 4)),
+            "summary": f"评分 {score}/100，{'通过' if passed else f'低于阈值 {threshold}'}，{len(issues)} 个问题",
+        })
+
+    # ── style ──
+
+    async def _style(self, call_id, args):
+        path = args.get("path", ".")
+        full_path = os.path.abspath(path)
+        if not os.path.isdir(full_path):
+            return ToolResult.error(call_id, self.name, f"目录不存在: {path}")
+
+        rules = []
+        config = self._load_toml(os.path.join(full_path, "pyproject.toml"))
+        if config:
+            rules.append({"source": "pyproject.toml"})
+            ruff = config.get("tool", {}).get("ruff", {})
+            if ruff:
+                rules.append({"key": "line_length", "value": ruff.get("line-length", 88)})
+                rules.append({"key": "linter", "value": "ruff"})
+
+        if not rules:
+            return ToolResult.success(call_id, self.name, {
+                "path": path, "has_config": False,
+                "_hint": "未检测到项目代码规范配置，使用默认规范",
+            })
+        return ToolResult.success(call_id, self.name, {"path": path, "has_config": True, "rules": rules})
+
+    @staticmethod
+    def _load_toml(filepath):
+        if not os.path.isfile(filepath):
+            return None
+        try:
+            import tomllib
+            with open(filepath, "rb") as f:
+                return tomllib.load(f)
+        except ImportError:
+            try:
+                import tomli
+                with open(filepath, "rb") as f:
+                    return tomli.load(f)
+            except ImportError:
+                return None
+
+    # ── grep ──
+
+    async def _grep(self, call_id, args):
+        pattern_str = args.get("pattern", "")
+        glob_pattern = args.get("glob", "**/*.py")
+        base_dir = args.get("base_dir", ".")
+        if not pattern_str:
+            return ToolResult.error(call_id, self.name, "grep 需要 pattern")
+        try:
+            regex = re.compile(pattern_str)
+        except re.error as e:
+            return ToolResult.error(call_id, self.name, f"正则无效: {e}")
+
+        exclude = {'.venv', 'venv', '__pycache__', '.git', 'node_modules',
+                   '.idea', '.vscode', 'dist', 'build'}
+        file_glob = glob_pattern.split("/")[-1] if "/" in glob_pattern else glob_pattern
+        recursive = "**" in glob_pattern
+
+        results, scanned = [], 0
+        for root, dirs, files in os.walk(base_dir):
+            dirs[:] = [d for d in dirs if d not in exclude and not d.startswith(".")]
+            if not recursive and os.path.relpath(root, base_dir).count(os.sep) > 0:
+                dirs.clear()
+                continue
+            for fname in files:
+                if not fnmatch.fnmatch(fname, file_glob):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.readlines()
+                    scanned += 1
+                    for i, line in enumerate(lines):
+                        m = regex.search(line)
+                        if m:
+                            ctx_start = max(0, i - 2)
+                            ctx_end = min(len(lines), i + 3)
+                            results.append({
+                                "file": os.path.relpath(fpath, base_dir),
+                                "line": i + 1,
+                                "match": line.strip()[:200],
+                                "context": "".join(
+                                    f"{'>' if j==i else ' '} {j+1}: {lines[j].rstrip()}\n"
+                                    for j in range(ctx_start, ctx_end)
+                                ),
+                            })
+                            if len(results) >= 30:
+                                break
+                except Exception:
+                    pass
+                if len(results) >= 30:
+                    break
+            if len(results) >= 30:
+                break
 
         return ToolResult.success(call_id, self.name, {
-            "path": path, "rolled_back": True, "method": "reverse"
+            "pattern": pattern_str, "files_scanned": scanned,
+            "matches": len(results), "results": results[:30],
         })

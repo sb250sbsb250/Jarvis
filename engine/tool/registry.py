@@ -194,6 +194,16 @@ class ToolRegistry:
     def has_tool(self, name: str) -> bool:
         return name in self._registry
 
+    def is_read_tool(self, name: str) -> bool:
+        """询问工具实例：你是否只读？"""
+        tool = self.get(name)
+        return tool.is_read if tool else False
+
+    def is_write_tool(self, name: str) -> bool:
+        """询问工具实例：你是否写入？"""
+        tool = self.get(name)
+        return tool.is_write if tool else False
+
     def count(self) -> int:
         return len(self._registry)
 
