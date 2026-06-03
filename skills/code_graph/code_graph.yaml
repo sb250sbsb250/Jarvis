@@ -1,0 +1,52 @@
+name: code_graph
+display_name: 代码图谱分析
+icon: 🔗
+description: 理解项目代码结构：依赖关系、调用链追踪、影响分析
+when_to_use: 需要理解代码结构、查找函数定义、分析依赖关系、评估改动影响时
+tools: [code, code_graph, file]
+fallback: null
+tags:
+  - 代码
+  - 依赖分析
+  - 调用链
+  - 代码结构
+  - 影响分析
+  - code
+  - import
+  - trace
+  - 函数定义
+  - 类定义
+  - 引用
+  - 调用关系
+
+trigger_keywords:
+  # 结构理解
+  - 依赖
+  - 依赖关系
+  - 调用链
+  - 调用关系
+  - 代码结构
+  - 模块关系
+  - 类层次
+  # 影响分析
+  - 影响了什么
+  - 会影响哪些
+  - 谁调用了
+  - 谁用了
+  - 被谁引用
+  - 调用者
+  - 被调用
+  # 符号定位
+  - 函数定义
+  - 类定义
+  - 在哪里定义
+  - 找到
+  # 英文
+  - dependency
+  - call chain
+  - trace
+  - who calls
+  - caller
+  - callee
+  - import graph
+  - impact analysis

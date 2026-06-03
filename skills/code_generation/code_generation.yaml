@@ -1,0 +1,14 @@
+name: code_generation
+display_name: 代码生成
+icon: 💻
+description: 根据需求生成完整代码
+when_to_use: 用户要写新代码、创建新功能时
+tools: [code, shell, file]
+fallback: null
+tags: [代码, 生成, 创建]
+constraints: |
+  1. eval()/exec()/shell=True 绝对禁止
+  2. 所有 I/O 操作必须有 try-except
+  3. 所有公共函数必须有类型注解和 docstring
+  4. 代码必须可直接运行，不输出不完整的代码
+  5. 遵循 PEP 8，行长度建议 100 以内

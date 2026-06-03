@@ -1,0 +1,8 @@
+name: auto_fix
+display_name: 自动修复
+icon: 🔁
+description: 分析错误、自动修复、验证修复效果
+when_to_use: 代码报错、运行失败、需要自动修 bug 时
+tools: [code, shell, file]
+fallback: debug
+tags: [自动修复, 修复bug, 报错修复, 代码调试]

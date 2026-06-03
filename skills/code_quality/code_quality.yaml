@@ -1,0 +1,8 @@
+name: code_quality
+display_name: 代码质量
+icon: 🧹
+description: 自动检查代码风格、类型安全、潜在问题并修复
+when_to_use: 用户要求检查代码质量、优化代码、保证代码规范时
+tools: [code, shell, file]
+fallback: code_review
+tags: [代码质量, lint, 代码规范, 代码优化, 整洁代码]
