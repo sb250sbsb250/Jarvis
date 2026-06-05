@@ -68,20 +68,31 @@ class SkillRouter:
             logger.info(f"🎯 指定 Skill: {skill.meta.display_name} ({skill.meta.name})")
         else:
             candidates = await self.skill_registry.route_with_fallback(
-                user_input, llm_client=self.llm_client, top_k=1
+                user_input, llm_client=self.llm_client, top_k=3
             )
             skill = candidates[0][0] if candidates else None
             if skill:
+                names = [c[0].meta.name for c in candidates]
                 logger.info(
-                    f"🎯 Skill 匹配: {skill.meta.display_name} ({skill.meta.name}) | "
-                    f"置信度: {candidates[0][1]:.0%}"
+                    f"🎯 Skill 匹配: {', '.join(names)} | "
+                    f"主: {skill.meta.display_name} ({candidates[0][1]:.0%})"
                 )
             else:
                 logger.info("🎯 无匹配 Skill，走 AgentLoop 自主执行")
 
-        # 2. 框架模板在 agent_loop._BASE_TEMPLATE，领域数据由 skill 注入
-        system_prompt = ""
-        logger.info(f"📝 Skill: {skill.meta.display_name if skill else '无'}")
+        # 2. 构建 system_prompt（主 skill + 辅 skill 知识）
+        skill_prompts = []
+        skills_for_prompt = candidates if len(candidates) > 1 else ([(skill, 1.0)] if skill else [])
+        for s, conf in skills_for_prompt:
+            sp = s.get_system_prompt()
+            if sp:
+                label = "**主 Skill**" if s == skill else f"参考 ({conf:.0%})"
+                skill_prompts.append(f"## {label}: {s.meta.display_name}\n{sp}")
+
+        system_prompt = "\n\n".join(skill_prompts) if skill_prompts else ""
+        logger.info(f"📝 Skill: {skill.meta.display_name if skill else '无'}" + (
+            f" + {len(candidates)-1} 辅 Skill" if len(candidates) > 1 else ""
+        ))
 
         # 3. AgentLoop 执行
         loop = AgentLoop(

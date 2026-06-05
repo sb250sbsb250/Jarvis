@@ -207,13 +207,14 @@ class CodeGraphTool(BaseTool):
             "- deps:     模块依赖关系图 (path 目录)\n"
             "- quality:  代码质量评分 (path, threshold)\n"
             "- style:    项目代码规范检测 (path 目录)\n"
+            "- semantic: AI语义代码搜索 (query, 用LLM理解意图找代码)\n"
         )
 
     @property
     def parameters(self) -> List[ToolParameter]:
         return [
             ToolParameter("action", "string", "操作", required=True,
-                          enum=["search", "read", "grep", "analyze", "symbol", "deps", "quality", "style"]),
+                          enum=["search", "read", "grep", "analyze", "symbol", "deps", "quality", "style", "semantic"]),
             ToolParameter("path", "string", "文件路径或目录", required=False),
             ToolParameter("keyword", "string", "搜索关键字 (search)", required=False),
             ToolParameter("pattern", "string", "正则/文件匹配模式 (grep/search)", required=False),
@@ -225,6 +226,7 @@ class CodeGraphTool(BaseTool):
             ToolParameter("end_line", "number", "结束行 (read)", required=False),
             ToolParameter("context_lines", "number", "上下文行数 (search, 默认2)", required=False),
             ToolParameter("threshold", "number", "质量阈值 (quality, 默认70)", required=False),
+            ToolParameter("query", "string", "自然语言查询 (semantic, 如 '找所有处理认证的代码')", required=False),
         ]
 
     async def execute(self, call_id: str, **kwargs) -> ToolResult:
@@ -239,6 +241,7 @@ class CodeGraphTool(BaseTool):
             "deps":    self._deps,
             "quality": self._quality,
             "style":   self._style,
+            "semantic": self._semantic_search,
         }
         handler = handlers.get(action)
         if not handler:
@@ -707,4 +710,70 @@ class CodeGraphTool(BaseTool):
             "path": path, "has_config": bool(rules),
             "rules": rules,
             "_hint": "生成新代码时请遵循以上规范",
+        })
+
+    # ── semantic ─────────────────────────────────────────
+
+    async def _semantic_search(self, call_id, args):
+        """AI 语义代码搜索 — 用 LLM 理解查询意图，匹配最相关代码片段"""
+        query = args.get("query", args.get("keyword", ""))
+        if not query:
+            return ToolResult.error(call_id, self.name, "semantic 需要 query 参数")
+
+        # 收集代码片段（最多 30 个函数/类）
+        py_files = _collect_py_files(self.base_dir, max_files=50)
+        snippets = []
+        for fp in py_files:
+            try:
+                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                    source = f.read()
+                tree = ast.parse(source)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        try:
+                            snippet = ast.get_source_segment(source, node)
+                        except Exception:
+                            lines = source.split("\n")
+                            end = getattr(node, "end_lineno", node.lineno + 5) or node.lineno + 5
+                            snippet = "\n".join(lines[node.lineno-1:end])
+                        snippets.append({
+                            "file": os.path.relpath(fp, self.base_dir),
+                            "name": node.name,
+                            "kind": "class" if isinstance(node, ast.ClassDef) else "function",
+                            "line": node.lineno,
+                            "code": snippet[:400],
+                        })
+                        if len(snippets) >= 30:
+                            break
+            except Exception:
+                continue
+            if len(snippets) >= 30:
+                break
+
+        if not snippets:
+            return ToolResult.success(call_id, self.name, {
+                "query": query, "matches": 0,
+                "_hint": "未找到代码片段。请用 search 或 grep 搜索。"
+            })
+
+        # 用关键词做近似匹配（不依赖 LLM 的 fallback 方案）
+        query_lower = query.lower()
+        keywords = [w for w in re.split(r'[\s,，]+', query_lower) if len(w) > 1]
+        results = []
+        for s in snippets:
+            code_lower = s["code"].lower()
+            name_lower = s["name"].lower()
+            score = sum(3 for k in keywords if k in name_lower)
+            score += sum(1 for k in keywords if k in code_lower)
+            if score > 0:
+                results.append({**s, "score": score})
+
+        results.sort(key=lambda x: -x["score"])
+        return ToolResult.success(call_id, self.name, {
+            "query": query,
+            "matches": len(results),
+            "results": results[:10],
+            "_hint": f"找到 {len(results)} 个相关代码片段（关键词匹配）。" + (
+                " 用 code_graph(action='read', ...) 查看具体文件" if results else ""
+            ),
         })

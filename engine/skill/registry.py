@@ -175,105 +175,105 @@ class SkillRegistry:
         self,
         user_input: str,
         llm_client: Any = None,
-        top_k: int = 1,
-        min_confidence: float = 0.4,
+        top_k: int = 3,
+        min_confidence: float = 0.6,
     ) -> List[Tuple[Skill, float]]:
         """
-        关键词路由 + LLM 语义回退。
+        关键词预筛 + LLM 语义匹配。
 
-        流程：
-          1. 先走纯关键词匹配（快、免费）
+        流程:
+          1. 先走纯关键词匹配
           2. 如果最佳匹配置信度 >= min_confidence，直接返回
-          3. 如果置信度不足或无匹配，调用 LLM 做语义路由
+          3. 否则调用 LLM 做多 Skill 语义匹配
 
         Args:
             user_input: 用户输入
-            llm_client: LLM 客户端（有 chat_completion 方法）
-            top_k: 返回前 k 个结果
+            llm_client: LLM 客户端
+            top_k: 返回前 k 个
             min_confidence: 关键词匹配的最低置信度阈值
         """
         # 先走关键词
         results = self.route(user_input, top_k=top_k)
 
         if results and results[0][1] >= min_confidence:
-            return results
+            return results[:top_k]
 
-        # 置信度不足 → LLM 语义回退
+        # 置信度不足 → LLM 语义匹配（多 Skill）
         if llm_client:
-            skill = await self._llm_route(user_input, llm_client)
-            if skill:
-                logger.info(
-                    f"🔮 LLM 路由: {skill.meta.display_name} ({skill.meta.name})"
-                )
-                return [(skill, 0.85)]
+            llm_results = await self.route_with_llm(
+                user_input, llm_client, top_k=top_k
+            )
+            if llm_results:
+                names = [r[0].meta.name for r in llm_results]
+                logger.info(f"🔮 LLM 路由: {', '.join(names)}")
+                return llm_results
 
-        return results
+        return results[:top_k]
 
-    async def _llm_route(self, user_input: str, llm_client: Any) -> Optional[Skill]:
+    async def route_with_llm(
+        self,
+        user_input: str,
+        llm_client: Any,
+        top_k: int = 3,
+    ) -> List[Tuple[Skill, float]]:
         """
-        LLM 语义路由：用 LLM 选择最合适的 Skill。
+        用 LLM 一次性匹配多个 Skill，返回排序列表。
 
-        发送所有 Skill 的名称和描述，让 LLM 做语义匹配。
-        用 difflib 对 LLM 返回做模糊修正。
+        与旧 _llm_route 的区别:
+        - 传完整 Skill 信息（tags、when_to_use、description）
+        - 返回多个 Skill 而非只选一个
+        - 更高的置信度区分（0.9/0.75/0.6）
         """
         skills = self.list_skills()
         if not skills:
-            return None
+            return []
 
-        # 构建 Skill 列表（取前 15 个，避免 prompt 过长）
-        skill_list = "\n".join(
-            f"  {s.meta.name}: {s.meta.description[:80]}"
-            for s in skills[:15]
-        )
+        # 构建完整 skill 描述
+        skill_descriptions = []
+        for s in skills:
+            tags_str = ", ".join(s.meta.tags[:5])
+            when = getattr(s, '_config', {}).get('when_to_use', '')
+            desc = f"- **{s.meta.name}** ({s.meta.display_name})\n"
+            desc += f"  {s.meta.description[:100]}\n"
+            desc += f"  标签: {tags_str}"
+            if when:
+                desc += f"\n  场景: {when}"
+            skill_descriptions.append(desc)
 
         prompt = (
-            f"根据用户请求，从以下 Skill 中选择最适合的一个。\n"
-            f"如果没有合适的，回答 'none'。\n\n"
-            f"Skill 列表:\n{skill_list}\n\n"
-            f"用户请求: {user_input[:200]}\n\n"
-            f"只回答 Skill 名称（如 'excel_fill'），或 'none':"
+            "根据用户请求，从以下 Skill 中匹配最相关的（可多个，按相关性排序）。\n\n"
+            f"用户请求: {user_input}\n\n"
+            "可用 Skill:\n" + "\n".join(skill_descriptions) + "\n\n"
+            f"返回 JSON 数组，最多 {top_k} 个:\n"
+            '[{"name": "skill名", "reason": "原因"}]\n\n'
+            "都不匹配返回 []。只返回 JSON:"
         )
 
         try:
             response = await llm_client.chat_completion(
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=50,
+                max_tokens=300,
             )
-            answer = (
-                response.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-                .lower()
-            )
+            content = response.get("choices", [{}])[0].get("message", {}).get("content", "[]")
+            import json
+            matches = json.loads(content) if isinstance(content, str) else content
 
-            if answer == "none" or not answer:
-                return None
-
-            # 1. 精确匹配
-            skill = self.get(answer)
-            if skill:
-                return skill
-
-            # 2. 格式修正（空格→下划线）
-            skill = self.get(answer.replace(" ", "_").replace("-", "_"))
-            if skill:
-                return skill
-
-            # 3. 编辑距离模糊匹配
-            names = [s.meta.name for s in skills]
-            matches = difflib.get_close_matches(
-                answer, names, n=1, cutoff=0.6
-            )
-            if matches:
-                logger.info(f"🔍 模糊匹配: '{answer}' → '{matches[0]}'")
-                return self.get(matches[0])
-
+            results = []
+            for i, m in enumerate(matches[:top_k]):
+                skill = self.get(m.get("name", ""))
+                if skill:
+                    confidence = 0.9 - (i * 0.15)
+                    results.append((skill, confidence))
+            return results
         except Exception as e:
             logger.debug(f"LLM 路由失败: {e}")
+            return []
 
-        return None
+    async def _llm_route(self, user_input: str, llm_client: Any) -> Optional[Skill]:
+        """旧版 LLM 路由，保留兼容，内部委托给 route_with_llm"""
+        results = await self.route_with_llm(user_input, llm_client, top_k=1)
+        return results[0][0] if results else None
 
     def route_exact(self, skill_name: str) -> Optional[Skill]:
         """精确路由"""

@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from engine import (
     AgentLoop,
 )
+from engine.conversation import ConversationSession
 from engine.llm_client import LLMClient, LLMConfig
 from engine.skill.router import SkillRouter
 from engine.skill.registry import SkillRegistry
@@ -93,6 +94,24 @@ skill_router = SkillRouter(
 )
 
 session_manager = SessionManager()  # 纯内存模式，不走 JsonFileStore
+
+# ── 连贯对话会话池 ──
+_conv_sessions: Dict[str, ConversationSession] = {}
+
+
+def _get_or_create_conv_session(session_id: str) -> ConversationSession:
+    """获取或创建该会话的 ConversationSession（管理历史 + 调用 AgentLoop）"""
+    if session_id not in _conv_sessions:
+        _conv_sessions[session_id] = ConversationSession(
+            loop_factory=lambda: AgentLoop(
+                llm_client=llm_client,
+                tool_registry=tool_registry,
+                max_rounds=30,
+            ),
+            session_id=session_id,
+        )
+        logger.info(f"🧵 创建会话: {session_id[:12]}...")
+    return _conv_sessions[session_id]
 
 
 # ====================================================================
@@ -192,9 +211,6 @@ async def event_generator(
     # 发第一条消息前先返回 session_id（前端需要知道新创建的会话 id）
     yield f"data: {json.dumps({'type': 'session', 'session_id': session.session_id})}\n\n"
 
-    # 保存用户消息
-    history.add_user(user_input)
-
     try:
         start_time = time.time()
 
@@ -233,41 +249,56 @@ async def event_generator(
 
             sse_queue.append(json.dumps(sse_data, ensure_ascii=False))
 
-        # ── 执行过程，逐条 yield SSE 事件 ──
-        # 先启动 skill_router.process 作为后台任务
+        # ── 通过 ConversationSession 执行（自动管理对话历史） ──
+        conv_session = _get_or_create_conv_session(session.session_id)
+        if not conv_session._messages:
+            # 如果 Session 有持久化历史，导入
+            if history and len(history) > 0:
+                conv_session.import_history(history)
+                logger.info(f"🧵 导入 {len(history)} 条持久化历史")
+
         process_task = asyncio.create_task(
-            skill_router.process(
-                user_input=user_input,
-                history=history,
-                session_id=session_id,
+            conv_session.chat(
+                task=user_input,
                 on_event=on_event,
             )
         )
 
-        # 轮询 sse_queue 直到任务完成
-        while True:
-            # 取出所有已积累的事件
-            while sse_queue:
-                payload = sse_queue.pop(0)
-                yield f"data: {payload}\n\n"
-            # 检查任务是否完成
-            if process_task.done():
-                # 再取一次防止遗漏（done 事件可能刚刚加入）
-                await asyncio.sleep(0.05)  # 稍微等待确保事件已入队
+        try:
+            # 轮询 sse_queue 直到任务完成
+            while True:
                 while sse_queue:
                     payload = sse_queue.pop(0)
                     yield f"data: {payload}\n\n"
-                break
-            await asyncio.sleep(0.05)
+                if process_task.done():
+                    await asyncio.sleep(0.05)
+                    while sse_queue:
+                        payload = sse_queue.pop(0)
+                        yield f"data: {payload}\n\n"
+                    break
+                await asyncio.sleep(0.05)
 
-        result = process_task.result()
+            result = process_task.result()
+
+        except asyncio.CancelledError:
+            if not process_task.done():
+                process_task.cancel()
+                try:
+                    await process_task
+                except asyncio.CancelledError:
+                    pass
+            return
 
         elapsed = time.time() - start_time
-        answer = result.content if result else "处理完成。"
+        answer = result.get("content", "处理完成。")
         logger.info(f"✅ 执行完成 ({_format_speed_info(elapsed, 0)})")
 
-        # 保存助手回复
-        history.add_assistant(answer)
+        # ── 将完整对话同步回 Session（持久化） ──
+        if conv_session._messages:
+            history.clear()
+            history.extend(conv_session._messages)
+        else:
+            history.append({"role": "assistant", "content": answer})
         await session_manager.save_session(session)
 
     except Exception as e:
@@ -287,14 +318,10 @@ async def event_generator(
 # ====================================================================
 # API 路由
 # ====================================================================
-@app.get("/api/chat/stream")
-async def chat_stream(
-    message: str = Query(""),
-    session_id: Optional[str] = Query(None),
-    model: Optional[str] = Query(None),
-):
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
     return StreamingResponse(
-        event_generator(message.strip(), session_id=session_id, model_name=model),
+        event_generator(req.message.strip(), session_id=req.session_id, model_name=req.model),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -332,12 +359,10 @@ async def get_session(session_id: str):
     session = await session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    messages = getattr(session, "messages", [])
-    if hasattr(messages, "get_for_llm"):
-        messages = messages.get_for_llm()
     return {
         "id": session_id,
-        "messages": messages,
+        "messages": session.messages,
+        "summary": session.summary,
     }
 
 

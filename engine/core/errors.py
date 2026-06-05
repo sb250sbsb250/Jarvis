@@ -53,31 +53,6 @@ class MessageLimitExceededError(EngineError):
 
 
 # ═══════════════════════════════════════
-#  DAG 层级异常
-# ═══════════════════════════════════════
-
-class DAGExecutionError(EngineError):
-    """DAG 执行失败"""
-    def __init__(self, message: str, node_name: str = None, original_error: Exception = None):
-        super().__init__(message)
-        self.node_name = node_name
-        self.original_error = original_error
-
-
-class NodeTimeoutError(DAGExecutionError):
-    """节点执行超时"""
-    pass
-
-
-class NodeRetryExhaustedError(DAGExecutionError):
-    """节点重试耗尽"""
-    def __init__(self, node_name: str, attempts: int, last_error: str):
-        super().__init__(f"Node '{node_name}' failed after {attempts} retries", node_name=node_name)
-        self.attempts = attempts
-        self.last_error = last_error
-
-
-# ═══════════════════════════════════════
 #  Skill 层级异常
 # ═══════════════════════════════════════
 

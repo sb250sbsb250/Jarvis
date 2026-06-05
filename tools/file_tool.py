@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 class FileTool(BaseTool):
     """文件操作 — list/read/write/append/rename/diff"""
 
+    # 合并工具：支持读写，按执行为准
+    is_read = True
+    is_write = True
+
     @property
     def name(self) -> str:
         return "file"
@@ -27,13 +31,14 @@ class FileTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "文件操作。action: list(列出)/read(读取)/write(写入)/append(追加)/rename(重命名)/diff(比较)\n"
+            "文件操作。action: list/read/write/append/rename/diff/glob\n"
             "- list: pattern='*.py', recursive=True\n"
             "- read: path='a.txt', start=1, end=50\n"
             "- write: path='a.txt', content='内容' (覆盖)\n"
             "- append: path='a.txt', content='追加内容'\n"
             "- rename: path='old.txt', new_path='new.txt'\n"
             "- diff: path_a='v1.py', path_b='v2.py'\n"
+            "- glob: pattern='**/*.py' (文件名匹配，返回路径列表)\n"
             "安全流程: list → read → diff → write"
         )
 
@@ -41,7 +46,7 @@ class FileTool(BaseTool):
     def parameters(self) -> List[ToolParameter]:
         return [
             ToolParameter("action", "string", "list/read/write/append/rename/diff", required=True,
-                          enum=["list", "read", "write", "append", "rename", "diff"]),
+                          enum=["list", "read", "write", "append", "rename", "diff", "glob"]),
             ToolParameter("path", "string", "文件路径", required=False),
             ToolParameter("new_path", "string", "新路径(rename用)", required=False),
             ToolParameter("content", "string", "文件内容(write/append用)", required=False),
@@ -68,6 +73,8 @@ class FileTool(BaseTool):
             return await self._rename(call_id, kwargs)
         elif action == "diff":
             return await self._diff(call_id, kwargs)
+        elif action == "glob":
+            return await self._glob(call_id, kwargs)
         else:
             return ToolResult.error(call_id, self.name, f"未知操作: {action}")
 
@@ -268,4 +275,40 @@ class FileTool(BaseTool):
             "diff": diff_text,
             "size": len(diff_text),
             "_hint": "减号(-): 删除的行，加号(+): 新增的行",
+        })
+
+    # ── glob ──
+
+    async def _glob(self, call_id, args):
+        """文件名通配匹配，返回路径列表"""
+        pattern = args.get("pattern", "*")
+        path = args.get("path", ".")
+
+        results = []
+        base = path if os.path.isdir(path) else os.path.dirname(path) or "."
+
+        if "**" in pattern:
+            for root, dirs, files in os.walk(base):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                for f in files:
+                    fp = os.path.join(root, f)
+                    rel = os.path.relpath(fp, base)
+                    if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(fp, pattern):
+                        results.append(rel)
+                        if len(results) >= 200:
+                            break
+                if len(results) >= 200:
+                    break
+        else:
+            for f in os.listdir(base):
+                fp = os.path.join(base, f)
+                if os.path.isfile(fp) and fnmatch.fnmatch(f, pattern):
+                    results.append(f)
+
+        return ToolResult.success(call_id, self.name, {
+            "pattern": pattern,
+            "base": base,
+            "matches": len(results),
+            "results": results,
+            "_hint": f"找到 {len(results)} 个匹配文件",
         })

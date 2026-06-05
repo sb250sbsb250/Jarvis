@@ -8,6 +8,7 @@ code_graph_tool.py — Code Graph 工具引擎
 from __future__ import annotations
 
 import ast
+import os
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,23 +39,71 @@ class ProjectGraph:
         self.root = Path(project_root).resolve()
         self._files: Dict[str, Dict] = {}
         self._symbols: Dict[str, List[SymbolInfo]] = {}
+        self._file_mtimes: Dict[str, float] = {}
         self._built = False
 
-    def build(self) -> "ProjectGraph":
-        if self._built:
-            return self
+    def build(self, force: bool = False) -> "ProjectGraph":
+        if self._built and not force:
+            return self._incremental_update()
         py_files = [
             f for f in self.root.rglob("*.py")
             if "__pycache__" not in str(f)
             and ".venv" not in str(f)
             and "site-packages" not in str(f)
         ]
-        logger.info(f"[CodeGraph] 扫描 {len(py_files)} 个文件...")
+        logger.info(f"[CodeGraph] 全量扫描 {len(py_files)} 个文件...")
         for fpath in py_files:
             self._parse_file(fpath)
+            self._file_mtimes[str(fpath)] = fpath.stat().st_mtime
         self._build_reverse()
         self._built = True
         logger.info(f"[CodeGraph] 图谱就绪: {len(self._files)} 文件, {len(self._symbols)} 符号")
+        return self
+
+    def _incremental_update(self) -> "ProjectGraph":
+        """增量更新：只重新解析修改/新增/删除的文件"""
+        current_files = [
+            f for f in self.root.rglob("*.py")
+            if "__pycache__" not in str(f)
+            and ".venv" not in str(f)
+            and "site-packages" not in str(f)
+        ]
+        current_set = {str(f) for f in current_files}
+        cached_set = set(self._file_mtimes.keys())
+
+        new = current_set - cached_set
+        changed = {p for p in cached_set & current_set
+                   if os.path.getmtime(p) != self._file_mtimes.get(p, 0)}
+        deleted = cached_set - current_set
+
+        if not new and not changed and not deleted:
+            return self
+
+        # 清理删除
+        for fp in deleted:
+            try:
+                rel = str(Path(fp).relative_to(self.root))
+            except ValueError:
+                rel = fp
+            self._files.pop(rel, None)
+            self._file_mtimes.pop(fp, None)
+
+        logger.info(f"[CodeGraph] 增量: +{len(new)}新 ~{len(changed)}改 -{len(deleted)}删")
+        for fp in sorted(new | changed):
+            fpath = Path(fp)
+            # 移除旧符号
+            try:
+                rel = str(fpath.relative_to(self.root))
+            except ValueError:
+                rel = str(fpath)
+            old_info = self._files.get(rel)
+            if old_info:
+                for sym_name in list(old_info.get("symbols", {}).keys()):
+                    self._symbols.pop(sym_name, None)
+            self._parse_file(fpath)
+            self._file_mtimes[fp] = fpath.stat().st_mtime
+
+        self._build_reverse()
         return self
 
     def _parse_file(self, fpath: Path) -> None:

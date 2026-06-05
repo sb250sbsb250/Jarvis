@@ -11,9 +11,6 @@ Jarvis V3 Engine — 自主 Agent 引擎
 from .agent_loop import AgentLoop
 from .llm_client import LLMClient
 
-# ── 消息 ──
-from .message.message_list import MessageList
-
 # ── 会话 ──
 from .session.session import Session
 
@@ -23,19 +20,12 @@ from .tool.base import BaseTool, ToolSchema, ToolParameter
 from .tool.executor import ToolExecutor
 from .tool.policy import ToolPolicy, AccessLevel
 
-# ── 存储 ──
-from .storage.store import MessageStore
-
 __all__ = [
     # 核心
     "AgentLoop", "LLMClient",
-    # 消息
-    "MessageList",
     # 会话
     "Session",
     # 工具
     "ToolRegistry", "BaseTool", "ToolSchema", "ToolParameter",
     "ToolExecutor", "ToolPolicy", "AccessLevel",
-    # 存储
-    "MessageStore",
 ]

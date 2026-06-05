@@ -18,33 +18,35 @@ from engine.tool.registry import ToolRegistry as _ToolRegistry
 logger = logging.getLogger(__name__)
 
 
-# ── 11 个统一工具 ──
+# ── 12 个统一工具 ──
 from .file_tool import FileTool
 from .excel_tool import ExcelTool
-from .code_graph import CodeGraphTool      # 代码理解（只读）: search/read/grep/analyze/symbol/deps/quality/style
-from .code_edit import CodeEditTool        # 代码编辑（写入）: diff/write/rollback
+from .code_graph_tool import CodeGraphTool     # 代码分析（只读）: AST/依赖/调用链
+from .code_tool import CodeTool                # 代码编辑（读写）: read/diff/write/rollback/append/create
+from .pdf_tool import PdfReadTool              # PDF: 文本提取/表格/扫描件
+from .word_tool import WordTool                # Word: read_docx/write_docx
 from .pentest_tool import PentestTool
 from .shell_tool import ShellExecuteTool
 from .web_tool import WebTool
 from .git_tool import GitTool
 from .system_tool import SystemTool
 from .image_tool import ImageTool
-from .office_tool import OfficeTool
 
 
-# ── 工具类列表 ──
+# ── 工具类列表（12个） ──
 ALL_TOOL_CLASSES: List[type] = [
-    FileTool,          # 文件: list/read/write/append/rename/diff
+    FileTool,          # 通用文件: list/read/write/append/rename/diff/glob
     ExcelTool,         # Excel: connect/read/write/migrate...
-    CodeGraphTool,     # 代码理解（只读）: search/read/grep/analyze/symbol/deps/quality/style
-    CodeEditTool,      # 代码编辑（写入）: diff/write/rollback
-    PentestTool,       # 渗透测试: 18工具 via WSL（只读）
-    ShellExecuteTool,  # Shell: 命令执行 + 输出恢复
+    CodeGraphTool,     # 代码分析（只读）: AST/依赖/调用链/影响分析
+    CodeTool,          # 代码编辑（读写）: read/diff/write/rollback/append/create
+    PdfReadTool,       # PDF: 文本提取/表格/扫描件检测
+    WordTool,          # Word: read_docx/write_docx
+    PentestTool,       # 渗透测试: 18工具 via WSL
+    ShellExecuteTool,  # Shell: 命令执行
     WebTool,           # 网络: fetch/search
     GitTool,           # 版本控制: status/commit/push
     SystemTool,        # 系统: info/time/cwd
     ImageTool,         # 图片: read/ocr
-    OfficeTool,        # Office: read_pdf/read_docx/write_docx
 ]
 
 

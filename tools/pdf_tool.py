@@ -20,7 +20,7 @@ class PdfReadTool(BaseTool):
 
     @property
     def name(self) -> str:
-        return "pdf_read"
+        return "pdf"
 
     @property
     def description(self) -> str:
@@ -31,9 +31,9 @@ class PdfReadTool(BaseTool):
             "\n"
             "📖 使用示例：\n"
             "  # 读全部:\n"
-            "  pdf_read(path='report.pdf')\n"
+            "  pdf(path='report.pdf')\n"
             "  # 指定页码范围:\n"
-            "  pdf_read(path='report.pdf', start_page=1, max_pages=3)\n"
+            "  pdf(path='report.pdf', start_page=1, max_pages=3)\n"
             "  💡 返回每页文本+表格结构。自动检测扫描件（图片类PDF）。\n"
         )
 

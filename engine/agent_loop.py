@@ -28,14 +28,17 @@ import subprocess
 import time
 from typing import Any, Dict, List, Set, Optional, Callable, Awaitable
 
-from .tool.registry import ToolRegistry
+
 from .tool.executor import ToolExecutor
 from .tool.policy import ToolPolicy
 from .core.types import ToolCall, ToolResult
+from .plan.subtask import TaskPlanner
+from .memory.todo_tracker import TodoTracker
 from .lint.runner import LintRunner
 from .memory.working_memory import WorkingMemory
 from .checkpoint import Checkpoint
-from .llm_client import InsufficientBalanceError
+from .llm_client import InsufficientBalanceError, LLMClient
+from .prompt.complexity import ComplexityRouter, ResponseMode
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,45 @@ KEEP_RECENT_TURNS = 3                 # 注入历史时，保留最近 N 轮完�
 MAX_LLM_ERRORS = 3                    # LLM 连续错误上限
 MAX_TOOL_ERRORS = 8                   # 工具连续错误上限（工具错误更常见，容忍度更高）
 TOOL_DEFAULT_TIMEOUT = 60.0           # 工具执行默认超时（秒）
+
+
+def _trim_history_messages(messages: List[Dict], max_tool_chars: int = 2000) -> List[Dict]:
+    """截短历史消息中的 tool 结果，智能保留结构。"""
+    trimmed = []
+    for m in messages:
+        m = dict(m)
+        if m.get("role") == "tool":
+            content = str(m.get("content", ""))
+            if len(content) > max_tool_chars:
+                import re
+                # 尝试保留 JSON 关键字段
+                try:
+                    if content.strip().startswith(("{", "[")):
+                        import json
+                        obj = json.loads(content)
+                        if isinstance(obj, dict):
+                            keys = list(obj.keys())[:5]
+                            summary = {k: str(obj[k])[:200] for k in keys}
+                            m["content"] = json.dumps(summary, ensure_ascii=False) + "\n... [历史结果已精简]"
+                        else:
+                            m["content"] = content[:max_tool_chars] + "\n... [历史结果已截短]"
+                    else:
+                        # 行边界截断
+                        lines = content.split("\n")
+                        keep = 0
+                        total = 0
+                        for line in lines:
+                            total += len(line) + 1
+                            if total > max_tool_chars:
+                                break
+                            keep += 1
+                        m["content"] = "\n".join(lines[:keep])
+                        if keep < len(lines):
+                            m["content"] += f"\n... [已截短, 省略 {len(lines)-keep} 行]"
+                except Exception:
+                    m["content"] = content[:max_tool_chars] + "\n... [历史结果已截短]"
+        trimmed.append(m)
+    return trimmed
 
 
 class AgentLoop:
@@ -103,6 +145,17 @@ class AgentLoop:
 - 最多重试2次同方式，第3次必须换方案
 - 注意不要重复调用相同工具读取相同内容
 
+## 大数据处理规则（处理大量文件/长文本时严格遵守）
+- 不要在上下文中累积超过3个文件的完整原始数据
+- 采用"读取 → 提取关键信息 → 追加到中间汇总文件"模式：
+  1. 读取一个文件 → 提取关键字段 → file(action='append', path='_summary.jsonl', content=JSON一行)
+  2. 继续下一个文件，重复步骤1
+  3. 全部处理完毕 → file(action='read', path='_summary.jsonl') 一次性读回汇总数据
+  4. 基于汇总数据做最终操作（写Excel、生成报告等）
+- 汇总文件格式：每行一条 JSON 记录 {"字段1":"值1", "字段2":"值2"}
+- 处理完成后删除中间汇总文件 file(action='shell', command='del _summary.jsonl')
+- 每步上下文只保留：当前处理结果 + 已处理计数（如 "第3/10份"）
+
 ## 输出要求
 - 用中文回答，代码注释用英文
 - 完成时给出核心结论 + 关键步骤
@@ -147,6 +200,16 @@ class AgentLoop:
         # 检查点（run 时按 task_id 创建）
         self._checkpoint: Optional[Checkpoint] = None
 
+        # 子任务规划（惰性初始化）
+        self._task_planner: Optional[TaskPlanner] = None
+
+        # 长期记忆（惰性初始化）
+        self._injector: Any = None
+        self._topic_store: Any = None
+
+        # Todo 追踪
+        self._todo_tracker: TodoTracker = TodoTracker()
+
         # Token 追踪
         self._total_tokens_used: int = 0
         self._last_llm_usage: Optional[Dict] = None
@@ -159,6 +222,7 @@ class AgentLoop:
         history: Optional[List[Dict]] = None,
         on_event: Optional[Callable[[str, Dict], Awaitable[None]]] = None,
         resume_from: Optional[str] = None,
+        skip_last_user: bool = True,
     ) -> Dict[str, Any]:
         """
         自主执行任务。
@@ -235,13 +299,51 @@ class AgentLoop:
             else:
                 # 检查点无效，从头开始
                 logger.warning("检查点无效，从头开始")
-                messages = await self._build_messages(task, working_dir, history)
+                messages = await self._build_messages(task, working_dir, history, skip_last_user)
                 start_round = 0
                 if self.enable_checkpoint:
                     self._checkpoint = Checkpoint(task)
         else:
-            messages = await self._build_messages(task, working_dir, history)
+            messages = await self._build_messages(task, working_dir, history, skip_last_user)
             start_round = 0
+
+        logger.info(
+            f"build_messages: history_in={len(history) if history else 0}"
+            f", count={len(messages)}"
+            f", skip_last={skip_last_user}"
+        )
+
+        # ⭐ 子任务分解（复杂任务自动拆分）
+        self._task_planner = TaskPlanner(self.llm_client)
+        plan = await self._task_planner.decompose(task, max_subtasks=5)
+        if len(plan) > 1:
+            plan_prompt = self._task_planner.get_plan_prompt()
+            messages.append({"role": "system", "content": plan_prompt})
+            logger.info(f"📋 任务已分解为 {len(plan)} 个子任务")
+            # 标记第一个为进行中
+            self._task_planner.mark_in_progress(1)
+
+        # ⭐ 注入长期记忆（相关 Topic）
+        try:
+            self._ensure_injector()
+            if self._injector:
+                memory_block = self._injector.prepare_injection(task)
+                if memory_block:
+                    messages.insert(1, {"role": "system", "content": memory_block})
+        except Exception as e:
+            logger.debug(f"长期记忆注入跳过: {e}")
+
+        # ⭐ 复杂度分类 → 模型路由
+        self._task_mode, self._task_mode_info = ComplexityRouter.classify(task)
+        self._routed_model = LLMClient.get_model_for_mode(self._task_mode.value)
+        self._routed_temperature = ComplexityRouter.get_temperature(self._task_mode)
+        self._routed_max_tokens = ComplexityRouter.get_max_tokens(self._task_mode)
+        logger.info(
+            f"🧠 复杂度: {self._task_mode.value} "
+            f"→ 模型: {self._routed_model} "
+            f"(t={self._routed_temperature}, max_tok={self._routed_max_tokens}) "
+            f"原因: {self._task_mode_info.get('reason', 'unknown')}"
+        )
 
         # ⭐ 预判
         if on_event:
@@ -275,6 +377,11 @@ class AgentLoop:
                     self._safe_inject_system(messages, reminder)
                     logger.debug(f"📋 注入工作记忆({len(reminder)}字符)")
 
+            # ── Todo 进度注入 ──
+            todo_prompt = self._todo_tracker.get_prompt()
+            if todo_prompt:
+                self._safe_inject_system(messages, todo_prompt)
+
             # ── 自我反思（连续失败检测） ──
             if self.working_memory.need_reflection(REFLECTION_THRESHOLD):
                 reflection = self.working_memory.get_reflection_prompt()
@@ -299,8 +406,9 @@ class AgentLoop:
             try:
                 response = await self.llm_client.chat_completion(
                     messages=messages,
-                    temperature=0.3,
-                    max_tokens=4096,
+                    model=self._routed_model,
+                    temperature=self._routed_temperature,
+                    max_tokens=self._routed_max_tokens,
                     tools=tools if tools else None,
                 )
             except InsufficientBalanceError as e:
@@ -322,6 +430,7 @@ class AgentLoop:
                     "content": msg,
                     "rounds": round_display,
                     "tool_calls": tool_calls_log,
+                    "messages": messages,
                 }
             except Exception as e:
                 logger.error(f"第 {round_display} 轮 LLM 调用失败: {e}")
@@ -362,14 +471,48 @@ class AgentLoop:
             content = msg.get("content", "")
             tool_calls = msg.get("tool_calls", [])
 
+            # ⭐ Todo 解析 — 从 LLM 输出中提取 todo 状态变更
+            if content:
+                changes = self._todo_tracker.update_from_llm(content, round_display)
+                if changes and on_event:
+                    await on_event("todo_update", {
+                        "items": self._todo_tracker.get_items(),
+                        "changes": changes,
+                    })
+
             # 追加助手回复
             assistant_msg: Dict = {"role": "assistant", "content": content or ""}
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
             messages.append(assistant_msg)
 
-            # ── 无工具调用 → 让 LLM 生成最终总结后结束 ──
+            # ── 无工具调用 → 子任务推进 或 最终总结
             if content and not tool_calls:
+                # 子任务推进：如果还有下一个子任务
+                next_st = self._task_planner.get_next() if self._task_planner else None
+                if next_st:
+                    current = self._task_planner.get_current()
+                    if current:
+                        self._task_planner.mark_done(current.id, content[:500])
+                    self._task_planner.mark_in_progress(next_st.id)
+                    logger.info(
+                        f"📋 子任务 [{current.id}] 完成 → 推进到 [{next_st.id}] {next_st.title}"
+                        if current else f"📋 推进子任务 [{next_st.id}] {next_st.title}"
+                    )
+                    progress = self._task_planner.progress()
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            f"✅ 子任务完成。下一个: {next_st.title}\n"
+                            f"{next_st.description}\n"
+                            f"进度: {progress['done']}/{progress['total']}"
+                        ),
+                    })
+                    # 更新计划提示
+                    plan_prompt = self._task_planner.get_plan_prompt()
+                    messages.insert(-2, {"role": "system", "content": plan_prompt})
+                    continue  # 继续循环处理下一个子任务
+
                 logger.info(f"✅ Agent 第 {round_display} 轮完成，请求最终总结")
 
                 messages.append({
@@ -381,6 +524,7 @@ class AgentLoop:
                 try:
                     final_resp = await self.llm_client.chat_completion(
                         messages=messages,
+                        model=self._routed_model,
                         temperature=0.3,
                         max_tokens=2048,
                     )
@@ -403,6 +547,7 @@ class AgentLoop:
                     })
 
                 # 清理检查点
+                await self._try_save_topics(messages)
                 if self._checkpoint:
                     self._checkpoint.cleanup()
 
@@ -411,17 +556,79 @@ class AgentLoop:
                     "content": content,
                     "rounds": round_display,
                     "tool_calls": tool_calls_log,
+                    "messages": messages,
                 }
 
             # ── 处理工具调用 ──
             if tool_calls:
+                # ═══════════════════════════════════════════════════
+                # P0: 并行执行只读工具（无依赖，可安全并行）
+                # ═══════════════════════════════════════════════════
+                _pre_results: Dict[str, Any] = {}  # call_id → result
+                _read_tcs = []
+                _other_tcs = []
                 for tc in tool_calls:
+                    tname = tc.get("function", {}).get("name", "")
+                    if (self.tool_registry
+                        and hasattr(self.tool_registry, 'is_read_tool')
+                        and self.tool_registry.is_read_tool(tname)):
+                        _read_tcs.append(tc)
+                    else:
+                        _other_tcs.append(tc)
+
+                if len(_read_tcs) > 1:
+                    async def _exec_read_tc(_tc):
+                        _tname = _tc.get("function", {}).get("name", "")
+                        _targs_str = _tc.get("function", {}).get("arguments", "{}")
+                        try:
+                            _targs = json.loads(_targs_str) if isinstance(_targs_str, str) else _targs_str
+                        except json.JSONDecodeError:
+                            _targs = {"raw": _targs_str}
+                        _cid = _tc.get("id", "")
+                        try:
+                            _result = await self._execute_tool(_tname, _targs, _cid)
+                            return (_tc, _tname, _targs, _cid, _result, None)
+                        except Exception as _e:
+                            return (_tc, _tname, _targs, _cid, None, _e)
+
+                    _parallel_results = await asyncio.gather(
+                        *[_exec_read_tc(rtc) for rtc in _read_tcs]
+                    )
+                    for _pr in _parallel_results:
+                        _pre_results[_pr[0].get("id", "")] = _pr
+                    logger.info(f"⚡ 并行执行 {len(_read_tcs)} 个只读工具完成")
+
+                # Merge: 先处理并行读结果，再串行处理写操作
+                _ordered_tcs = _read_tcs + _other_tcs
+
+                for tc in _ordered_tcs:
                     tool_name = tc.get("function", {}).get("name", "")
-                    tool_args_str = tc.get("function", {}).get("arguments", "{}")
-                    try:
-                        tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
-                    except json.JSONDecodeError:
-                        tool_args = {"raw": tool_args_str}
+                    tool_args_raw = tc.get("function", {}).get("arguments", "{}")
+
+                    # 兼容三种格式：JSON字符串 / 已解析的 dict / None / 空
+                    if isinstance(tool_args_raw, dict):
+                        tool_args = tool_args_raw
+                    elif isinstance(tool_args_raw, str) and tool_args_raw.strip():
+                        try:
+                            tool_args = json.loads(tool_args_raw)
+                        except json.JSONDecodeError:
+                            # JSON 解析失败：LLM 返回的 arguments 可能含未转义的控制字符
+                            # 尝试 ast.literal_eval（宽松 Python 字面量解析）
+                            try:
+                                import ast
+                                # ast.literal_eval 不认识 JSON 的 true/false/null
+                                fixed_ast = tool_args_raw.replace('true', 'True').replace('false', 'False').replace('null', 'None')
+                                tool_args = ast.literal_eval(fixed_ast)
+                            except (ValueError, SyntaxError):
+                                # 最后兜底：手动转义控制字符后重试
+                                try:
+                                    fixed = tool_args_raw.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                                    tool_args = json.loads(fixed)
+                                except json.JSONDecodeError:
+                                    logger.warning(f"[tc] arguments 解析全失败: {tool_args_raw[:200]}")
+                                    tool_args = {"raw": tool_args_raw}
+                    else:
+                        tool_args = {}
 
                     # 空参数拦截：LLM 调了工具但没传参数 → 跳过
                     meaningful = any(
@@ -453,9 +660,17 @@ class AgentLoop:
                     if on_event:
                         await on_event("tool_call", log_entry)
 
-                    # 执行工具
+                    # 执行工具（优先使用并行预执行结果）
                     try:
-                        result = await self._execute_tool(tool_name, tool_args, tc.get("id", ""))
+                        call_id = tc.get("id", "")
+                        if call_id in _pre_results:
+                            _pr = _pre_results[call_id]
+                            result = _pr[4]  # result
+                            _exec_err = _pr[5]  # exception or None
+                            if _exec_err:
+                                raise _exec_err
+                        else:
+                            result = await self._execute_tool(tool_name, tool_args, call_id)
                         is_success = (
                             hasattr(result, 'status')
                             and getattr(result, 'status', None) is not None
@@ -481,9 +696,20 @@ class AgentLoop:
                         if not is_success:
                             error_msg = result.error_message if hasattr(result, 'error_message') else "执行失败"
                             result_str = f"错误: {error_msg}"
+                            # ⭐ 通知 TaskPlanner 当前子任务失败
+                            if self._task_planner:
+                                current = self._task_planner.get_current()
+                                if current and current.status.value == "in_progress":
+                                    self._task_planner.mark_failed(current.id, error=error_msg[:200])
+                                    next_st = self._task_planner.get_next()
+                                    if next_st:
+                                        self._task_planner.mark_in_progress(next_st.id)
+                                        logger.info(f"📋 子任务 [{current.id}] 失败 → 尝试 [{next_st.id}]")
+                                    else:
+                                        logger.info(f"📋 子任务 [{current.id}] 失败，无剩余子任务")
 
                         if len(result_str) > MAX_TOOL_RESULT_CHARS:
-                            result_str = result_str[:MAX_TOOL_RESULT_CHARS] + "\n... [截断]"
+                            result_str = self._smart_truncate(result_str, MAX_TOOL_RESULT_CHARS)
 
                         # ── 更新工作记忆 ──
                         if is_success:
@@ -653,6 +879,7 @@ class AgentLoop:
             })
 
         # 清理检查点
+        await self._try_save_topics(messages)
         if self._checkpoint:
             self._checkpoint.cleanup()
 
@@ -661,6 +888,7 @@ class AgentLoop:
             "content": final_content,
             "rounds": self.max_rounds,
             "tool_calls": tool_calls_log,
+            "messages": messages,
         }
 
     # ── 消息构建 ──
@@ -670,8 +898,14 @@ class AgentLoop:
         task: str,
         working_dir: str,
         history: Optional[List[Dict]],
+        skip_last_user: bool = True,
     ) -> List[Dict]:
-        """构建初始消息列表，基础模板 + skill/user/memory + 历史对话（LLM压缩）"""
+        """构建初始消息列表，基础模板 + skill/user/memory + 历史对话（LLM压缩）
+        
+        Args:
+            skip_last_user: True=跳过 history 最后一条 user（它是本次请求）；
+                           False=保留（ConversationSession 传入的是前轮完整对话）
+        """
         messages: List[Dict] = []
 
         # 构建变量（从 skill / user / memory 抽取）
@@ -693,8 +927,9 @@ class AgentLoop:
                 if m.get("role") == "user"
             ]
 
-            # 2. 跳过最后一条 user（即当前输入，已被下方 "任务: {task}" 替代）
-            user_indices = user_indices[:-1] if user_indices else []
+            # 2. 跳过最后一条 user（仅当它确实是本次任务时）
+            if skip_last_user:
+                user_indices = user_indices[:-1] if user_indices else []
 
             if user_indices:
                 # 3. 拆分：最近 KEEP_RECENT_TURNS 轮 vs 更老的
@@ -759,22 +994,13 @@ class AgentLoop:
         return variables
 
     def _render_template(self, template: str, variables: Dict[str, str]) -> str:
-        """替换 {{ variable }} 占位符，递归处理变量值中的模板"""
-        # 先预渲染变量值（变量值本身可能含模板）
-        rendered_vars = {}
-        for k, v in variables.items():
-            if isinstance(v, str) and "{{" in v:
-                # 递归渲染变量值中的模板
-                rendered_vars[k] = self._TEMPLATE_PATTERN.sub(
-                    lambda m: variables.get(m.group(1), f"{{{{ {m.group(1)} }}}}"),
-                    v
-                )
-            else:
-                rendered_vars[k] = v
-
+        """Replace {{ variable }} placeholders. Missing vars stay as-is."""
         def replacer(match):
             var_name = match.group(1)
-            return rendered_vars.get(var_name, f"{{{{ {var_name} }}}}")
+            value = variables.get(var_name)
+            if value is None:
+                return '{{ ' + var_name + ' }}'
+            return str(value)
         return self._TEMPLATE_PATTERN.sub(replacer, template)
 
     def _summarize_history(self, history: List[Dict]) -> str:
@@ -927,6 +1153,36 @@ class AgentLoop:
 
         return self._summarize_history(messages)
 
+    def _ensure_injector(self) -> None:
+        """惰性初始化长期记忆注入器"""
+        if self._injector is not None:
+            return
+        try:
+            from engine.longterm.topic_inject import get_injector
+            self._injector = get_injector()
+            self._topic_store = self._injector.store
+        except Exception as e:
+            logger.debug(f"长期记忆未启用: {e}")
+            self._injector = None
+
+    async def _try_save_topics(self, messages: List[Dict]) -> None:
+        """尝试将对话提炼为长期记忆 Topic"""
+        self._ensure_injector()
+        if not self._injector or not self._topic_store:
+            return
+        try:
+            from engine.longterm.topic_compress import compress_dialogue
+            topics = await compress_dialogue(
+                messages=messages[-40:],
+                llm_client=self.llm_client,
+                store=self._topic_store,
+                min_importance=0.3,
+            )
+            if topics:
+                logger.info(f"💾 提取 {len(topics)} 个长期记忆")
+        except Exception as e:
+            logger.debug(f"长期记忆保存跳过: {e}")
+
     @staticmethod
     def _safe_inject_system(messages: List[Dict], content: str) -> None:
         """
@@ -1074,6 +1330,79 @@ class AgentLoop:
         except Exception:
             return self._total_tokens_used
 
+    @staticmethod
+    def _smart_truncate(text: str, max_chars: int) -> str:
+        """
+        智能截断工具输出 — 保留结构，丢弃冗余。
+
+        策略:
+        - JSON 格式 → 尝试保留外层 key 和少量数组元素
+        - 多行文本 → 在行边界截断，保留头尾
+        - 单行长文本 → 保留头 70% + 尾 30%
+        """
+        if len(text) <= max_chars:
+            return text
+
+        # JSON 结构: 尝试保留关键 key
+        if text.strip().startswith("{"):
+            try:
+                import json
+                obj = json.loads(text)
+                summary = {}
+                for k, v in list(obj.items())[:10]:
+                    if isinstance(v, str) and len(v) > 100:
+                        summary[k] = v[:100] + "..."
+                    elif isinstance(v, list):
+                        summary[k] = v[:3] if len(v) > 3 else v
+                        if len(v) > 3:
+                            summary[k].append(f"... (+{len(v)-3}项)")
+                    else:
+                        summary[k] = v
+                result = json.dumps(summary, ensure_ascii=False, indent=2)
+                if len(result) <= max_chars:
+                    return result + f"\n... [截断: 完整数据{len(text)}字符]"
+            except (json.JSONDecodeError, Exception):
+                pass
+
+        # JSON 数组
+        if text.strip().startswith("["):
+            try:
+                import json
+                arr = json.loads(text)
+                if isinstance(arr, list) and len(arr) > 5:
+                    snippet = json.dumps(arr[:5], ensure_ascii=False, indent=2)
+                    return (
+                        snippet[:-1]  # 去掉结尾 ]
+                        + f",\n  ... (+{len(arr)-5}项)\n]\n"
+                        f"[截断: 完整数据{len(text)}字符]"
+                    )
+            except (json.JSONDecodeError, Exception):
+                pass
+
+        # 多行文本: 行边界截断
+        if "\n" in text:
+            lines = text.split("\n")
+            # 保留前 70% 行 + 尾 30% 行
+            head_count = max(int(len(lines) * 0.7), 1)
+            tail_count = max(int(len(lines) * 0.1), 1)
+            head = "\n".join(lines[:head_count])
+            if len(head) <= max_chars:
+                tail = "\n".join(lines[-tail_count:])
+                return (
+                    f"{head}\n... [省略 {len(lines)-head_count-tail_count} 行] ...\n{tail}\n"
+                    f"[截断: 完整数据 {len(lines)} 行, {len(text)} 字符]"
+                )
+            # 头都放不下，直接在行边界截断
+            to_keep = max_chars - 200
+            for i in range(head_count - 1, 0, -1):
+                chunk = "\n".join(lines[:i])
+                if len(chunk) <= to_keep:
+                    return chunk + f"\n... [截断: 完整数据 {len(lines)} 行, {len(text)} 字符]"
+
+        # 纯文本: 保留头尾
+        keep = max_chars - 150
+        return text[:keep] + f"\n... [截断: 完整数据 {len(text)} 字符]"
+
     # ── 工具执行 ──
 
     async def _execute_tool(self, tool_name: str, tool_args: Dict, call_id: str = "") -> Any:
@@ -1085,7 +1414,7 @@ class AgentLoop:
         logger.info(f"⚡ [{tool_name}] | 参数: {tool_args}")
 
         # 记录被编辑的文件
-        if tool_name in ("edit", "write_file", "code_editor", "diff_file"):
+        if tool_name in ("edit", "write_file", "code_editor", "diff_file", "file"):
             file_path = tool_args.get("path", tool_args.get("file_path", ""))
             if file_path:
                 self.edited_files.add(file_path)

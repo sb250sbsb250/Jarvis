@@ -52,14 +52,17 @@ const API = {
 
   // ── 聊天 SSE ──
   createChatStream(message, sessionId, model) {
-    const params = new URLSearchParams({ message });
-    if (sessionId) params.set('session_id', sessionId);
-    if (model) params.set('model', model);
-
     const controller = new AbortController();
-    const url = '/api/chat/stream?' + params.toString();
+    const body = JSON.stringify({
+      message,
+      session_id: sessionId || null,
+      model: model || null,
+    });
 
-    const stream = fetch(url, {
+    const stream = fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
       signal: controller.signal
     }).then(async resp => {
       if (!resp.ok) {
@@ -69,7 +72,7 @@ const API = {
       return resp.body.getReader();
     });
 
-    return { stream, controller, url };
+    return { stream, controller };
   },
 
   // ── 会话 ──

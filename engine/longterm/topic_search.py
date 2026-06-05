@@ -162,5 +162,3 @@ def search_simple(
     return [t for t, _ in scored[:top_k]]
 
 
-# 需要 json 用于 search_simple
-import json

@@ -38,6 +38,14 @@ class LLMClient:
         response = await client.chat_completion(messages, tools)
     """
 
+    # ── 模型路由表：ResponseMode → 推荐模型 ──
+    MODEL_ROUTING = {
+        "direct":   "deepseek-chat",
+        "concise":  "deepseek-chat",
+        "standard": "deepseek-v4-pro",
+        "detailed": "deepseek-v4-pro",
+    }
+
     def __init__(self, config: Optional[LLMConfig] = None):
         self.config = config or self._load_config_from_env()
 
@@ -82,13 +90,22 @@ class LLMClient:
         """从环境变量加载配置"""
         api_key = os.environ.get("DEEPSEEK_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
         base_url = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")
-        model = os.environ.get("LLM_MODEL", "deepseek-v4-pro")
+        model = os.environ.get("LLM_MODEL", "deepseek-chat")
 
         return LLMConfig(
             api_key=api_key,
             base_url=base_url,
             model=model,
         )
+
+    @classmethod
+    def get_model_for_mode(cls, mode: str) -> str:
+        """根据复杂度模式获取推荐模型，支持环境变量覆盖"""
+        env_key = f"LLM_MODEL_{mode.upper()}"
+        env_model = os.environ.get(env_key)
+        if env_model:
+            return env_model
+        return cls.MODEL_ROUTING.get(mode, cls._load_config_from_env().model)
 
     async def chat_completion(
         self,
@@ -217,19 +234,6 @@ class LLMClient:
         except Exception as e:
             _llm_elapsed = (time.time() - _llm_start) * 1000
             logger.error(f"❌ LLM 调用失败 ({_llm_elapsed:.0f}ms): {e}")
-            # ⭐ 消息格式错误时打印详细分析
-            error_str = str(e)
-            if "tool' must be a response" in error_str or "BadRequestError" in error_str:
-                from .message.validator import MessageDebugger, aggressive_clean
-                MessageDebugger.print_analysis(messages, e)
-                # 激进修复：移除孤立的 tool 消息后重试一次
-                if "tool' must be a response" in error_str:
-                    cleaned = aggressive_clean(messages)
-                    if len(cleaned) != len(messages):
-                        logger.warning(f"激进修复: 消息数 {len(messages)} → {len(cleaned)}")
-                        params["messages"] = cleaned
-                        non_stream_resp = await self._client.chat.completions.create(**params)
-                        return self._to_dict(non_stream_resp)
             logger.error(f"LLM 调用失败: {e}")
 
             # ── 永久性错误检查（余额不足、认证失败） → 尝试 Fallback ──
