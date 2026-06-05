@@ -1,0 +1,8 @@
+name: debug
+display_name: 错误调试
+icon: 🐛
+description: 定位和修复代码错误
+when_to_use: 用户遇到报错、bug 时
+tools: [code, shell, file]
+fallback: code_review
+tags: [调试bug, 报错修复, 错误定位, 栈追踪]

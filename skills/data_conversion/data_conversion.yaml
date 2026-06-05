@@ -1,0 +1,8 @@
+name: data_conversion
+display_name: 数据格式转换
+icon: 🔄
+description: 转换数据格式（JSON/CSV/XML/YAML）
+when_to_use: 用户要转换数据格式时
+tools: [file, shell, excel]
+fallback: null
+tags: [转换, JSON, CSV, 格式]

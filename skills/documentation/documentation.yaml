@@ -1,0 +1,8 @@
+name: documentation
+display_name: 文档生成
+icon: 📝
+description: 生成代码文档、README、API 文档
+when_to_use: 用户要生成文档时
+tools: [code, file, office]
+fallback: null
+tags: [文档, README, API]

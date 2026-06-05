@@ -1,0 +1,23 @@
+# ── Core Framework ──
+fastapi>=0.110.0
+uvicorn>=0.27.0
+pydantic>=2.5.0
+jinja2>=3.1.0
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# ── LLM Client ──
+openai>=1.10.0
+
+# ── Document Processing ──
+openpyxl>=3.1.0
+PyPDF2>=3.0.0
+pdfplumber>=0.10.0
+
+# ── System & Utils ──
+psutil>=5.9.0
+
+# ── Optional (uncomment if needed) ──
+# Pillow>=10.0.0          # Image processing (read_image tool)
+# pandas>=2.0.0           # Advanced data analysis
+# sentence-transformers   # Long-term memory embedding

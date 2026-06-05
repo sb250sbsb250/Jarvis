@@ -1,0 +1,8 @@
+name: web_scraping
+display_name: 网页数据抓取
+icon: 🕷️
+description: 抓取网页数据并结构化
+when_to_use: 用户要从网页提取数据时
+tools: [web, file, shell]
+fallback: null
+tags: [网页, 抓取, 爬虫]

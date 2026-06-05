@@ -1,0 +1,8 @@
+name: schedule_reminder
+display_name: 日程提醒
+icon: ⏰
+description: 设置和管理日程提醒
+when_to_use: 用户要设置提醒、管理日程时
+tools: [system, file]
+fallback: null
+tags: [日程, 提醒, 时间]

@@ -1,0 +1,8 @@
+name: data_explore
+display_name: 数据探索
+icon: 📊
+description: 探索和理解未知数据集
+when_to_use: 用户上传陌生数据文件要了解内容时
+tools: [excel, file, shell]
+fallback: null
+tags: [数据, 探索, 分析]

@@ -1,0 +1,8 @@
+name: project_init
+display_name: 项目初始化
+icon: 🚀
+description: 快速初始化项目结构和配置
+when_to_use: 用户要创建新项目时
+tools: [file, shell, code]
+fallback: code_generation
+tags: [项目, 初始化, 脚手架]
