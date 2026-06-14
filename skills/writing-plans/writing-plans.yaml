@@ -1,0 +1,13 @@
+name: writing-plans
+display_name: 编写实现计划
+icon: 📝
+description: 有规格说明或需求需要多步骤实现时，在接触代码之前
+when_to_use: 有规格说明或需求需要多步骤实现时，在接触代码之前
+tools:
+- file
+tags:
+- 计划
+- plan
+- 实现计划
+- 任务分解
+- 技术方案

@@ -1,0 +1,13 @@
+name: dispatching-parallel-agents
+display_name: 并行代理调度
+icon: 🚀
+description: 有2个以上独立任务需要并行处理时
+when_to_use: 有2个以上独立任务需要并行处理时
+tools:
+- task
+tags:
+- 并行
+- 多代理
+- 并行处理
+- parallel
+- 并发

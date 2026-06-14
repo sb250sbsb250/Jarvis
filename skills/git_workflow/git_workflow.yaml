@@ -1,0 +1,8 @@
+name: git_workflow
+display_name: Git 工作流
+icon: 🔄
+description: Git 提交、推送、分支管理
+when_to_use: 用户要操作 Git 时
+tools: [git, shell, code]
+fallback: null
+tags: [git, 版本控制]

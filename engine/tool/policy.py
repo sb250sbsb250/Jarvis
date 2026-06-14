@@ -31,9 +31,16 @@ class AccessLevel(Enum):
 DEFAULT_POLICY: Dict[str, AccessLevel] = {
     # Shell — 默认禁止，需显式授权
     "shell_execute": AccessLevel.DENY,
+    "shell_run": AccessLevel.REQUIRE_APPROVAL,
 
     # 文件写操作 — 默认需审批
     "file_write": AccessLevel.REQUIRE_APPROVAL,
+    "file_append": AccessLevel.REQUIRE_APPROVAL,
+
+    # 代码编辑 — 默认需审批（小修改动态放行）
+    "code_write": AccessLevel.REQUIRE_APPROVAL,
+    "code_create": AccessLevel.REQUIRE_APPROVAL,
+    "code_append": AccessLevel.REQUIRE_APPROVAL,
 
     # 进程管理 — 默认禁止
     "process_list": AccessLevel.DENY,
@@ -83,6 +90,22 @@ class ToolPolicy:
             logger.info(f"📝 需要审批: {tool_name} (call_id={call_id[:12]})")
 
         return level
+
+    def check_dynamic(self, tool_name: str, tool_args: Dict, call_id: str = "") -> AccessLevel:
+        """
+        带参数感知的动态检查。
+
+        某些工具在小修改时自动放行（如 code_write ≤50 行）。
+        """
+        # code_write/code_append/code_create: 小修改自动放行
+        if tool_name in ("code_write", "code_append", "code_create"):
+            new_text = tool_args.get("new_text", "")
+            if isinstance(new_text, str):
+                line_count = len(new_text.splitlines())
+                if line_count <= 50:
+                    return AccessLevel.ALLOW
+
+        return self.check(tool_name, call_id)
 
     def approve(self, call_id: str) -> bool:
         """批准一个待审批的调用"""

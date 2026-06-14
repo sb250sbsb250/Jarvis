@@ -1,0 +1,13 @@
+{
+  "session_id": "sess_735b8b46f922",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hi"
+    },
+    {
+      "role": "assistant",
+      "content": "嗨 Boss。\n\n当前仓库状态：master 分支有 9 个文件修改待提交，主要是 engine 核心模块和 frontend 的改动。\n\n有什么需要搞的？"
+    }
+  ]
+}

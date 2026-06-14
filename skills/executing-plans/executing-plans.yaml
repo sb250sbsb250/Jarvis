@@ -1,0 +1,14 @@
+name: executing-plans
+display_name: 执行计划
+icon: 📋
+description: 有书面的实现计划需要执行时
+when_to_use: 有书面的实现计划需要执行时
+tools:
+- task
+- file
+tags:
+- 计划执行
+- 任务执行
+- plan
+- 计划
+- 执行

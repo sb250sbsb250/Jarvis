@@ -1,0 +1,8 @@
+name: invoice_processor
+display_name: 发票识别处理
+icon: 🧾
+description: 从发票提取信息并填入报销模板
+when_to_use: 用户要处理发票、报销单时
+tools: [excel, image, office]
+fallback: excel_migration
+tags: [发票, 报销, 识别]

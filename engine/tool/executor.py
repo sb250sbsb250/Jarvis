@@ -33,13 +33,13 @@ class ToolExecutor:
         if self.policy:
             access = self.policy.check(call.name, call.id)
             if access == AccessLevel.DENY:
-                return ToolResult.error(
+                return ToolResult.fail(
                     call.id, call.name,
                     f"工具 '{call.name}' 已被禁止执行"
                 )
             elif access == AccessLevel.REQUIRE_APPROVAL:
                 logger.warning(f"⏸️ 工具 '{call.name}' 等待审批 (call_id={call.id[:12]})")
-                return ToolResult.error(
+                return ToolResult.fail(
                     call.id, call.name,
                     f"工具 '{call.name}' 需要人类审批才能执行"
                 )
@@ -48,7 +48,7 @@ class ToolExecutor:
         if not tool:
             return ToolResult.error(call.id, call.name, f"工具 '{call.name}' 未注册")
 
-        is_valid, error_msg = tool.validate_args(call.arguments)
+        is_valid, error_msg = tool.validate_args(call.name, call.arguments)
         if not is_valid:
             return ToolResult.error(call.id, call.name, error_msg or "参数无效")
 
@@ -79,7 +79,7 @@ class ToolExecutor:
                 )
 
                 # 工具自身返回错误但可重试
-                if result.is_success() or attempt >= tool_max_retries:
+                if result.is_success or attempt >= tool_max_retries:
                     return result
 
                 last_error = result

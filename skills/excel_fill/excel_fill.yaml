@@ -1,0 +1,8 @@
+name: excel_fill
+display_name: Excel 智能填充
+icon: 📝
+description: 根据源数据自动填充 Excel 模板
+when_to_use: 用户要把数据填入 Excel 模板时
+tools: [excel, shell]
+fallback: excel_analysis
+tags: [excel, 填充, 模板]

@@ -157,14 +157,17 @@ class ComplexityRouter:
 - 先理解问题，再给出方案"""
 
     @classmethod
-    def get_max_tokens(cls, mode: ResponseMode) -> int:
-        mapping = {
-            ResponseMode.DIRECT: 30,
-            ResponseMode.CONCISE: 150,
-            ResponseMode.STANDARD: 500,
-            ResponseMode.DETAILED: 2000,
-        }
-        return mapping[mode]
+    def get_max_tokens(mode: str, input_length: int = 0) -> int:
+        base = {
+            "simple": 100000,
+            "standard": 100000,
+            "complex": 409600,
+        }.get(mode, 100000)
+
+        # 如果输入上下文较大，自动增加输出空间
+
+
+        return base
 
     @classmethod
     def get_temperature(cls, mode: ResponseMode) -> float:

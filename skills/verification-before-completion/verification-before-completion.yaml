@@ -1,0 +1,13 @@
+name: verification-before-completion
+display_name: 完成前验证
+icon: ✅
+description: 即将声称工作已完成、已修复或测试通过时，在提交或创建PR之前
+when_to_use: 即将声称工作已完成、已修复或测试通过时，在提交或创建PR之前
+tools:
+- code
+- file
+tags:
+- 验证
+- verification
+- 质量保证
+- 代码提交

@@ -1,0 +1,2557 @@
+================================================================================
+# FILE: __init__.py
+================================================================================
+"""
+工具包 — 注册入口（v3.0 原子工具版）
+
+每个大类注册多个原子工具。
+LLM 看到的扁平工具列表由 Registry 自动生成。
+
+使用方式：
+    from tools import register_all_tools
+    registry = ToolRegistry()
+    register_all_tools(registry)
+"""
+
+import logging
+from typing import Dict, Optional, List, Type
+
+from engine.tool.base import BaseTool
+from engine.tool.registry import ToolRegistry as _ToolRegistry
+
+logger = logging.getLogger(__name__)
+
+# ── 9 个大类 ──
+from .file_tool import FileTool              # 7 个原子工具
+from .excel_tool import ExcelTool            # 10 个原子工具
+from .code_graph_tool import CodeGraphTool   # 7 个原子工具
+from .code_tool import CodeTool              # 6 个原子工具
+from .pdf_tool import PdfTool                # 1 个原子工具
+from .word_tool import WordTool              # 2 个原子工具
+from .shell_tool import ShellExecuteTool     # 1 个原子工具
+from .web_tool import WebTool                # 2 个原子工具
+from .git_tool import GitTool                # 3 个原子工具
+from .system_tool import SystemTool          # 3 个原子工具
+from .image_tool import ImageTool            # 2 个原子工具
+from .pentest_tool import PentestTool        # 1 个原子工具
+from .todo_tool import TodoTool              # 2 个原子工具
+
+# ── 大类列表（13 个大类，共 47 个原子工具） ──
+ALL_TOOL_CLASSES: List[type] = [
+    FileTool,          # 文件: list/read/glob/write/append/rename/diff
+    ExcelTool,         # Excel: open/close/list_sheets/read_sheet/write...
+    CodeGraphTool,     # 代码图谱: related/symbol/callers/callees/impact/folder/stats
+    CodeTool,          # 代码编辑: read/diff/write/rollback/append/create
+    PdfTool,           # PDF: read
+    WordTool,          # Word: read/write
+    PentestTool,       # 渗透: run
+    ShellExecuteTool,  # Shell: run
+    WebTool,           # 网络: fetch/search
+    GitTool,           # Git: status/commit/push
+    SystemTool,        # 系统: info/time/cwd
+    ImageTool,         # 图片: read/ocr
+    TodoTool,          # Todo: write/list
+]
+
+# ── 默认配置 ──
+DEFAULT_TOOL_CONFIGS: Dict[Type, Dict] = {
+    ShellExecuteTool: {"timeout": 30},
+    CodeGraphTool: {"project_root": "."},
+}
+
+STANDARD_TOOL_NAMES = [
+    # 文件
+    "file_list", "file_read", "file_glob", "file_write",
+    "file_append", "file_rename", "file_diff",
+    # Excel
+    "excel_open", "excel_close", "excel_list_sheets", "excel_read_sheet",
+    "excel_get_structure", "excel_write_cell", "excel_write_by_header",
+    "excel_insert_rows", "excel_format_range", "excel_save",
+    # 代码图谱
+    "code_graph_related", "code_graph_symbol", "code_graph_callers",
+    "code_graph_callees", "code_graph_impact", "code_graph_folder",
+    "code_graph_stats",
+    # 代码编辑
+    "code_read", "code_diff", "code_write", "code_rollback",
+    "code_append", "code_create",
+    # PDF
+    "pdf_read",
+    "pdf_split",
+    "pdf_concat",
+    # Word
+    "word_read", "word_write",
+    # Shell
+    "shell_run",
+    # 网络
+    "web_fetch", "web_search",
+    # Git
+    "git_status", "git_commit", "git_push",
+    # 系统
+    "system_info", "system_time", "system_cwd",
+    # 图片
+    "image_read", "image_ocr",
+    # 渗透
+    "pentest_run",
+    # Todo
+    "todo_write", "todo_list",
+]
+
+
+def register_all_tools(
+    registry: _ToolRegistry,
+    config: Optional[Dict[str, Dict]] = None,
+    exclude: Optional[List[str]] = None,
+) -> _ToolRegistry:
+    """
+    注册所有工具大类到 Registry。
+
+    Args:
+        registry: ToolRegistry 实例
+        config: 覆盖默认配置，{大类名: {配置字典}}
+        exclude: 要跳过的大类名列表
+    """
+    exclude = exclude or []
+    custom_config = config or {}
+    registered = 0
+
+    for tool_class in ALL_TOOL_CLASSES:
+        try:
+            default_kwargs = DEFAULT_TOOL_CONFIGS.get(tool_class, {})
+            temp = tool_class(**default_kwargs)
+            ns = temp.name
+        except Exception as e:
+            logger.error(f"获取工具名称失败: {tool_class.__name__}: {e}")
+            continue
+
+        if ns in exclude:
+            logger.debug(f"跳过: {ns}")
+            continue
+
+        kwargs = dict(DEFAULT_TOOL_CONFIGS.get(tool_class, {}))
+        if ns in custom_config:
+            kwargs.update(custom_config[ns])
+
+        registry.register(tool_class, **kwargs)
+        registered += 1
+
+    logger.info(f"注册完成: {registered} 个大类")
+    return registry
+
+
+def print_tool_list(registry: Optional[_ToolRegistry] = None):
+    """打印所有工具（大类 + 原子工具）"""
+    if registry:
+        status = registry.get_status()
+        logger.info(f"ToolRegistry v3: {status['categories']} 个大类, {status['atomic_tools']} 个原子工具")
+        for ns in sorted(registry.list_categories()):
+            inst = registry._get_instance(ns) if hasattr(registry, '_get_instance') else None
+            if inst:
+                names = inst.get_tool_names()
+                logger.info(f"  {ns} ({len(names)}): {', '.join(names)}")
+    else:
+        for tc in ALL_TOOL_CLASSES:
+            try:
+                kwargs = DEFAULT_TOOL_CONFIGS.get(tc, {})
+                inst = tc(**kwargs)
+                names = inst.get_tool_names()
+                logger.info(f"  {inst.name} ({len(names)}): {', '.join(names)}")
+            except Exception:
+                logger.info(f"  {tc.__name__}")
+
+
+================================================================================
+# FILE: code_graph_tool.py
+================================================================================
+"""
+Code Graph 工具（原子工具版）
+
+原子工具:
+  code_graph_related    — 文件相关查询（import/被谁import）
+  code_graph_symbol     — 搜索符号定义
+  code_graph_callers    — 追踪谁调用了某函数
+  code_graph_callees    — 追踪某函数调用了谁
+  code_graph_impact     — 分析修改文件的影响范围
+  code_graph_folder     — 列出文件夹代码结构
+  code_graph_stats      — 项目图谱概览
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_CODE,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SymbolInfo:
+    name: str
+    kind: str
+    file: str
+    line: int
+    docstring: Optional[str] = None
+    calls: List[str] = field(default_factory=list)
+    called_by: List[str] = field(default_factory=list)
+    decorators: List[str] = field(default_factory=list)
+
+
+class ProjectGraph:
+    """全项目代码图谱 — 一次构建，全局缓存"""
+
+    def __init__(self, project_root: str = "."):
+        self.root = Path(project_root).resolve()
+        self._files: Dict[str, Dict] = {}
+        self._symbols: Dict[str, List[SymbolInfo]] = {}
+        self._file_mtimes: Dict[str, float] = {}
+        self._built = False
+
+    def build(self, force: bool = False) -> "ProjectGraph":
+        if self._built and not force:
+            return self._incremental_update()
+        py_files = [f for f in self.root.rglob("*.py")
+                    if "__pycache__" not in str(f) and ".venv" not in str(f)
+                    and "site-packages" not in str(f)]
+        logger.info(f"[CodeGraph] 扫描 {len(py_files)} 个文件...")
+        for fpath in py_files:
+            self._parse_file(fpath)
+            self._file_mtimes[str(fpath)] = fpath.stat().st_mtime
+        self._build_reverse()
+        self._built = True
+        return self
+
+    def _incremental_update(self) -> "ProjectGraph":
+        current_files = [f for f in self.root.rglob("*.py")
+                         if "__pycache__" not in str(f) and ".venv" not in str(f)
+                         and "site-packages" not in str(f)]
+        current_set = {str(f) for f in current_files}
+        cached_set = set(self._file_mtimes.keys())
+        new = current_set - cached_set
+        changed = {p for p in cached_set & current_set
+                   if os.path.getmtime(p) != self._file_mtimes.get(p, 0)}
+        deleted = cached_set - current_set
+        if not new and not changed and not deleted:
+            return self
+        for fp in deleted:
+            try:
+                rel = str(Path(fp).relative_to(self.root))
+            except ValueError:
+                rel = fp
+            self._files.pop(rel, None)
+            self._file_mtimes.pop(fp, None)
+        logger.info(f"[CodeGraph] 增量: +{len(new)} ~{len(changed)} -{len(deleted)}")
+        for fp in sorted(new | changed):
+            fpath = Path(fp)
+            try:
+                rel = str(fpath.relative_to(self.root))
+            except ValueError:
+                rel = str(fpath)
+            old_info = self._files.get(rel)
+            if old_info:
+                for sym_name in list(old_info.get("symbols", {}).keys()):
+                    self._symbols.pop(sym_name, None)
+            self._parse_file(fpath)
+            self._file_mtimes[fp] = fpath.stat().st_mtime
+        self._build_reverse()
+        return self
+
+    def _parse_file(self, fpath: Path) -> None:
+        try:
+            rel = str(fpath.relative_to(self.root))
+        except ValueError:
+            rel = str(fpath)
+        try:
+            source = fpath.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+        except Exception:
+            return
+        info: Dict[str, Any] = {"imports": {}, "imported_by": set(), "symbols": {}}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    target = self._resolve_module(alias.name)
+                    if target:
+                        info["imports"][alias.name] = target
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                target = self._resolve_module(node.module)
+                if target:
+                    info["imports"][node.module] = target
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                sym = self._extract_symbol(node, rel)
+                info["symbols"][sym.name] = sym
+                self._add_symbol(sym.name, sym)
+                if isinstance(node, ast.ClassDef):
+                    for item in node.body:
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            msym = self._extract_symbol(item, rel, name=f"{node.name}.{item.name}")
+                            info["symbols"][msym.name] = msym
+                            self._add_symbol(msym.name, msym)
+        self._files[rel] = info
+
+    def _extract_symbol(self, node, fp: str, name: str = None) -> SymbolInfo:
+        sn = name or node.name
+        kind = ("async_function" if isinstance(node, ast.AsyncFunctionDef)
+                else "class" if isinstance(node, ast.ClassDef) else "function")
+        doc = ast.get_docstring(node)
+        decos = [d.id if isinstance(d, ast.Name) else d.attr if isinstance(d, ast.Attribute) else "@"
+                 for d in getattr(node, 'decorator_list', [])]
+        calls = []
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                if isinstance(child.func, ast.Name):
+                    calls.append(child.func.id)
+                elif isinstance(child.func, ast.Attribute):
+                    parts = []
+                    cur = child.func
+                    while isinstance(cur, ast.Attribute):
+                        parts.append(cur.attr)
+                        cur = cur.value
+                    if isinstance(cur, ast.Name):
+                        parts.append(cur.id)
+                    calls.append(".".join(reversed(parts)))
+        return SymbolInfo(name=sn, kind=kind, file=fp, line=node.lineno,
+                          docstring=doc[:300] if doc else None, calls=calls, decorators=decos)
+
+    def _add_symbol(self, name, sym):
+        self._symbols.setdefault(name, []).append(sym)
+
+    def _build_reverse(self):
+        for rel, info in self._files.items():
+            for module, target in info["imports"].items():
+                if target in self._files:
+                    self._files[target]["imported_by"].add(rel)
+        for name, syms in self._symbols.items():
+            for sym in syms:
+                for called in sym.calls:
+                    if called in self._symbols:
+                        for target in self._symbols[called]:
+                            target.called_by.append(f"{sym.file}::{sym.name}")
+
+    def _resolve_module(self, module: str) -> Optional[str]:
+        parts = module.split(".")
+        for c in [str(Path(*parts).with_suffix(".py")), str(Path(*parts) / "__init__.py")]:
+            if c in self._files or (self.root / c).exists():
+                return c
+        return None
+
+    def _match_file(self, path):
+        if path in self._files:
+            return path
+        fname = Path(path).name
+        candidates = [p for p in self._files if p.endswith(path) or Path(p).name == fname]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _find_symbol(self, name):
+        if name in self._symbols:
+            return self._symbols[name]
+        for sn, syms in self._symbols.items():
+            if name in sn:
+                return syms
+        return []
+
+    def find_related(self, file_path: str) -> Dict:
+        target = self._match_file(file_path)
+        if not target:
+            return {"error": f"文件未找到: {file_path}"}
+        info = self._files[target]
+        return {
+            "target": target,
+            "imports": [{"module": m, "file": f} for m, f in info["imports"].items()],
+            "imported_by": sorted(info["imported_by"]),
+            "symbol_count": len(info["symbols"]),
+            "key_symbols": [{"name": s.name, "kind": s.kind, "line": s.line}
+                            for s in list(info["symbols"].values())[:10]],
+            "same_package": [p for p in self._files
+                             if p != target and str(Path(p).parent) == str(Path(target).parent)],
+        }
+
+    def search_symbol(self, name: str) -> Dict:
+        nl = name.lower()
+        results = []
+        for sn, syms in self._symbols.items():
+            if nl in sn.lower():
+                for s in syms:
+                    results.append({"name": s.name, "kind": s.kind, "file": s.file,
+                                    "line": s.line, "docstring": s.docstring})
+        results.sort(key=lambda x: len(x["name"]))
+        return {"query": name, "count": len(results), "results": results[:15]}
+
+    def trace_callers(self, func_name: str) -> Dict:
+        syms = self._find_symbol(func_name)
+        if not syms:
+            return {"error": f"符号未找到: {func_name}"}
+        callers = []
+        for sym in syms:
+            for c in sym.called_by:
+                parts = c.split("::")
+                callers.append({"file": parts[0], "function": parts[1] if len(parts) > 1 else "?"})
+        return {"target": func_name,
+                "defined_in": [{"file": s.file, "line": s.line} for s in syms],
+                "callers": callers, "count": len(callers),
+                "impact_note": f"修改 {func_name} 可能影响 {len(callers)} 个调用点"}
+
+    def trace_callees(self, func_name: str) -> Dict:
+        syms = self._find_symbol(func_name)
+        if not syms:
+            return {"error": f"符号未找到: {func_name}"}
+        callees = []
+        seen = set()
+        for sym in syms:
+            for c in sym.calls:
+                if c in self._symbols and c not in seen:
+                    seen.add(c)
+                    for t in self._symbols[c]:
+                        callees.append({"name": c, "file": t.file, "line": t.line})
+        return {"target": func_name, "callees": callees, "count": len(callees)}
+
+    def analyze_impact(self, file_path: str) -> Dict:
+        target = self._match_file(file_path)
+        if not target:
+            return {"error": f"文件未找到: {file_path}"}
+        info = self._files[target]
+        callers = {}
+        for sn, sym in info["symbols"].items():
+            if sym.called_by:
+                callers[sn] = sym.called_by
+        return {
+            "target": target,
+            "direct_dependents": sorted(info["imported_by"]),
+            "callers_of_my_symbols": callers,
+            "same_package_files": [p for p in self._files
+                                   if p != target and str(Path(p).parent) == str(Path(target).parent)],
+            "summary": f"修改 {target} 可能影响 {len(info['imported_by'])} 个直接依赖文件"
+                       + (f" 和 {len(callers)} 个函数的调用者" if callers else ""),
+        }
+
+    def get_stats(self) -> Dict:
+        return {"total_files": len(self._files), "total_symbols": len(self._symbols),
+                "total_import_edges": sum(len(info["imports"]) for info in self._files.values())}
+
+    def list_folder(self, folder_path: str = "") -> Dict:
+        td = folder_path.replace("\\", "/").rstrip("/")
+        dir_files = {}
+        for rel, info in self._files.items():
+            rn = rel.replace("\\", "/")
+            parent = "/".join(rn.split("/")[:-1])
+            if td == "" or parent == td or rn.startswith(td + "/") or rn == td:
+                dir_files[rel] = info
+        if not dir_files:
+            return {"folder": folder_path, "files": 0, "modules": []}
+        modules = []
+        for rel, info in sorted(dir_files.items()):
+            syms = [{"name": sn, "kind": s.kind, "line": s.line, "calls": s.calls[:5]}
+                    for sn, s in sorted(info["symbols"].items())]
+            modules.append({"file": rel, "imports": [m for m in info["imports"].keys()][:8],
+                            "imported_by": sorted(info["imported_by"])[:5], "symbols": syms})
+        return {"folder": folder_path or "(root)", "files": len(dir_files),
+                "total_symbols": sum(len(m["symbols"]) for m in modules), "modules": modules}
+
+
+_graph_cache: Dict[str, ProjectGraph] = {}
+
+def get_graph(project_root: str = ".") -> ProjectGraph:
+    root_abs = str(Path(project_root).resolve())
+    if root_abs not in _graph_cache:
+        _graph_cache[root_abs] = ProjectGraph(root_abs).build()
+    return _graph_cache[root_abs]
+
+
+class CodeGraphTool(BaseTool):
+    """代码图谱分析工具集"""
+
+    def __init__(self, project_root: str = "."):
+        self._project_root = project_root
+        self._graph: Optional[ProjectGraph] = None
+        self._handlers = {
+            "code_graph_related": self._handle_related,
+            "code_graph_symbol": self._handle_symbol,
+            "code_graph_callers": self._handle_callers,
+            "code_graph_callees": self._handle_callees,
+            "code_graph_impact": self._handle_impact,
+            "code_graph_folder": self._handle_folder,
+            "code_graph_stats": self._handle_stats,
+        }
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "code_graph"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_CODE
+
+    @property
+    def is_read(self) -> bool:
+        return True
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="code_graph_related",
+                description="查询文件的所有 import 关系和同包文件。",
+                parameters=[ToolParameter("path", "string", "文件路径", required=True)],
+                is_read=True,
+                examples=['code_graph_related(path="app.py")'],
+            ),
+            ToolDefinition(
+                name="code_graph_symbol",
+                description="搜索函数/类符号的定义位置。",
+                parameters=[ToolParameter("symbol", "string", "函数名或类名", required=True)],
+                is_read=True,
+                examples=['code_graph_symbol(symbol="main")', 'code_graph_symbol(symbol="UserService")'],
+            ),
+            ToolDefinition(
+                name="code_graph_callers",
+                description="追踪某个函数被谁调用了（调用链反向追溯）。",
+                parameters=[ToolParameter("symbol", "string", "函数名", required=True)],
+                is_read=True,
+                examples=['code_graph_callers(symbol="validate_user")'],
+            ),
+            ToolDefinition(
+                name="code_graph_callees",
+                description="追踪某个函数调用了哪些其他函数。",
+                parameters=[ToolParameter("symbol", "string", "函数名", required=True)],
+                is_read=True,
+                examples=['code_graph_callees(symbol="main")'],
+            ),
+            ToolDefinition(
+                name="code_graph_impact",
+                description="分析修改某个文件可能的影响范围（哪些文件会受影响）。",
+                parameters=[ToolParameter("path", "string", "文件路径", required=True)],
+                is_read=True,
+                examples=['code_graph_impact(path="app.py")'],
+            ),
+            ToolDefinition(
+                name="code_graph_folder",
+                description="列出文件夹的代码结构：模块 → 类 → 函数。",
+                parameters=[ToolParameter("path", "string", "文件夹路径（相对路径，空=根目录）", required=False)],
+                is_read=True,
+                examples=['code_graph_folder()', 'code_graph_folder(path="engine/tool")'],
+            ),
+            ToolDefinition(
+                name="code_graph_stats",
+                description="项目代码图谱概览（文件数、符号数、依赖边数）。",
+                parameters=[],
+                is_read=True,
+                examples=['code_graph_stats()'],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            graph = self._get_graph()
+            result = handler(graph, **kwargs)
+            if isinstance(result, dict) and "error" in result:
+                return ToolResult.fail(call_id, tool_name, result["error"])
+            return ToolResult.ok(call_id, tool_name, result)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    def _get_graph(self) -> ProjectGraph:
+        if self._graph is None:
+            self._graph = get_graph(self._project_root)
+        return self._graph
+
+    @staticmethod
+    def _handle_related(graph: ProjectGraph, path: str) -> Dict:
+        return graph.find_related(path)
+
+    @staticmethod
+    def _handle_symbol(graph: ProjectGraph, symbol: str) -> Dict:
+        return graph.search_symbol(symbol)
+
+    @staticmethod
+    def _handle_callers(graph: ProjectGraph, symbol: str) -> Dict:
+        return graph.trace_callers(symbol)
+
+    @staticmethod
+    def _handle_callees(graph: ProjectGraph, symbol: str) -> Dict:
+        return graph.trace_callees(symbol)
+
+    @staticmethod
+    def _handle_impact(graph: ProjectGraph, path: str) -> Dict:
+        return graph.analyze_impact(path)
+
+    @staticmethod
+    def _handle_folder(graph: ProjectGraph, path: str = "") -> Dict:
+        return graph.list_folder(path)
+
+    @staticmethod
+    def _handle_stats(graph: ProjectGraph) -> Dict:
+        return graph.get_stats()
+
+
+================================================================================
+# FILE: code_tool.py
+================================================================================
+"""
+代码编辑工具（原子工具版）
+
+原子工具:
+  code_read      — 读取代码文件
+  code_diff      — 预览代码修改差异
+  code_write     — 提交代码修改（带备份）
+  code_rollback  — 回滚代码修改
+  code_append    — 追加代码
+  code_create    — 创建代码文件
+"""
+
+import os
+import difflib
+import shutil
+import logging
+from typing import Any, Dict, List
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_CODE,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class CodeTool(BaseTool):
+    """代码编辑工具集（安全流程：read → diff → write → rollback）"""
+
+    _history: List[Dict] = []
+
+    def __init__(self):
+        self._handlers = {
+            "code_read": self._handle_read,
+            "code_diff": self._handle_diff,
+            "code_write": self._handle_write,
+            "code_rollback": self._handle_rollback,
+            "code_append": self._handle_append,
+            "code_create": self._handle_create,
+        }
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "code"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_CODE
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="code_read",
+                description="专门用于编程语言代码文件（.py, .js, .ts, .java, .go 等）。自动提取类/函数结构。非代码文件（日志/配置/数据）请用 file_read。",
+                parameters=[
+                    ToolParameter("path", "string", "文件路径", required=True),
+                    ToolParameter("start_line", "number", "起始行，默认 1", required=False),
+                    ToolParameter("end_line", "number", "结束行，默认全部", required=False),
+                ],
+                is_read=True,
+                examples=['code_read(path="app.py")', 'code_read(path="app.py", start_line=10, end_line=50)'],
+            ),
+            ToolDefinition(
+                name="code_diff",
+                description="预览代码文件的修改差异（不修改文件）。通过 old_text/new_text 精确替换。非代码文件对比请用 file_diff。",
+                parameters=[
+                    ToolParameter("path", "string", "文件路径", required=True),
+                    ToolParameter("old_text", "string", "要替换的旧代码", required=True),
+                    ToolParameter("new_text", "string", "替换后的新代码", required=True),
+                ],
+                is_read=True,
+                examples=['code_diff(path="app.py", old_text="旧代码", new_text="新代码")'],
+                constraints=["old_text 必须在文件中唯一匹配，否则会报错"],
+            ),
+            ToolDefinition(
+                name="code_write",
+                description="提交代码修改（带 .bak 自动备份+回滚）。先用 code_diff 预览再执行。非代码文件写入请用 file_write。",
+                parameters=[
+                    ToolParameter("path", "string", "文件路径", required=True),
+                    ToolParameter("old_text", "string", "要替换的旧代码", required=True),
+                    ToolParameter("new_text", "string", "替换后的新代码", required=True),
+                ],
+                examples=['code_write(path="app.py", old_text="旧代码", new_text="新代码")'],
+                constraints=["先 code_diff 预览再执行", "自动备份到 .bak"],
+            ),
+            ToolDefinition(
+                name="code_rollback",
+                description="回滚最近一次 code_write 修改。支持从 .bak 文件恢复。",
+                parameters=[
+                    ToolParameter("path", "string", "文件路径", required=True),
+                ],
+                examples=['code_rollback(path="app.py")'],
+            ),
+            ToolDefinition(
+                name="code_append",
+                description="追加代码到代码文件末尾（带 .bak 备份）。非代码内容追加请用 file_append。",
+                parameters=[
+                    ToolParameter("path", "string", "文件路径", required=True),
+                    ToolParameter("new_text", "string", "要追加的代码", required=True),
+                ],
+                examples=['code_append(path="app.py", new_text="# 新增函数")'],
+            ),
+            ToolDefinition(
+                name="code_create",
+                description="创建新的代码文件（已有文件自动备份到 .bak）。创建非代码文件请用 file_write。",
+                parameters=[
+                    ToolParameter("path", "string", "文件路径", required=True),
+                    ToolParameter("new_text", "string", "文件完整内容", required=True),
+                ],
+                examples=['code_create(path="new_app.py", new_text="def main():\\n    pass")'],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    async def _handle_read(self, call_id: str, path: str,
+                           start_line: int = 1, end_line: int = None) -> ToolResult:
+        if not os.path.isfile(path):
+            return ToolResult.fail(call_id, "code_read", f"文件不存在: {path}")
+
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        total = len(lines)
+        start = max(0, int(start_line) - 1)
+        end = min(total, int(end_line) if end_line else total)
+        content = "".join(lines[start:end])
+        structure = self._extract_structure(content) if path.endswith(".py") else []
+
+        return ToolResult.ok(call_id, "code_read", {
+            "path": path, "total_lines": total,
+            "lines": f"{start+1}-{end}", "content": content,
+            "structure": structure[:30],
+        })
+
+    async def _handle_diff(self, call_id: str, path: str, old_text: str, new_text: str) -> ToolResult:
+        if not os.path.isfile(path):
+            return ToolResult.fail(call_id, "code_diff", f"文件不存在: {path}")
+
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        count = content.count(old_text)
+        if count == 0:
+            return ToolResult.fail(call_id, "code_diff",
+                "未找到匹配文本。请用 code_read 确认文件内容，复制原文（含缩进和空行）。")
+        if count > 1:
+            return ToolResult.fail(call_id, "code_diff",
+                f"匹配到 {count} 处。请扩大 old_text 范围使其唯一。")
+
+        new_content = content.replace(old_text, new_text, 1)
+        diff = "".join(difflib.unified_diff(
+            content.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=f"a/{path}", tofile=f"b/{path}", n=3,
+        ))
+
+        return ToolResult.ok(call_id, "code_diff", {
+            "path": path, "diff": diff,
+        })
+
+    async def _handle_write(self, call_id: str, path: str, old_text: str, new_text: str) -> ToolResult:
+        if not os.path.isfile(path):
+            return ToolResult.fail(call_id, "code_write", f"文件不存在: {path}")
+
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        count = content.count(old_text)
+        if count == 0:
+            return ToolResult.fail(call_id, "code_write", "未找到匹配文本。先 code_diff 预览确认。")
+        if count > 1:
+            return ToolResult.fail(call_id, "code_write", f"匹配到 {count} 处。请扩大 old_text 范围。")
+
+        bak = path + ".bak"
+        shutil.copy2(path, bak)
+
+        new_content = content.replace(old_text, new_text, 1)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+        self._history.append({"path": path, "backup": bak, "old": old_text, "new": new_text})
+
+        return ToolResult.ok(call_id, "code_write", {
+            "path": path, "status": "已修改", "backup": bak,
+        })
+
+    async def _handle_rollback(self, call_id: str, path: str) -> ToolResult:
+        entry = next((e for e in reversed(self._history) if e["path"] == path), None)
+        if not entry:
+            bak = path + ".bak"
+            if os.path.exists(bak):
+                shutil.copy2(bak, path)
+                return ToolResult.ok(call_id, "code_rollback", {
+                    "path": path, "status": "已从 .bak 恢复",
+                })
+            return ToolResult.fail(call_id, "code_rollback", f"没有 {path} 的编辑记录")
+
+        if os.path.exists(entry["backup"]):
+            shutil.copy2(entry["backup"], path)
+        else:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content.replace(entry["new"], entry["old"], 1))
+
+        self._history.remove(entry)
+        return ToolResult.ok(call_id, "code_rollback", {"path": path, "status": "已回滚"})
+
+    async def _handle_append(self, call_id: str, path: str, new_text: str) -> ToolResult:
+        if not os.path.isfile(path):
+            return ToolResult.fail(call_id, "code_append", f"文件不存在: {path}")
+
+        bak = path + ".bak"
+        shutil.copy2(path, bak)
+
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n" + new_text)
+
+        return ToolResult.ok(call_id, "code_append", {"path": path, "status": "已追加"})
+
+    async def _handle_create(self, call_id: str, path: str, new_text: str) -> ToolResult:
+        if not path:
+            return ToolResult.fail(call_id, "code_create", "需要 path")
+
+        existed = os.path.isfile(path)
+        if existed:
+            shutil.copy2(path, path + ".bak")
+
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_text)
+
+        return ToolResult.ok(call_id, "code_create", {
+            "path": path, "status": "已创建" if not existed else "已覆盖",
+            "size": len(new_text),
+            "backup": path + ".bak" if existed else None,
+        })
+
+    @staticmethod
+    def _extract_structure(content: str) -> List[Dict]:
+        structure = []
+        for line in content.splitlines():
+            s = line.strip()
+            if s.startswith("class ") and s.endswith(":"):
+                structure.append({"type": "class", "name": s[6:-1].split("(")[0].split(":")[0].strip()})
+            elif s.startswith("def ") and s.endswith(":"):
+                structure.append({"type": "function", "name": s[4:-1].split("(")[0].strip()})
+            elif s.startswith("async def ") and s.endswith(":"):
+                structure.append({"type": "async_function", "name": s[11:-1].split("(")[0].strip()})
+        return structure
+
+
+================================================================================
+# FILE: excel_tool.py
+================================================================================
+"""
+Excel 工具（原子工具版）
+
+原子工具:
+  excel_open             — 打开 Excel 文件
+  excel_close            — 关闭 Excel 文件
+  excel_list_sheets      — 列出工作表
+  excel_read_sheet       — 读取工作表数据
+  excel_get_structure    — 获取工作表结构
+  excel_write_cell       — 写入单元格
+  excel_write_by_header  — 按列名写入
+  excel_insert_rows      — 插入行
+  excel_format_range     — 设置单元格格式
+  excel_save             — 保存文件
+
+依赖: xlwings + Excel（Windows）
+"""
+
+import json
+import os
+import logging
+from typing import Any, Dict, List
+
+import xlwings as xw
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_DATA,
+)
+
+logger = logging.getLogger(__name__)
+
+# ── 全局状态 ──
+_open_apps: Dict[str, Any] = {}
+_open_books: Dict[str, Any] = {}
+_ref_map: Dict[str, str] = {}
+
+
+def _safe_quit():
+    for ref in list(_open_books.keys()):
+        try:
+            _open_books[ref].close()
+        except Exception:
+            pass
+    for ref in list(_open_apps.keys()):
+        try:
+            _open_apps[ref].quit()
+        except Exception:
+            pass
+    _open_apps.clear()
+    _open_books.clear()
+    _ref_map.clear()
+
+
+import atexit
+atexit.register(_safe_quit)
+
+
+class ExcelTool(BaseTool):
+    """Excel 操作工具集（基于 xlwings）"""
+
+    def __init__(self):
+        self._handlers = {
+            "excel_open": self._handle_open,
+            "excel_close": self._handle_close,
+            "excel_list_sheets": self._handle_list_sheets,
+            "excel_read_sheet": self._handle_read_sheet,
+            "excel_get_structure": self._handle_get_structure,
+            "excel_write_cell": self._handle_write_cell,
+            "excel_write_by_header": self._handle_write_by_header,
+            "excel_insert_rows": self._handle_insert_rows,
+            "excel_format_range": self._handle_format_range,
+            "excel_save": self._handle_save,
+        }
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "excel"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_DATA
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="excel_open",
+                description="打开 Excel 文件。必须最先调用，获得 ref（引用标识）后才能操作其他工具。",
+                parameters=[
+                    ToolParameter("file_path", "string", "Excel 文件路径", required=True),
+                    ToolParameter("ref", "string", "文件引用标识，后续操作用。默认用文件名", required=False),
+                ],
+                examples=['excel_open(file_path="data.xlsx")', 'excel_open(file_path="report.xlsx", ref="rpt")'],
+                constraints=["必须先调用此工具获得 ref", "操作完毕记得 excel_save + excel_close"],
+            ),
+            ToolDefinition(
+                name="excel_close",
+                description="关闭 Excel 文件，释放资源。关闭前会自动保存。",
+                parameters=[ToolParameter("ref", "string", "文件引用标识", required=True)],
+                examples=['excel_close(ref="data.xlsx")'],
+            ),
+            ToolDefinition(
+                name="excel_list_sheets",
+                description="列出 Excel 文件的所有工作表及其行列数。",
+                parameters=[ToolParameter("ref", "string", "文件引用标识", required=True)],
+                examples=['excel_list_sheets(ref="data.xlsx")'],
+                is_read=True,
+            ),
+            ToolDefinition(
+                name="excel_read_sheet",
+                description="读取工作表数据。支持分页，自动跳过空列。",
+                parameters=[
+                    ToolParameter("ref", "string", "文件引用标识", required=True),
+                    ToolParameter("sheet_name", "string", "工作表名称", required=True),
+                    ToolParameter("start_row", "number", "起始行，默认 1", required=False),
+                    ToolParameter("end_row", "number", "结束行，默认到末尾", required=False),
+                    ToolParameter("header_row", "number", "表头所在行，默认 1", required=False),
+                ],
+                examples=['excel_read_sheet(ref="d", sheet_name="Sheet1", start_row=1, end_row=50)'],
+                is_read=True,
+            ),
+            ToolDefinition(
+                name="excel_get_structure",
+                description="获取工作表结构信息：列名、合并单元格区域等。",
+                parameters=[
+                    ToolParameter("ref", "string", "文件引用标识", required=True),
+                    ToolParameter("sheet_name", "string", "工作表名称", required=True),
+                    ToolParameter("header_row", "number", "表头行，默认 1", required=False),
+                ],
+                is_read=True,
+            ),
+            ToolDefinition(
+                name="excel_write_cell",
+                description="写入单个单元格的值。",
+                parameters=[
+                    ToolParameter("ref", "string", "文件引用标识", required=True),
+                    ToolParameter("sheet_name", "string", "工作表名称", required=True),
+                    ToolParameter("row", "number", "行号（从 1 开始）", required=True),
+                    ToolParameter("column", "number", "列号（从 1 开始）", required=True),
+                    ToolParameter("value", "string", "要写入的值", required=True),
+                ],
+            ),
+            ToolDefinition(
+                name="excel_write_by_header",
+                description="按列名写入一行数据。自动匹配表头，支持模糊匹配。",
+                parameters=[
+                    ToolParameter("ref", "string", "文件引用标识", required=True),
+                    ToolParameter("sheet_name", "string", "工作表名称", required=True),
+                    ToolParameter("row", "number", "写入的行号", required=True),
+                    ToolParameter("data", "object", "列名→值的字典，如 {'姓名': '张三', '年龄': 25}", required=True),
+                    ToolParameter("header_row", "number", "表头行，默认 1", required=False),
+                ],
+                examples=['excel_write_by_header(ref="d", sheet_name="Sheet1", row=5, data={"姓名": "张三"})'],
+            ),
+            ToolDefinition(
+                name="excel_insert_rows",
+                description="在指定行前插入行，自动复制上一行格式（边框、字体、数字格式）。",
+                parameters=[
+                    ToolParameter("ref", "string", "文件引用标识", required=True),
+                    ToolParameter("sheet_name", "string", "工作表名称", required=True),
+                    ToolParameter("start_row", "number", "从第几行开始插入", required=True),
+                    ToolParameter("count", "number", "插入行数，默认 1", required=False),
+                ],
+                constraints=["插入后记得调用 excel_save"],
+            ),
+            ToolDefinition(
+                name="excel_format_range",
+                description="设置单元格格式：字体加粗/大小/颜色、数字格式、对齐方式。",
+                parameters=[
+                    ToolParameter("ref", "string", "文件引用标识", required=True),
+                    ToolParameter("sheet_name", "string", "工作表名称", required=True),
+                    ToolParameter("range", "string", "单元格范围，如 'A1:C10'", required=True),
+                    ToolParameter("font", "object", "字体设置：{bold: true, size: 12, color: '#FF0000'}", required=False),
+                    ToolParameter("number_format", "string", "数字格式，如 '#,##0.00'", required=False),
+                    ToolParameter("alignment", "object", "对齐：{horizontal: 'center', vertical: 'center'}", required=False),
+                ],
+                examples=['excel_format_range(ref="d", sheet_name="Sheet1", range="A1:C1", font={"bold": true})'],
+            ),
+            ToolDefinition(
+                name="excel_save",
+                description="保存 Excel 文件的更改。",
+                parameters=[ToolParameter("ref", "string", "文件引用标识", required=True)],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return handler(call_id, **kwargs)
+        except Exception as e:
+            logger.exception(f"Excel {tool_name} 失败")
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    def _handle_open(self, call_id: str, file_path: str, ref: str = None) -> ToolResult:
+        if ref is None:
+            ref = os.path.basename(file_path)
+
+        if not os.path.isabs(file_path):
+            file_path = os.path.abspath(file_path)
+
+        app = xw.App(visible=False)
+        app.display_alerts = False
+
+        if os.path.exists(file_path):
+            wb = app.books.open(file_path)
+            status = "已打开"
+        else:
+            wb = app.books.add()
+            wb.save(file_path)
+            status = "已创建"
+
+        _ref_map[ref] = file_path
+        _open_apps[ref] = app
+        _open_books[ref] = wb
+
+        sheets = [s.name for s in wb.sheets]
+        return ToolResult.ok(call_id, "excel_open", {
+            "ref": ref, "file_path": file_path, "status": status, "sheets": sheets,
+        })
+
+    def _handle_close(self, call_id: str, ref: str) -> ToolResult:
+        if ref not in _open_books:
+            return ToolResult.fail(call_id, "excel_close", f"未找到打开的文件: {ref}")
+        wb = _open_books.pop(ref)
+        app = _open_apps.pop(ref)
+        _ref_map.pop(ref, None)
+        try:
+            wb.save()
+            wb.close()
+        except Exception:
+            pass
+        try:
+            app.quit()
+        except Exception:
+            pass
+        return ToolResult.ok(call_id, "excel_close", {"ref": ref, "status": "已关闭"})
+
+    def _handle_list_sheets(self, call_id: str, ref: str) -> ToolResult:
+        wb = self._book(ref)
+        if not wb:
+            return self._not_found(call_id, "excel_list_sheets", ref)
+        sheets = []
+        for s in wb.sheets:
+            used = s.used_range
+            sheets.append({
+                "name": s.name,
+                "rows": used.last_cell.row if used else 0,
+                "cols": used.last_cell.column if used else 0,
+            })
+        return ToolResult.ok(call_id, "excel_list_sheets", {"sheets": sheets})
+
+    def _handle_read_sheet(self, call_id: str, ref: str, sheet_name: str,
+                           start_row: int = 1, end_row: int = None,
+                           header_row: int = 1) -> ToolResult:
+        wb = self._book(ref)
+        if not wb:
+            return self._not_found(call_id, "excel_read_sheet", ref)
+        sheet = self._sheet(wb, sheet_name)
+        if not sheet:
+            return ToolResult.fail(call_id, "excel_read_sheet", f"工作表不存在: {sheet_name}")
+
+        used = sheet.used_range
+        total_rows = used.last_cell.row if used else 0
+        total_cols = used.last_cell.column if used else 0
+        if end_row is None:
+            end_row = total_rows
+        end_row = min(end_row, total_rows)
+
+        raw = sheet.range((start_row, 1), (end_row, total_cols)).value
+        if not isinstance(raw, list):
+            raw = [[raw]]
+
+        valid_cols = []
+        col_names = {}
+        for c in range(total_cols):
+            col_data = [raw[r][c] for r in range(len(raw)) if r < len(raw) and c < len(raw[r])]
+            if any(v is not None for v in col_data):
+                valid_cols.append(c)
+                if start_row <= header_row <= end_row:
+                    hv = None
+                    for r in range(len(raw)):
+                        if start_row + r == header_row:
+                            hv = raw[r][c]
+                            break
+                    col_names[c] = str(hv) if hv is not None else f"Col{c+1}"
+                else:
+                    col_names[c] = f"Col{c+1}"
+
+        rows = []
+        for ri, rd in enumerate(raw):
+            cells = {}
+            for c in valid_cols:
+                cells[col_names[c]] = rd[c] if c < len(rd) else None
+            rows.append({"row": start_row + ri, **cells})
+
+        return ToolResult.ok(call_id, "excel_read_sheet", {
+            "sheet": sheet_name, "total_rows": total_rows, "total_cols": total_cols,
+            "range": f"{start_row}-{end_row}", "columns": list(col_names.values()), "rows": rows,
+        })
+
+    def _handle_get_structure(self, call_id: str, ref: str, sheet_name: str,
+                              header_row: int = 1) -> ToolResult:
+        wb = self._book(ref)
+        if not wb:
+            return self._not_found(call_id, "excel_get_structure", ref)
+        sheet = self._sheet(wb, sheet_name)
+        if not sheet:
+            return ToolResult.fail(call_id, "excel_get_structure", f"工作表不存在: {sheet_name}")
+
+        used = sheet.used_range
+        total_rows = used.last_cell.row if used else 0
+        total_cols = used.last_cell.column if used else 0
+
+        headers = []
+        for c in range(1, total_cols + 1):
+            v = sheet.range((header_row, c)).value
+            headers.append({"col": c, "name": str(v) if v is not None else f"Col{c}"})
+
+        merged = []
+        try:
+            for mg in sheet.used_range.api.MergeAreas:
+                merged.append(mg.Address.replace("$", ""))
+        except Exception:
+            pass
+
+        return ToolResult.ok(call_id, "excel_get_structure", {
+            "sheet": sheet_name, "total_rows": total_rows, "total_cols": total_cols,
+            "headers": headers, "merged_cells": merged[:20],
+        })
+
+    def _handle_write_cell(self, call_id: str, ref: str, sheet_name: str,
+                           row: int, column: int, value: str) -> ToolResult:
+        wb = self._book(ref)
+        if not wb:
+            return self._not_found(call_id, "excel_write_cell", ref)
+        sheet = self._sheet(wb, sheet_name)
+        if not sheet:
+            return ToolResult.fail(call_id, "excel_write_cell", f"工作表不存在: {sheet_name}")
+        sheet.range((row, column)).value = value
+        return ToolResult.ok(call_id, "excel_write_cell", {
+            "sheet": sheet_name, "row": row, "col": column, "value": str(value)[:100],
+        })
+
+    def _handle_write_by_header(self, call_id: str, ref: str, sheet_name: str,
+                                row: int, data: dict, header_row: int = 1) -> ToolResult:
+        wb = self._book(ref)
+        if not wb:
+            return self._not_found(call_id, "excel_write_by_header", ref)
+        sheet = self._sheet(wb, sheet_name)
+        if not sheet:
+            return ToolResult.fail(call_id, "excel_write_by_header", f"工作表不存在: {sheet_name}")
+
+        used = sheet.used_range
+        max_col = used.last_cell.column if used else 0
+        col_map = {}
+        for c in range(1, max_col + 1):
+            v = sheet.range((header_row, c)).value
+            if v is not None:
+                col_map[str(v)] = c
+
+        written = 0
+        for col_name, val in data.items():
+            if col_name in col_map:
+                sheet.range((row, col_map[col_name])).value = val
+                written += 1
+            else:
+                for hdr, ci in col_map.items():
+                    if col_name.lower() in hdr.lower() or hdr.lower() in col_name.lower():
+                        sheet.range((row, ci)).value = val
+                        written += 1
+                        break
+
+        return ToolResult.ok(call_id, "excel_write_by_header", {
+            "sheet": sheet_name, "row": row, "written": written,
+        })
+
+    def _handle_insert_rows(self, call_id: str, ref: str, sheet_name: str,
+                            start_row: int, count: int = 1) -> ToolResult:
+        wb = self._book(ref)
+        if not wb:
+            return self._not_found(call_id, "excel_insert_rows", ref)
+        sheet = self._sheet(wb, sheet_name)
+        if not sheet:
+            return ToolResult.fail(call_id, "excel_insert_rows", f"工作表不存在: {sheet_name}")
+
+        if start_row <= 1:
+            start_row = 2
+
+        source_row = start_row - 1
+        sheet.range(f"{source_row}:{source_row}").copy()
+        sheet.range(f"{start_row}:{start_row + count - 1}").api.Insert()
+        target = sheet.range(f"{start_row}:{start_row + count - 1}")
+        target.api.PasteSpecial(Paste=-4122)
+        try:
+            wb.app.api.CutCopyMode = False
+        except Exception:
+            pass
+
+        return ToolResult.ok(call_id, "excel_insert_rows", {
+            "sheet": sheet_name, "start_row": start_row, "count": count,
+            "format_from": source_row,
+        })
+
+    def _handle_format_range(self, call_id: str, ref: str, sheet_name: str,
+                             range: str, font: dict = None,
+                             number_format: str = None, alignment: dict = None) -> ToolResult:
+        wb = self._book(ref)
+        if not wb:
+            return self._not_found(call_id, "excel_format_range", ref)
+        sheet = self._sheet(wb, sheet_name)
+        if not sheet:
+            return ToolResult.fail(call_id, "excel_format_range", f"工作表不存在: {sheet_name}")
+
+        rng = sheet.range(range)
+
+        if font:
+            if "bold" in font:
+                rng.api.Font.Bold = font["bold"]
+            if "size" in font:
+                rng.api.Font.Size = font["size"]
+            if "name" in font:
+                rng.api.Font.Name = font["name"]
+            if "color" in font:
+                rng.api.Font.Color = self._rgb(font["color"])
+        if number_format:
+            rng.api.NumberFormat = number_format
+        if alignment:
+            h_map = {"left": -4131, "center": -4108, "right": -4152}
+            v_map = {"top": -4160, "center": -4108, "bottom": -4107}
+            if "horizontal" in alignment:
+                rng.api.HorizontalAlignment = h_map.get(alignment["horizontal"], -4108)
+            if "vertical" in alignment:
+                rng.api.VerticalAlignment = v_map.get(alignment["vertical"], -4108)
+
+        return ToolResult.ok(call_id, "excel_format_range", {
+            "range": range, "sheet": sheet_name,
+        })
+
+    def _handle_save(self, call_id: str, ref: str) -> ToolResult:
+        wb = self._book(ref)
+        if not wb:
+            return self._not_found(call_id, "excel_save", ref)
+        wb.save()
+        return ToolResult.ok(call_id, "excel_save", {"status": "已保存", "file_path": wb.fullname})
+
+    @staticmethod
+    def _rgb(color):
+        if isinstance(color, int):
+            return color
+        if isinstance(color, str) and color.startswith("#"):
+            r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+            return r + (g << 8) + (b << 16)
+        return 0
+
+    @staticmethod
+    def _book(ref: str):
+        return _open_books.get(ref)
+
+    @staticmethod
+    def _sheet(wb, name: str):
+        try:
+            return wb.sheets[name]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _not_found(call_id, tool_name, ref):
+        return ToolResult.fail(call_id, tool_name, f"文件未打开: {ref}。请先用 excel_open 打开文件")
+
+
+================================================================================
+# FILE: file_tool.py
+================================================================================
+"""
+文件工具（原子工具版）
+
+原子工具:
+  file_list    — 列出目录文件
+  file_read    — 读取文件内容
+  file_glob    — 通配匹配文件
+  file_write   — 写入文件（覆盖）
+  file_append  — 追加内容到文件
+  file_rename  — 重命名/移动文件
+  file_diff    — 对比两个文件
+"""
+
+import os
+import difflib
+import shutil
+import fnmatch
+import logging
+from typing import List
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_FILE,
+)
+
+logger = logging.getLogger(__name__)
+
+_EXCLUDE_DIRS = {'.git', '__pycache__', 'node_modules', '.venv', 'venv',
+                 '.idea', '.vscode', 'dist', 'build', '.egg-info'}
+
+
+class FileTool(BaseTool):
+    """文件操作工具集"""
+
+    def __init__(self):
+        self._handlers = {
+            "file_list": self._handle_list,
+            "file_read": self._handle_read,
+            "file_glob": self._handle_glob,
+            "file_write": self._handle_write,
+            "file_append": self._handle_append,
+            "file_rename": self._handle_rename,
+            "file_diff": self._handle_diff,
+        }
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "file"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_FILE
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="file_list",
+                description="列出指定目录下的文件。支持通配符过滤。不传 path 默认当前目录。",
+                parameters=[
+                    ToolParameter("pattern", "string", "文件匹配模式，如 '*.py'，默认 '*'", required=False),
+                    ToolParameter("path", "string", "目标目录路径，默认当前目录", required=False),
+                    ToolParameter("recursive", "boolean", "是否递归子目录，默认 true", required=False),
+                ],
+                is_read=True,
+                examples=['file_list()', 'file_list(pattern="*.py")', 'file_list(path="C:/Downloads", pattern="*.pdf")'],
+            ),
+            ToolDefinition(
+                name="file_read",
+                description="读取任意文件内容（日志/配置/文档/数据等）。支持指定行范围。读取代码文件建议用 code_read（会提取类/函数结构）。",
+                parameters=[
+                    ToolParameter("path", "string", "文件路径", required=True),
+                    ToolParameter("start_line", "number", "起始行号，默认 1", required=False),
+                    ToolParameter("end_line", "number", "结束行号，默认到文件末尾", required=False),
+                ],
+                is_read=True,
+                examples=[
+                    'file_read(path="app.py")',
+                    'file_read(path="app.py", start_line=10, end_line=50)',
+                ],
+            ),
+            ToolDefinition(
+                name="file_glob",
+                description="使用通配符匹配文件路径。支持 ** 递归匹配。",
+                parameters=[
+                    ToolParameter("pattern", "string", "通配符模式，如 '**/*.py'，默认 '*'", required=True),
+                    ToolParameter("path", "string", "搜索起始目录，默认当前目录", required=False),
+                ],
+                is_read=True,
+                examples=['file_glob(pattern="**/*.py")', 'file_glob(pattern="src/**/*.ts")'],
+            ),
+            ToolDefinition(
+                name="file_write",
+                description="写入/覆盖任意文件内容（日志/配置/文档/数据等）。自动创建不存在的目录。修改代码文件建议用 code_write（带备份和回滚）。",
+                parameters=[
+                    ToolParameter("path", "string", "文件路径", required=True),
+                    ToolParameter("content", "string", "要写入的内容", required=True),
+                ],
+                examples=[
+                    'file_write(path="hello.txt", content="Hello World")',
+                ],
+                constraints=["此操作会覆盖已有文件！如需追加请用 file_append"],
+            ),
+            ToolDefinition(
+                name="file_append",
+                description="追加内容到任意文件末尾。如果文件不存在会自动创建。追加代码建议用 code_append（带备份）。",
+                parameters=[
+                    ToolParameter("path", "string", "文件路径", required=True),
+                    ToolParameter("content", "string", "要追加的内容", required=True),
+                ],
+                examples=['file_append(path="log.txt", content="新日志行")'],
+            ),
+            ToolDefinition(
+                name="file_rename",
+                description="重命名或移动文件。支持跨目录移动。",
+                parameters=[
+                    ToolParameter("path", "string", "当前文件路径", required=True),
+                    ToolParameter("new_path", "string", "新文件路径（或新文件名）", required=True),
+                ],
+                examples=['file_rename(path="old.txt", new_path="new.txt")'],
+                constraints=["目标路径已存在时会报错"],
+            ),
+            ToolDefinition(
+                name="file_diff",
+                description="对比两个任意文件的差异，输出 unified diff 格式。代码文件差异预览建议用 code_diff。",
+                parameters=[
+                    ToolParameter("path_a", "string", "第一个文件路径", required=True),
+                    ToolParameter("path_b", "string", "第二个文件路径", required=True),
+                ],
+                is_read=True,
+                examples=['file_diff(path_a="v1.py", path_b="v2.py")'],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    async def _handle_list(self, call_id: str, pattern: str = "*", path: str = "", recursive: bool = True) -> ToolResult:
+        if "*" not in pattern and "?" not in pattern:
+            pattern = f"*{pattern}*"
+
+        results = []
+        root = path.strip() if path and path.strip() else "."
+        for r, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in _EXCLUDE_DIRS and not d.startswith(".")]
+            for f in files:
+                if fnmatch.fnmatch(f, pattern):
+                    fpath = os.path.join(r, f)
+                    try:
+                        stat = os.stat(fpath)
+                        results.append({
+                            "name": f, "path": self._rel(fpath),
+                            "size": stat.st_size, "modified": stat.st_mtime,
+                        })
+                    except Exception:
+                        results.append({"name": f, "path": self._rel(fpath)})
+            if not recursive:
+                break
+
+        results.sort(key=lambda x: x["path"])
+        results = results[:100]
+
+        return ToolResult.ok(call_id, "file_list", {
+            "pattern": pattern, "count": len(results), "files": results,
+        })
+
+    async def _handle_read(self, call_id: str, path: str,
+                           start_line: int = 1, end_line: int = None) -> ToolResult:
+        path = self._safe(path)
+        if not path or not os.path.exists(path):
+            return ToolResult.fail(call_id, "file_read", f"文件不存在: {path}")
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except Exception as e:
+            return ToolResult.fail(call_id, "file_read", str(e))
+
+        total = len(lines)
+        start = max(0, int(start_line) - 1)
+        end = min(total, int(end_line) if end_line else total)
+        content = "".join(lines[start:end])
+
+        return ToolResult.ok(call_id, "file_read", {
+            "path": path, "total_lines": total,
+            "lines": f"{start+1}-{end}", "content": content,
+        })
+
+    async def _handle_glob(self, call_id: str, pattern: str, path: str = ".") -> ToolResult:
+        results = []
+        base = path if os.path.isdir(path) else os.path.dirname(path) or "."
+
+        if "**" in pattern:
+            for root, dirs, files in os.walk(base):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                for f in files:
+                    fp = os.path.join(root, f)
+                    rel = self._rel(os.path.relpath(fp, base))
+                    if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(fp, pattern):
+                        results.append(rel)
+                        if len(results) >= 200:
+                            break
+                if len(results) >= 200:
+                    break
+        else:
+            try:
+                for f in os.listdir(base):
+                    fp = os.path.join(base, f)
+                    if os.path.isfile(fp) and fnmatch.fnmatch(f, pattern):
+                        results.append(f)
+            except FileNotFoundError:
+                return ToolResult.fail(call_id, "file_glob", f"目录不存在: {base}")
+
+        return ToolResult.ok(call_id, "file_glob", {
+            "pattern": pattern, "base": base,
+            "matches": len(results), "results": results,
+        })
+
+    async def _handle_write(self, call_id: str, path: str, content: str) -> ToolResult:
+        if not path:
+            return ToolResult.fail(call_id, "file_write", "需要 path 参数")
+
+        path = self._safe(path)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        existed = os.path.exists(path)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        return ToolResult.ok(call_id, "file_write", {
+            "path": path, "size": len(content),
+            "status": "已覆盖" if existed else "已创建",
+        })
+
+    async def _handle_append(self, call_id: str, path: str, content: str) -> ToolResult:
+        path = self._safe(path)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+        old_size = os.path.getsize(path) if os.path.exists(path) else 0
+        need_newline = False
+        if old_size > 0:
+            with open(path, "rb") as f:
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    need_newline = True
+
+        with open(path, "a", encoding="utf-8") as f:
+            if need_newline:
+                f.write("\n")
+            f.write(content)
+            if not content.endswith("\n"):
+                f.write("\n")
+
+        return ToolResult.ok(call_id, "file_append", {
+            "path": path, "old_size": old_size,
+            "new_size": os.path.getsize(path), "status": "已追加",
+        })
+
+    async def _handle_rename(self, call_id: str, path: str, new_path: str) -> ToolResult:
+        path = self._safe(path)
+        new_path = self._safe(new_path)
+
+        if not os.path.exists(path):
+            return ToolResult.fail(call_id, "file_rename", f"源文件不存在: {path}")
+        if os.path.normpath(path) == os.path.normpath(new_path):
+            return ToolResult.fail(call_id, "file_rename", "源路径和目标路径相同")
+        if os.path.exists(new_path):
+            return ToolResult.fail(call_id, "file_rename", f"目标路径已存在: {new_path}")
+
+        try:
+            os.makedirs(os.path.dirname(new_path) or ".", exist_ok=True)
+            shutil.move(path, new_path)
+            return ToolResult.ok(call_id, "file_rename", {
+                "from": path, "to": new_path, "status": "已完成",
+            })
+        except Exception as e:
+            return ToolResult.fail(call_id, "file_rename", str(e))
+
+    async def _handle_diff(self, call_id: str, path_a: str, path_b: str) -> ToolResult:
+        if not path_a or not os.path.exists(path_a):
+            return ToolResult.fail(call_id, "file_diff", f"文件 A 不存在: {path_a}")
+        if not path_b or not os.path.exists(path_b):
+            return ToolResult.fail(call_id, "file_diff", f"文件 B 不存在: {path_b}")
+
+        try:
+            with open(path_a, "r", encoding="utf-8", errors="replace") as f:
+                lines_a = f.readlines()
+            with open(path_b, "r", encoding="utf-8", errors="replace") as f:
+                lines_b = f.readlines()
+        except Exception as e:
+            return ToolResult.fail(call_id, "file_diff", str(e))
+
+        diff = "".join(difflib.unified_diff(
+            lines_a, lines_b, fromfile=path_a, tofile=path_b, n=3,
+        ))
+
+        return ToolResult.ok(call_id, "file_diff", {
+            "path_a": path_a, "path_b": path_b,
+            "diff": diff, "identical": not diff.strip(),
+        })
+
+    @staticmethod
+    def _safe(path: str) -> str:
+        if not path:
+            return path
+        try:
+            return os.path.abspath(path)
+        except (ValueError, OSError):
+            return os.path.normpath(os.path.join(os.getcwd(), path))
+
+    @staticmethod
+    def _rel(path: str) -> str:
+        try:
+            return os.path.relpath(path)
+        except (ValueError, OSError):
+            return path
+
+
+================================================================================
+# FILE: git_tool.py
+================================================================================
+"""
+Git 工具（原子工具版）
+
+原子工具:
+  git_status  — 查看工作区状态
+  git_commit  — 提交修改
+  git_push    — 推送到远程
+"""
+
+import os
+import logging
+from typing import List
+
+from engine.tool.base import BaseTool, ToolDefinition, ToolParameter, ToolResult
+
+logger = logging.getLogger("jarvis.tools.git")
+
+
+class GitTool(BaseTool):
+    """Git 操作工具集"""
+
+    def __init__(self):
+        self._handlers = {
+            "git_status": self._handle_status,
+            "git_commit": self._handle_commit,
+            "git_push": self._handle_push,
+        }
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "git"
+
+    @property
+    def category(self) -> str:
+        return "version"
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="git_status",
+                description="查看 Git 仓库工作区状态（修改/新增/删除的文件）。",
+                parameters=[
+                    ToolParameter("path", "string", "仓库路径，默认当前目录", required=False),
+                ],
+                is_read=True,
+                examples=['git_status()', 'git_status(path="/home/project")'],
+            ),
+            ToolDefinition(
+                name="git_commit",
+                description="提交修改到本地仓库。自动执行 git add . 再 commit。",
+                parameters=[
+                    ToolParameter("message", "string", "提交信息", required=True),
+                    ToolParameter("path", "string", "仓库路径，默认当前目录", required=False),
+                    ToolParameter("add_all", "boolean", "是否自动 git add .，默认 true", required=False),
+                ],
+                examples=['git_commit(message="fix: 修复登录bug")'],
+                constraints=["提交前请确保有文件修改"],
+            ),
+            ToolDefinition(
+                name="git_push",
+                description="推送本地提交到远程仓库。",
+                parameters=[
+                    ToolParameter("path", "string", "仓库路径，默认当前目录", required=False),
+                    ToolParameter("remote", "string", "远程名称，默认 origin", required=False),
+                    ToolParameter("branch", "string", "分支名，默认当前分支", required=False),
+                ],
+                examples=['git_push()', 'git_push(branch="main")'],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            logger.exception("Git 失败")
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    async def _handle_status(self, call_id: str, path: str = ".") -> ToolResult:
+        import subprocess
+        result = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=path, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return ToolResult.fail(call_id, "git_status", f"git status 失败: {result.stderr.strip()}")
+        return ToolResult.ok(call_id, "git_status", {
+            "status": result.stdout.strip() or "工作区干净，无修改",
+        })
+
+    async def _handle_commit(self, call_id: str, message: str, path: str = ".",
+                             add_all: bool = True) -> ToolResult:
+        import subprocess
+        if add_all:
+            add = subprocess.run(
+                ["git", "add", "."], cwd=path,
+                capture_output=True, text=True, timeout=30
+            )
+            if add.returncode != 0:
+                return ToolResult.fail(call_id, "git_commit", f"git add 失败: {add.stderr.strip()}")
+        if not message:
+            return ToolResult.fail(call_id, "git_commit", "commit 需要 message 参数")
+        result = subprocess.run(
+            ["git", "commit", "-m", message],
+            cwd=path, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return ToolResult.fail(call_id, "git_commit", f"git commit 失败: {result.stderr.strip()}")
+        return ToolResult.ok(call_id, "git_commit", {
+            "message": message,
+            "output": result.stdout.strip(),
+        })
+
+    async def _handle_push(self, call_id: str, path: str = ".", remote: str = "origin",
+                           branch: str = "") -> ToolResult:
+        import subprocess
+        cmd = ["git", "push", remote]
+        if branch:
+            cmd.append(branch)
+        result = subprocess.run(
+            cmd, cwd=path,
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode != 0:
+            return ToolResult.fail(call_id, "git_push", f"git push 失败: {result.stderr.strip()}")
+        return ToolResult.ok(call_id, "git_push", {
+            "remote": remote,
+            "branch": branch or "当前分支",
+            "output": result.stdout.strip(),
+        })
+
+
+================================================================================
+# FILE: image_tool.py
+================================================================================
+"""
+图片工具（原子工具版）
+
+原子工具:
+  image_read  — 读取图片信息（尺寸、格式、base64）
+  image_ocr   — 识别图片中的文字
+"""
+
+import os
+import base64
+import logging
+from typing import List
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_DATA,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ImageTool(BaseTool):
+    """图片工具集"""
+
+    def __init__(self):
+        self.api_key = os.environ.get("QWEN_API_KEY", os.environ.get("DASHSCOPE_API_KEY", ""))
+        self._handlers = {
+            "image_read": self._handle_read,
+            "image_ocr": self._handle_ocr,
+        }
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "image"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_DATA
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="image_read",
+                description="读取图片信息：尺寸、格式、base64 编码。支持 jpg/png/bmp/gif/webp。",
+                parameters=[
+                    ToolParameter("path", "string", "图片路径", required=True),
+                ],
+                is_read=True,
+                examples=['image_read(path="photo.png")'],
+            ),
+            ToolDefinition(
+                name="image_ocr",
+                description="使用 AI 识别图片中的文字。需要配置 QWEN_API_KEY。",
+                parameters=[
+                    ToolParameter("path", "string", "图片路径", required=True),
+                    ToolParameter("prompt", "string", "识别提示，如'提取发票金额和日期'", required=False),
+                ],
+                is_read=True,
+                examples=['image_ocr(path="invoice.jpg", prompt="提取发票金额")'],
+                constraints=["需要配置 QWEN_API_KEY 环境变量"],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            path = kwargs.get("path", "")
+            if not path or not os.path.exists(path):
+                return ToolResult.fail(call_id, tool_name, f"文件不存在: {path}")
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    async def _handle_read(self, call_id: str, path: str) -> ToolResult:
+        ext = os.path.splitext(path)[1].lower()
+        result = {
+            "path": path,
+            "size_bytes": os.path.getsize(path),
+            "format": ext,
+        }
+
+        try:
+            from PIL import Image
+            with Image.open(path) as img:
+                result["width"] = img.width
+                result["height"] = img.height
+                result["mode"] = img.mode
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        if result["size_bytes"] < 5 * 1024 * 1024:
+            with open(path, "rb") as f:
+                result["base64"] = base64.b64encode(f.read()).decode("utf-8")
+            mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                    ".bmp": "image/bmp", ".webp": "image/webp", ".gif": "image/gif"}
+            result["mime_type"] = mime.get(ext, "application/octet-stream")
+
+        return ToolResult.ok(call_id, "image_read", result)
+
+    async def _handle_ocr(self, call_id: str, path: str, prompt: str = "请提取图中的所有文字") -> ToolResult:
+        if not self.api_key:
+            return ToolResult.fail(call_id, "image_ocr",
+                "需要配置 QWEN_API_KEY 或 DASHSCOPE_API_KEY")
+
+        try:
+            import dashscope
+            from dashscope import MultiModalConversation
+
+            dashscope.api_key = self.api_key
+            response = MultiModalConversation.call(
+                model="qwen-vl-max",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"image": f"file://{os.path.abspath(path)}"},
+                        {"text": prompt},
+                    ],
+                }],
+                max_tokens=4096,
+            )
+
+            if response.status_code == 200:
+                text = response.output.choices[0].message.content[0].get("text", "")
+                return ToolResult.ok(call_id, "image_ocr", {
+                    "path": path,
+                    "text": text,
+                })
+
+            return ToolResult.fail(call_id, "image_ocr", f"OCR 失败: {response.message}")
+
+        except ImportError:
+            return ToolResult.fail(call_id, "image_ocr", "需要 dashscope: pip install dashscope")
+        except Exception as e:
+            return ToolResult.fail(call_id, "image_ocr", str(e))
+
+
+================================================================================
+# FILE: pdf_tool.py
+================================================================================
+"""
+PDF 工具（原子工具版）
+
+原子工具:
+  pdf_read    — 读取 PDF 文件内容
+  pdf_split   — 拆分 PDF 文件
+  pdf_concat  — 合并多个 PDF 文件
+
+v3.1: 新增 pdf_split / pdf_concat；PyPDF2 → pypdf 迁移
+"""
+
+import os
+import logging
+from typing import Any, Dict, List, Tuple
+
+from engine.tool.base import BaseTool, ToolDefinition, ToolParameter, ToolResult
+
+# PyPDF2 已停止维护，迁移到 pypdf（API 完全兼容）
+try:
+    import pypdf as PyPDF2
+except ImportError:
+    import PyPDF2
+
+logger = logging.getLogger("jarvis.tools.pdf")
+
+
+class PdfTool(BaseTool):
+    """PDF 文档工具集"""
+
+    def __init__(self):
+        self._handlers = {
+            "pdf_read": self._handle_read,
+            "pdf_split": self._handle_split,
+            "pdf_concat": self._handle_concat,
+        }
+
+    @property
+    def name(self) -> str:
+        return "pdf"
+
+    @property
+    def category(self) -> str:
+        return "data"
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="pdf_read",
+                description="读取 PDF 文件内容。支持文本提取、表格提取、扫描件检测。自动降级（pdfplumber → pypdf）。",
+                parameters=[
+                    ToolParameter("path", "string", "PDF 文件路径", required=True),
+                    ToolParameter("max_pages", "number", "最大读取页数，默认 10", required=False),
+                    ToolParameter("extract_tables", "boolean", "是否提取表格（银行询证函建议开启）", required=False),
+                    ToolParameter("keywords", "string", "逗号分隔的关键词，优先保留含这些词的页面", required=False),
+                ],
+                is_read=True,
+                examples=[
+                    'pdf_read(path="report.pdf")',
+                    'pdf_read(path="report.pdf", max_pages=5, extract_tables=True)',
+                ],
+            ),
+            ToolDefinition(
+                name="pdf_split",
+                description="拆分 PDF 文件。可按指定页码范围（如 '1-5,8'）或按固定页数拆分为多个子文件。",
+                parameters=[
+                    ToolParameter("path", "string", "源 PDF 文件路径", required=True),
+                    ToolParameter("output_dir", "string", "输出目录路径", required=True),
+                    ToolParameter("ranges", "string", "页码范围，如 '1-3,5,8-10'。不填则按 split_size 拆分", required=False),
+                    ToolParameter("split_size", "number", "无 ranges 时，按此页数拆分（如每 10 页一个文件），默认 10", required=False),
+                ],
+                examples=[
+                    'pdf_split(path="report.pdf", output_dir="./parts", ranges="1-5,8-10")',
+                    'pdf_split(path="report.pdf", output_dir="./parts", split_size=20)',
+                ],
+                constraints=["会产生临时文件，注意清理"],
+            ),
+            ToolDefinition(
+                name="pdf_concat",
+                description="合并多个 PDF 文件为一个新文件。按 paths 列表顺序合并。",
+                parameters=[
+                    ToolParameter("paths", "array", "要合并的 PDF 文件路径列表（按顺序）", required=True),
+                    ToolParameter("output_path", "string", "合并后的输出文件路径", required=True),
+                ],
+                examples=[
+                    'pdf_concat(paths=["part1.pdf", "part2.pdf"], output_path="merged.pdf")',
+                ],
+                constraints=["所有文件必须存在，否则合并失败"],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return handler(call_id, **kwargs)
+        except Exception as e:
+            logger.exception(f"PDF 工具 {tool_name} 异常")
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    # ==================== pdf_read ====================
+
+    def _handle_read(self, call_id: str, path: str, max_pages: int = 10,
+                     extract_tables: bool = False, keywords: str = "") -> ToolResult:
+        if not path or not os.path.exists(path):
+            return ToolResult.fail(call_id, "pdf_read", f"文件不存在: {path}")
+
+        meta = self._extract_metadata(path)
+        is_scanned = self._is_likely_scanned(path)
+
+        result = {
+            "path": path,
+            **meta,
+            "is_scanned": is_scanned,
+            "pages": [],
+            "tables": [],
+        }
+
+        if is_scanned:
+            result["_hint"] = "检测为扫描件（图片类PDF），文本提取可能为空。建议使用 OCR 工具。"
+            return ToolResult.ok(call_id, "pdf_read", result)
+
+        try:
+            import pdfplumber
+            with pdfplumber.open(path) as pdf:
+                total = len(pdf.pages)
+                result["page_count"] = total
+                pages_to_read = min(max_pages, total)
+
+                for i in range(pages_to_read):
+                    page = pdf.pages[i]
+                    text = page.extract_text() or ""
+                    tables = page.extract_tables() if extract_tables else []
+
+                    page_data = {
+                        "page_num": i + 1,
+                        "text": text[:3000] if text else "",
+                        "chars": len(text),
+                    }
+                    if tables:
+                        page_data["tables"] = [self._table_to_text(t) for t in tables]
+                        result["tables"].extend(page_data["tables"])
+                    result["pages"].append(page_data)
+
+                return ToolResult.ok(call_id, "pdf_read", result)
+
+        except ImportError:
+            logger.warning("pdfplumber 未安装，降级到 pypdf")
+            return self._read_with_pypdf2(call_id, path, max_pages)
+        except Exception as e:
+            return ToolResult.fail(call_id, "pdf_read", str(e))
+
+    def _read_with_pypdf2(self, call_id: str, path: str, max_pages: int) -> ToolResult:
+        try:
+            with open(path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                total = len(reader.pages)
+                result = {"path": path, "page_count": total, "engine": "pypdf (降级)", "pages": []}
+                pages_to_read = min(max_pages, total)
+
+                for i in range(pages_to_read):
+                    page = reader.pages[i]
+                    text = page.extract_text() or ""
+                    page_data = {"page_num": i + 1, "text": text[:3000], "chars": len(text)}
+                    result["pages"].append(page_data)
+
+                return ToolResult.ok(call_id, "pdf_read", result)
+
+        except ImportError:
+            return ToolResult.fail(call_id, "pdf_read", "需要 pdfplumber 或 pypdf: pip install pdfplumber pypdf")
+        except Exception as e:
+            return ToolResult.fail(call_id, "pdf_read", str(e))
+
+    # ==================== pdf_split ====================
+
+    def _handle_split(self, call_id: str, path: str, output_dir: str,
+                      ranges: str = "", split_size: int = 10) -> ToolResult:
+        if not os.path.exists(path):
+            return ToolResult.fail(call_id, "pdf_split", f"文件不存在: {path}")
+
+        try:
+            reader = PyPDF2.PdfReader(path)
+            total_pages = len(reader.pages)
+
+            # 解析拆分范围
+            if ranges:
+                split_ranges = self._parse_page_ranges(ranges, total_pages)
+            else:
+                split_ranges = [
+                    (i, min(i + split_size - 1, total_pages - 1))
+                    for i in range(0, total_pages, split_size)
+                ]
+
+            if not split_ranges:
+                return ToolResult.fail(call_id, "pdf_split", "未能解析出有效的页码范围")
+
+            os.makedirs(output_dir, exist_ok=True)
+            base_name = os.path.splitext(os.path.basename(path))[0]
+            generated_files = []
+
+            for idx, (start, end) in enumerate(split_ranges):
+                writer = PyPDF2.PdfWriter()
+                for page_num in range(start, end + 1):
+                    writer.add_page(reader.pages[page_num])
+
+                out_name = f"{base_name}_part{idx + 1}_p{start + 1}-{end + 1}.pdf"
+                out_path = os.path.join(output_dir, out_name)
+
+                with open(out_path, "wb") as f:
+                    writer.write(f)
+                generated_files.append(out_path)
+
+            return ToolResult.ok(call_id, "pdf_split", {
+                "source": path,
+                "output_dir": output_dir,
+                "generated_files": generated_files,
+                "total_parts": len(generated_files),
+            })
+
+        except Exception as e:
+            return ToolResult.fail(call_id, "pdf_split", f"拆分失败: {e}")
+
+    # ==================== pdf_concat ====================
+
+    def _handle_concat(self, call_id: str, paths: List[str], output_path: str) -> ToolResult:
+        if not paths:
+            return ToolResult.fail(call_id, "pdf_concat", "文件列表不能为空")
+
+        writer = PyPDF2.PdfWriter()
+        merged_files = []
+
+        for p in paths:
+            if not os.path.exists(p):
+                return ToolResult.fail(call_id, "pdf_concat", f"文件不存在: {p}")
+            try:
+                reader = PyPDF2.PdfReader(p)
+                for page in reader.pages:
+                    writer.add_page(page)
+                merged_files.append(p)
+            except Exception as e:
+                return ToolResult.fail(call_id, "pdf_concat", f"读取 {p} 失败: {e}")
+
+        try:
+            out_dir = os.path.dirname(os.path.abspath(output_path))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(output_path, "wb") as f:
+                writer.write(f)
+        except Exception as e:
+            return ToolResult.fail(call_id, "pdf_concat", f"写入文件失败: {e}")
+
+        return ToolResult.ok(call_id, "pdf_concat", {
+            "output_path": output_path,
+            "merged_files": merged_files,
+            "total_pages": len(writer.pages),
+        })
+
+    # ==================== 辅助方法 ====================
+
+    @staticmethod
+    def _parse_page_ranges(ranges_str: str, total_pages: int) -> List[Tuple[int, int]]:
+        """解析页码范围（如 '1-3,5,8-10'），返回 0-indexed 的 (start, end)"""
+        ranges = []
+        for part in ranges_str.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                start_str, end_str = part.split("-", 1)
+                start = max(1, int(start_str.strip()))
+                end = min(total_pages, int(end_str.strip()))
+                if start <= end:
+                    ranges.append((start - 1, end - 1))
+            else:
+                idx = int(part.strip())
+                if 1 <= idx <= total_pages:
+                    ranges.append((idx - 1, idx - 1))
+        return ranges
+
+    def _extract_metadata(self, path: str) -> Dict[str, Any]:
+        meta = {"file_name": os.path.basename(path), "file_size": os.path.getsize(path)}
+        try:
+            with open(path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                meta["page_count"] = len(reader.pages)
+                info = reader.metadata
+                if info:
+                    for k in ("/Title", "/Author", "/Subject", "/Creator", "/Producer", "/CreationDate", "/ModDate"):
+                        v = info.get(k)
+                        if v:
+                            meta[k.lstrip("/").lower()] = str(v)
+        except Exception:
+            pass
+        return meta
+
+    @staticmethod
+    def _is_likely_scanned(path: str) -> bool:
+        try:
+            with open(path, "rb") as f:
+                head = f.read(2048)
+            text_markers = [b"/Text", b"/Font", b"/CIDFont"]
+            return not any(m in head for m in text_markers)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _table_to_text(table) -> str:
+        rows = []
+        for row in table:
+            rows.append(" | ".join(str(cell or "") for cell in row))
+        return "\n".join(rows)
+
+
+================================================================================
+# FILE: pentest_tool.py
+================================================================================
+"""
+渗透测试工具（原子工具版）
+
+原子工具:
+  pentest_run  — 执行渗透测试工具（基于 WSL）
+"""
+
+import asyncio
+import logging
+from typing import List
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_SECURITY,
+)
+
+logger = logging.getLogger(__name__)
+
+PENTEST_TOOLS = {
+    "nmap": "端口扫描和服务探测", "amass": "子域名枚举（OWASP）",
+    "dnsrecon": "DNS 信息收集", "theharvester": "邮箱/域名/员工名收集",
+    "whois": "域名注册信息查询", "traceroute": "路由追踪",
+    "sublist3r": "快速子域名枚举", "enum4linux": "Windows/Samba 信息枚举",
+    "nikto": "Web 服务器漏洞扫描", "dirb": "目录/文件暴力扫描",
+    "gobuster": "目录/子域/DNS 暴力扫描", "ffuf": "Web fuzzing",
+    "whatweb": "Web 技术栈识别", "wpscan": "WordPress 漏洞扫描",
+    "sqlmap": "SQL 注入", "searchsploit": "Exploit-DB 漏洞搜索",
+    "metasploit": "渗透测试框架", "hydra": "在线密码暴力破解",
+    "john": "离线密码破解", "hashcat": "GPU 加速密码破解",
+    "netcat": "TCP/UDP 连接", "curl": "HTTP 请求调试",
+    "wget": "文件下载", "responder": "LLMNR/NBT-NS 欺骗",
+    "exiftool": "文件元数据提取", "binwalk": "固件分析",
+    "steghide": "隐写术检测",
+}
+
+PENTEST_CATEGORIES = {
+    "recon": ["nmap", "amass", "dnsrecon", "theharvester", "whois", "traceroute", "sublist3r", "enum4linux", "whatweb"],
+    "web": ["nikto", "dirb", "gobuster", "ffuf", "sqlmap", "wpscan", "curl", "wget"],
+    "exploit": ["metasploit", "searchsploit"],
+    "password": ["hydra", "john", "hashcat"],
+    "network": ["netcat", "responder"],
+    "forensics": ["exiftool", "binwalk", "steghide"],
+}
+
+
+class PentestTool(BaseTool):
+    """渗透测试工具集"""
+
+    def __init__(self):
+        self._handlers = {"pentest_run": self._handle_run}
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "pentest"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_SECURITY
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="pentest_run",
+                description="在 WSL 中执行渗透测试工具。支持 nmap/sqlmap/hydra 等 27 个工具。\n"
+                            "action 分类：\n"
+                            "  recon     — 信息收集 (nmap, amass, whois)\n"
+                            "  web       — Web 漏洞 (nikto, sqlmap, dirb)\n"
+                            "  exploit   — 漏洞利用 (metasploit, searchsploit)\n"
+                            "  password  — 密码破解 (hydra, john, hashcat)\n"
+                            "  network   — 网络工具 (netcat, responder)\n"
+                            "  forensics — 取证 (exiftool, binwalk)",
+                parameters=[
+                    ToolParameter("action", "string",
+                        "分类: recon/web/exploit/password/network/forensics/custom", required=True,
+                        enum=["recon", "web", "exploit", "password", "network", "forensics", "custom"]),
+                    ToolParameter("tool", "string", "工具名，如 nmap/sqlmap", required=True),
+                    ToolParameter("args", "string", "工具参数，如 '-sV localhost'", required=False),
+                    ToolParameter("timeout", "number", "超时秒数，默认 120", required=False),
+                ],
+                examples=[
+                    'pentest_run(action="recon", tool="nmap", args="-sV localhost")',
+                    'pentest_run(action="web", tool="sqlmap", args="-u https://target.com?id=1")',
+                    'pentest_run(action="custom", tool="ls", args="-la")',
+                ],
+                constraints=[
+                    "需要安装 WSL（Windows Subsystem for Linux）",
+                    "工具需先在 WSL 中安装：sudo apt install <tool>",
+                ],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    async def _handle_run(self, call_id: str, action: str, tool: str,
+                          args: str = "", timeout: int = 120) -> ToolResult:
+        if not tool:
+            return ToolResult.fail(call_id, "pentest_run", "需要 tool 参数")
+
+        if action == "custom":
+            return await self._wsl_exec(call_id, f"{tool} {args}".strip(), timeout)
+
+        # 检查是否已安装
+        check = await self._wsl_cmd(f"which {tool} 2>/dev/null || echo 'NOT_FOUND'", 10)
+        if "NOT_FOUND" in check:
+            return ToolResult.fail(call_id, "pentest_run",
+                f"'{tool}' 未安装。请在 WSL 中安装: sudo apt install {tool}")
+
+        cmd = f"{tool} {args}" if args else tool
+        return await self._wsl_exec(call_id, cmd, timeout)
+
+    async def _wsl_cmd(self, cmd: str, timeout: int) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            "wsl", "--", "bash", "-c", cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return (stdout.decode("utf-8", errors="replace") +
+                stderr.decode("utf-8", errors="replace")).strip()
+
+    async def _wsl_exec(self, call_id: str, cmd: str, timeout: int) -> ToolResult:
+        logger.info(f"WSL: {cmd}")
+        try:
+            output = await self._wsl_cmd(cmd, timeout)
+            return ToolResult.ok(call_id, "pentest_run", {
+                "tool": cmd.split()[0],
+                "command": cmd,
+                "output": output,
+            })
+        except asyncio.TimeoutError:
+            return ToolResult.fail(call_id, "pentest_run", f"执行超时（{timeout}秒）")
+        except Exception as e:
+            return ToolResult.fail(call_id, "pentest_run", str(e))
+
+
+================================================================================
+# FILE: shell_tool.py
+================================================================================
+"""
+Shell 工具（原子工具版）
+
+原子工具:
+  shell_run  — 执行 Shell 命令或 Python 代码
+"""
+
+import asyncio
+import os
+import re
+import logging
+import tempfile
+from typing import List
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_SYSTEM,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ShellExecuteTool(BaseTool):
+    """Shell 命令执行工具"""
+
+    def __init__(self, **kwargs):
+        self._default_timeout = kwargs.get("timeout", 30)
+        self._handlers = {"shell_run": self._handle_run}
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "shell"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_SYSTEM
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="shell_run",
+                description="执行 Shell 命令或 Python 代码。\n"
+                            "用法1 — 简单命令：shell_run(command='dir')\n"
+                            "用法2 — 多行 Python：shell_run(code='...')\n"
+                            "多行 Python 代码推荐用 code 参数（自动写临时文件执行，避免 JSON 转义问题）。",
+                parameters=[
+                    ToolParameter("command", "string", "Shell 命令（简单命令用）", required=False),
+                    ToolParameter("code", "string", "Python 代码（多行代码用，自动写文件执行）", required=False),
+                    ToolParameter("timeout", "number", "超时秒数，默认 30", required=False),
+                ],
+                examples=[
+                    'shell_run(command="dir")',
+                    'shell_run(command="python script.py")',
+                    'shell_run(code="import os; print(os.listdir(\'.\'))")',
+                ],
+                constraints=[
+                    "Windows 用 dir，Linux/Mac 用 ls",
+                    "默认超时 30 秒，大数据操作增加 timeout",
+                ],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    async def _handle_run(self, call_id: str, command: str = "", code: str = "",
+                          timeout: int = None) -> ToolResult:
+        timeout = timeout or self._default_timeout
+
+        # 优先处理 code 参数
+        if code:
+            command = self._prepare_code_execution(code)
+            logger.info(f"执行 Python 代码 ({len(code)} 字符)")
+        elif not command:
+            return ToolResult.fail(call_id, "shell_run", "需要 command 或 code 参数")
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                shell=True,
+            )
+            stdout_data, stderr_data = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+
+            stdout = self._decode(stdout_data)
+            stderr = self._decode(stderr_data)
+
+            if not stdout.strip() and not stderr.strip():
+                stdout = "命令执行完成，无输出"
+
+            return ToolResult.ok(call_id, "shell_run", {
+                "stdout": stdout,
+                "stderr": stderr,
+                "return_code": proc.returncode,
+            })
+
+        except asyncio.TimeoutError:
+            return ToolResult.fail(call_id, "shell_run",
+                f"执行超时（{timeout}秒），如需更长超时请增加 timeout 参数")
+        except Exception as e:
+            return ToolResult.fail(call_id, "shell_run", str(e))
+
+    @staticmethod
+    def _decode(data: bytes) -> str:
+        try:
+            return data.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            try:
+                return data.decode("gbk").strip()
+            except UnicodeDecodeError:
+                return data.decode("utf-8", errors="replace").strip()
+
+    @staticmethod
+    def _prepare_code_execution(code: str) -> str:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", encoding="utf-8", delete=False,
+        )
+        tmp.write(code)
+        tmp.close()
+        return f'python "{tmp.name}"'
+
+

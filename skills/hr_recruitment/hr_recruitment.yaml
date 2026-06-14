@@ -1,0 +1,8 @@
+name: hr_recruitment
+display_name: HR 招聘助手
+icon: 👔
+description: 简历解析、面试出题、JD 撰写
+when_to_use: 需要筛选简历、生成面试题、撰写岗位描述时
+tools: [shell, file]
+fallback: null
+tags: [HR, 招聘, 简历, 面试, JD, 岗位描述]

@@ -7,6 +7,7 @@ Topic 检索 — BM25 + 向量混合检索 + 上下文注入
   3. simple_kw_search: 纯关键词搜索（轻量级 fallback）
 """
 
+import json
 import logging
 from typing import Optional, List, Dict, Any
 

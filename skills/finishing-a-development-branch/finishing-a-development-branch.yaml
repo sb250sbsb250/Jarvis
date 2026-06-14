@@ -1,0 +1,14 @@
+name: finishing-a-development-branch
+display_name: 完成开发分支
+icon: 🏁
+description: 实现完成、测试通过后，需要决定如何合并/提交/清理时
+when_to_use: 实现完成、测试通过后，需要决定如何合并/提交/清理时
+tools:
+- git
+- file
+tags:
+- 分支管理
+- PR
+- 合并
+- git branch
+- 代码提交

@@ -38,12 +38,35 @@ class LLMClient:
         response = await client.chat_completion(messages, tools)
     """
 
+    # ── Fallback 加载标记（防止重复日志）
+    _fallbacks_initialized: bool = False
+
     # ── 模型路由表：ResponseMode → 推荐模型 ──
     MODEL_ROUTING = {
         "direct":   "deepseek-chat",
         "concise":  "deepseek-chat",
         "standard": "deepseek-v4-pro",
         "detailed": "deepseek-v4-pro",
+    }
+
+    # ── 模型预设：不同模型的不同配置 ──
+    MODEL_PRESETS = {
+        "deepseek-v4-pro": {
+            "label": "DeepSeek Pro",
+            "api_key_env": "DEEPSEEK_API_KEY",
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-chat",
+            "description": "高性能专业模型",
+            "adapter": "pro",
+        },
+        "deepseek-v4-flash": {
+            "label": "DeepSeek Flash",
+            "api_key_env": "DEEPSEEK_API_KEY",
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-chat",
+            "description": "快速轻量模型",
+            "adapter": "flash",
+        },
     }
 
     def __init__(self, config: Optional[LLMConfig] = None):
@@ -65,7 +88,7 @@ class LLMClient:
         self._load_fallback_providers()
 
     def _load_fallback_providers(self):
-        """从环境变量加载备用 LLM 提供商"""
+        """从环境变量加载备用 LLM 提供商（日志仅首次加载时打印一次）"""
         fallback_configs = [
             ("qwen",    "DASHSCOPE_API_KEY",    "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
             ("kimi",    "MOONSHOT_API_KEY",      "https://api.moonshot.cn/v1",                       "moonshot-v1-128k"),
@@ -79,11 +102,48 @@ class LLMClient:
                     AsyncOpenAI(api_key=key, base_url=base_url, timeout=self.config.timeout_seconds),
                     model,
                 ))
-                logger.info(f"🔁 Fallback 提供商已加载: {name} ({model})")
+                if not LLMClient._fallbacks_initialized:
+                    logger.info(f"🔁 Fallback 提供商已加载: {name} ({model})")
 
-        if self._fallbacks:
+        if self._fallbacks and not LLMClient._fallbacks_initialized:
             names = [fb[0] for fb in self._fallbacks]
             logger.info(f"🔁 共 {len(self._fallbacks)} 个 Fallback 提供商: {', '.join(names)}")
+            LLMClient._fallbacks_initialized = True
+
+    @staticmethod
+    def get_supported_models() -> List[str]:
+        """返回支持的模型名称列表"""
+        return list(LLMClient.MODEL_PRESETS.keys())
+
+    @staticmethod
+    def get_model_preset(model_name: str) -> Dict:
+        """获取指定模型的预设配置"""
+        return LLMClient.MODEL_PRESETS.get(model_name, LLMClient.MODEL_PRESETS["deepseek-v4-pro"])
+
+    @staticmethod
+    def _adapt_messages_for_model(messages: List[Dict], model: str) -> List[Dict]:
+        """
+        根据模型调整消息格式。
+        不同模型可能需要不同的消息结构。
+        """
+        preset = LLMClient.get_model_preset(model)
+        adapter = preset.get("adapter", "pro")
+
+        if adapter == "flash":
+            # Flash 模型：部分 API 不支持 system 角色，转换为 user 消息
+            adapted = []
+            for m in messages:
+                if m.get("role") == "system":
+                    adapted.append({"role": "user", "content": m["content"]})
+                else:
+                    # 移除 reasoning_content 字段（Flash 不支持）
+                    if "reasoning_content" in m:
+                        m = {k: v for k, v in m.items() if k != "reasoning_content"}
+                    adapted.append(m)
+            return adapted
+
+        # Pro / 默认：不做转换
+        return messages
 
     @staticmethod
     def _load_config_from_env() -> LLMConfig:
@@ -134,9 +194,12 @@ class LLMClient:
         _max_tokens = _max_tokens if _max_tokens is not None else self.config.max_tokens
         _temperature = _temperature if _temperature is not None else self.config.temperature
 
+        # ── 根据模型适配消息格式 ──
+        adapted_messages = self._adapt_messages_for_model(messages, _model)
+
         params = {
             "model": _model,
-            "messages": messages,
+            "messages": adapted_messages,
             "max_tokens": _max_tokens,
             "temperature": _temperature,
             "stream": stream,
@@ -288,10 +351,15 @@ class LLMClient:
         _max_tokens = kwargs.pop("max_tokens", None)
         _temperature = kwargs.pop("temperature", None)
 
+        _model = _model if _model is not None else self.config.model
+
+        # ── 根据模型适配消息格式 ──
+        adapted_messages = self._adapt_messages_for_model(messages, _model)
+
         # DeepSeek 思考模型要求原样传回 reasoning_content，不做过滤
         params = {
-            "model": _model if _model is not None else self.config.model,
-            "messages": messages,
+            "model": _model,
+            "messages": adapted_messages,
             "max_tokens": _max_tokens if _max_tokens is not None else self.config.max_tokens,
             "temperature": _temperature if _temperature is not None else self.config.temperature,
             "stream": True,

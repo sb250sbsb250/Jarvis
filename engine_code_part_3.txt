@@ -1,0 +1,3188 @@
+================================================================================
+# FILE: prompt\template.py
+================================================================================
+"""
+engine/prompt/template.py — System Prompt 模板
+
+从 agent_loop.py 提取的模板渲染逻辑。
+_BASE_TEMPLATE 定义了 Agent 的系统提示词模板。
+render_template 用于将变量注入模板。
+"""
+
+import re
+from typing import Dict
+
+_BASE_TEMPLATE = """你是 Jarvis，一个强大的自主智能助手。
+
+{{ skill_prompt }}
+
+## 工作环境
+{{ env_info }}
+
+{{ compressed_summary }}
+
+## 当前任务
+{{ task }}
+
+分析当前情况，决定下一步行动。如果需要更多信息，调用工具获取。如果任务完成或无法继续，直接输出最终答案。
+
+{{ user_profile }}
+
+## 约束条件
+{{ constraints }}
+
+## 核心原则
+1. 理解优先，动手在后 — 先分析意图，再行动
+2. 一次一步，步步验证 — 完成后检查结果
+3. 记忆复用，避免重复 — 牢记已获取的信息
+4. 失败不是终点 — 分析原因，换方式重试（同方式最多2次）
+5. 不需要征询用户同意即可执行搜索、读取、分析
+6. 任务完成或无法继续时，给出清晰总结
+
+## 工具选择指南
+- **代码文件**（.py / .js / .ts / .java / .go 等编程语言文件）：使用 `code_*` 系列工具（带自动备份和回滚）
+- **普通文件**（日志/配置/文档/数据/文本）：使用 `file_*` 系列工具
+- **Excel**：使用 `excel_*` 系列工具
+- **网页**：使用 `web_*` 系列工具（web_fetch/web_search）
+- **Shell 命令**：使用 `shell_run`
+
+## 进度管理
+你需要在每次回复中自行判断和报告进度。
+
+### 判断方式
+- 查看对话历史中的操作日志，确认已完成什么
+- 对比用户的原始任务，判断还差什么
+- 如果任务较大，在回复开头用一两句话概括当前进展
+
+### 输出格式
+对于多步骤任务，回复的第一行应该是进度概述：
+
+**进度: 2/4 | 已完成:** 读取源文件、分析依赖 | **下一步:** 修改配置文件
+
+### 注意
+- 这是给你自己看的进度锚点，防止在复杂任务中迷失
+- 不需要用工具记录，直接在回复中输出即可
+- 简单任务（1-3步）不需要进度概述
+- 如果发现之前的步骤没有实际效果，诚实标注并重新规划
+
+## 信息整合规则
+- 读取到用户背景信息（简历、档案、偏好）时，检查是否有空白身份文件（USER.md、IDENTITY.md、MEMORY.md），有则自动填充
+- 能用已有信息填的先填好，再让用户确认。禁止明知信息够用却从零开始提问
+- 一次对话中获取的新信息，结束前总结并回写到对应文件
+
+## 错误处理
+- 工具返回空：检查参数，换工具，或写入文件再读
+- 如果 shell 报告"未提供任何参数"，说明参数格式有问题
+  → 不要重试相同的 JSON 格式，改用 file_write 或 code_create 写入脚本文件
+  → 然后用 shell(command='python 脚本文件.py') 执行
+- 工具返回错误：参数错→修正；权限错→说明；超时→减量
+- 最多重试2次同方式，第3次必须换方案
+- 注意不要重复调用相同工具读取相同内容
+
+## 大数据处理规则（处理大量文件/长文本时严格遵守）
+- **绝对禁止**在上下文中累积超过 3 个文件的完整原始数据
+- 处理超过 3 个文件时，必须采用"读取 → 提取关键信息 → 追加到中间汇总文件"模式：
+  1. 读取一个文件 → 提取关键字段 → file_append(path='_summary.jsonl', content=JSON一行)
+  2. 继续下一个文件，重复步骤1
+  3. 全部处理完毕 → file_read(path='_summary.jsonl') 一次性读回汇总数据
+  4. 基于汇总数据做最终操作（写Excel、生成报告等）
+- 汇总文件格式：每行一条 JSON 记录 {"字段1":"值1", "字段2":"值2"}
+- 处理完成后删除中间汇总文件
+- 每步上下文只保留：当前处理结果 + 已处理计数（如 "第3/10份"）
+如果发现上下文已经很大（超过 5000 tokens），立即停止读取新文件，
+  先处理已有信息，输出结果
+
+## 输出要求
+- 用中文回答，代码注释用英文
+- 完成时给出核心结论 + 关键步骤
+- 无法完成时说明原因 + 需要什么
+- 主动汇报进度"""
+
+TEMPLATE_PATTERN = re.compile(r'\{\{\s*(\w+)\s*\}\}')
+
+
+def render_template(variables: Dict[str, str], base_system: str = "") -> str:
+    """渲染 system prompt 模板。"""
+    template = _BASE_TEMPLATE
+    if base_system:
+        template = template + "\n\n" + base_system
+
+    def replacer(match):
+        var_name = match.group(1)
+        value = variables.get(var_name)
+        if value is None:
+            return ' {{ ' + var_name + ' }} '
+        return str(value)
+
+    return TEMPLATE_PATTERN.sub(replacer, template)
+
+
+================================================================================
+# FILE: session\__init__.py
+================================================================================
+"""会话管理"""
+from .session import Session
+
+
+================================================================================
+# FILE: session\manager.py
+================================================================================
+"""
+会话管理器 — 简化版
+
+管理会话生命周期，用 JSON 文件持久化。
+Session 存 List[Dict] + summary，不再依赖 MessageList。
+"""
+
+import json
+import logging
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+from pathlib import Path
+
+from .session import Session
+
+logger = logging.getLogger(__name__)
+
+
+class JsonFileStore:
+    """基于 JSON 文件的会话存储"""
+
+    def __init__(self, store_dir: str):
+        self._dir = Path(store_dir)
+        self._dir.mkdir(parents=True, exist_ok=True)
+
+    def _session_path(self, sid: str) -> Path:
+        return self._dir / f"{sid}.json"
+
+    async def save_session(self, session: Session) -> None:
+        path = self._session_path(session.session_id)
+        data = session.to_dict()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    async def load_session(self, sid: str) -> Optional[Session]:
+        path = self._session_path(sid)
+        if not path.exists():
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return Session.from_dict(data)
+        except Exception as e:
+            logger.error(f"加载会话失败 {sid}: {e}")
+            return None
+
+    async def delete_session(self, sid: str) -> bool:
+        path = self._session_path(sid)
+        if path.exists():
+            path.unlink()
+            return True
+        return False
+
+    async def list_sessions(self) -> List[Dict[str, Any]]:
+        summaries = []
+        for p in sorted(self._dir.glob("*.json"), reverse=True):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # 自动从首条用户消息提取标题
+                title = data.get("title", "")
+                if not title:
+                    for m in data.get("messages", []):
+                        if m.get("role") == "user" and m.get("content"):
+                            title_text = m["content"].strip().replace("\n", " ")[:40]
+                            if len(m["content"]) > 40:
+                                title_text += "..."
+                            title = title_text
+                            break
+                summaries.append({
+                    "session_id": data.get("session_id", p.stem),
+                    "title": title,
+                    "messages": len(data.get("messages", [])),
+                    "created_at": data.get("created_at", ""),
+                    "updated_at": data.get("updated_at", ""),
+                })
+            except Exception:
+                summaries.append({"session_id": p.stem, "messages": 0})
+        return summaries
+
+
+class SessionManager:
+    """会话管理器 — 创建/保存/加载/删除会话"""
+
+    def __init__(self, storage_dir: str = "./sessions"):
+        self._store = JsonFileStore(storage_dir)
+        self._sessions: Dict[str, Session] = {}
+
+    async def create_session(self, title: str = "") -> Session:
+        session = Session(title=title)
+        self._sessions[session.session_id] = session
+        await self._store.save_session(session)
+        logger.info(f"Created session: {session.session_id}")
+        return session
+
+    async def get_session(self, session_id: str) -> Optional[Session]:
+        if session_id in self._sessions:
+            self._sessions[session_id].touch()
+            return self._sessions[session_id]
+
+        session = await self._store.load_session(session_id)
+        if session:
+            self._sessions[session_id] = session
+            logger.debug(f"Loaded session: {session_id}")
+        return session
+
+    async def get_or_create_session(self, session_id: Optional[str] = None) -> Session:
+        if session_id:
+            session = await self.get_session(session_id)
+            if session:
+                return session
+        return await self.create_session()
+
+    async def save_session(self, session: Session) -> None:
+        session.touch()
+        self._sessions[session.session_id] = session
+        await self._store.save_session(session)
+
+    async def delete_session(self, session_id: str) -> bool:
+        if session_id in self._sessions:
+            del self._sessions[session_id]
+        return await self._store.delete_session(session_id)
+
+    async def list_sessions(self) -> List[Dict[str, Any]]:
+        return await self._store.list_sessions()
+
+    async def close(self) -> None:
+        for session in self._sessions.values():
+            await self._store.save_session(session)
+        logger.info("SessionManager closed")
+
+
+================================================================================
+# FILE: session\session.py
+================================================================================
+"""
+会话实体 — 简化版
+
+用纯 List[Dict] 存消息，不再依赖 MessageList。
+存储格式: {"session_id": ..., "messages": [...], "summary": "..."}
+"""
+
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field
+from datetime import datetime
+from uuid import uuid4
+
+
+@dataclass
+class Session:
+    """会话实体 — 长期层存储"""
+
+    # 标识
+    session_id: str = field(default_factory=lambda: f"sess_{uuid4().hex[:12]}")
+
+    # 核心数据
+    messages: List[Dict] = field(default_factory=list)  # 最近 N 轮完整消息
+    summary: str = ""  # 更早对话的 LLM 摘要
+
+    # 元数据
+    title: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # 时间
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+
+    # 状态
+    is_active: bool = True
+    is_archived: bool = False
+
+    def __len__(self) -> int:
+        return len(self.messages)
+
+    def __bool__(self) -> bool:
+        return True
+
+    def touch(self) -> None:
+        self.updated_at = datetime.now()
+
+    def clear(self) -> None:
+        self.messages.clear()
+        self.summary = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "messages": self.messages,
+            "summary": self.summary,
+            "title": self.title,
+            "metadata": self.metadata,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "is_active": self.is_active,
+            "is_archived": self.is_archived,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Session":
+        return cls(
+            session_id=data.get("session_id", ""),
+            messages=data.get("messages", []),
+            summary=data.get("summary", ""),
+            title=data.get("title", ""),
+            metadata=data.get("metadata", {}),
+            created_at=datetime.fromisoformat(data["created_at"]) if data.get("created_at") else datetime.now(),
+            updated_at=datetime.fromisoformat(data["updated_at"]) if data.get("updated_at") else datetime.now(),
+            is_active=data.get("is_active", True),
+            is_archived=data.get("is_archived", False),
+        )
+
+
+================================================================================
+# FILE: skill\__init__.py
+================================================================================
+"""
+Skill 系统 — Jarvis V3 经验模块
+
+Skill 是经过验证的 DAG 执行经验，固化为可复用的模块。
+每个 Skill 可以直接被路由调用，支持：
+ - 触发条件匹配（关键词/语义）
+ - 经验等级（使用越多越优先）
+ - 自动降级（失败时的回退方案）
+ - 可组合（Skill 可以调用其他 Skill）
+"""
+
+from .base import Skill, SkillMeta, SkillLevel, SkillResult
+from .registry import SkillRegistry
+from .router import SkillRouter
+from .matcher import match_skill, get_filtered_tools
+
+__all__ = [
+    "Skill", "SkillMeta", "SkillLevel", "SkillResult",
+    "SkillRegistry", "SkillRouter",
+    "match_skill", "get_filtered_tools",
+]
+
+
+================================================================================
+# FILE: skill\base.py
+================================================================================
+"""
+skill/base.py — Skill 基类
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from enum import Enum
+import time
+
+if TYPE_CHECKING:
+    from .context import ExecutionContext
+
+
+class SkillLevel(Enum):
+    """经验等级（根据成功次数自动升级）"""
+    NOVICE = 1       # < 5 次
+    PRACTITIONER = 2 # 5-20 次
+    EXPERT = 3       # 20-100 次
+    MASTER = 4       # > 100 次（自动优先路由）
+
+
+@dataclass
+class SkillMeta:
+    """Skill 元数据"""
+    name: str                       # 唯一标识（如 "code_review"）
+    display_name: str               # 显示名称（如 "代码审查"）
+    description: str                # 一句话描述
+    icon: str = "⚡"                 # 图标
+    tags: List[str] = field(default_factory=list)  # 标签（用于检索）
+    tool_hints: List[str] = field(default_factory=list)  # 推荐工具列表
+    fallback: Optional[str] = None  # 降级 Skill 名称
+
+
+@dataclass
+class SkillResult:
+    """Skill 执行结果"""
+    success: bool
+    content: str = ""
+    data: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+    duration_ms: float = 0.0
+
+
+class Skill(ABC):
+    """
+    Skill 基类 — 纯配置驱动的 system prompt 提供者
+
+    子类必须实现：
+    - meta: SkillMeta
+
+    可选实现：
+    - get_system_prompt: 返回 domain prompt 给 AgentLoop
+    - can_handle: 自定义触发判断
+    - on_success / on_failure: 执行回调
+    - trigger_keywords: 触发关键词列表
+    """
+
+    def __init__(self):
+        self._success_count: int = 0
+        self._failure_count: int = 0
+        self._total_duration_ms: float = 0.0
+        self._last_used_at: float = 0.0
+
+    # ── 必须实现的属性 ──
+
+    @property
+    @abstractmethod
+    def meta(self) -> SkillMeta:
+        """Skill 元数据"""
+        ...
+
+    # ── 可选覆盖的方法 ──
+
+    def get_system_prompt(self) -> str:
+        """返回领域系统提示（AgentLoop system_prompt 的一部分）"""
+        return ""
+
+    @property
+    def trigger_keywords(self) -> List[str]:
+        """触发关键词列表（子类可选覆盖）"""
+        return []
+
+    def can_handle(self, user_input: str) -> float:
+        """
+        判断是否能处理用户输入
+
+        策略（三阶段匹配）：
+        1. 完整关键词匹配 — 关键词原文出现在用户输入中
+        2. 标签匹配 — 在 meta.tags 中匹配
+        3. 描述匹配 — 在 meta.description 中匹配
+
+        三阶段取最大值，加上经验加成。
+
+        Returns:
+            0.0-1.0 的置信度
+        """
+        user_lower = user_input.lower()
+        best = 0.0
+
+        # 阶段1：完整关键词匹配
+        if self.trigger_keywords:
+            exact = sum(1 for kw in self.trigger_keywords if kw.lower() in user_lower)
+            if exact > 0:
+                best = max(best, exact / len(self.trigger_keywords))
+
+        # 阶段2：标签匹配（标签通常是最精准的描述）
+        for tag in self.meta.tags:
+            tag_lower = tag.lower()
+            if tag_lower in user_lower:
+                best = max(best, 0.7)
+                break
+            # 模糊：用户输入包含标签的子串，或标签包含用户输入的子串
+            for word in user_lower.split():
+                if len(word) >= 2 and (word in tag_lower or tag_lower in word):
+                    best = max(best, 0.4)
+                    break
+
+        # 阶段3：描述匹配
+        desc = self.meta.description.lower()
+        for word in user_lower.split():
+            if len(word) >= 2 and word in desc:
+                best = max(best, 0.3)
+                break
+
+        if best == 0.0:
+            return 0.0
+
+        # 经验加成
+        experience_bonus = min(0.3, self.experience_level.value * 0.08)
+        recency_bonus = 0.1 if self.is_recently_used(3600) else 0.0
+
+        return min(1.0, best + experience_bonus + recency_bonus)
+
+    async def on_success(self, ctx: "ExecutionContext", result: SkillResult):
+        self._success_count += 1
+        self._total_duration_ms += result.duration_ms
+        self._last_used_at = time.time()
+
+    async def on_failure(self, error: Exception):
+        self._failure_count += 1
+
+    # ── 统计属性 ──
+
+    @property
+    def experience_level(self) -> SkillLevel:
+        if self._success_count >= 100:
+            return SkillLevel.MASTER
+        elif self._success_count >= 20:
+            return SkillLevel.EXPERT
+        elif self._success_count >= 5:
+            return SkillLevel.PRACTITIONER
+        return SkillLevel.NOVICE
+
+    @property
+    def success_rate(self) -> float:
+        total = self._success_count + self._failure_count
+        if total == 0:
+            return 0.0
+        return self._success_count / total
+
+    @property
+    def avg_duration_ms(self) -> float:
+        if self._success_count == 0:
+            return 0.0
+        return self._total_duration_ms / self._success_count
+
+    def is_recently_used(self, seconds: float = 3600) -> bool:
+        if self._last_used_at == 0:
+            return False
+        return (time.time() - self._last_used_at) < seconds
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "name": self.meta.name,
+            "display_name": self.meta.display_name,
+            "level": self.experience_level.name,
+            "success_count": self._success_count,
+            "failure_count": self._failure_count,
+            "success_rate": f"{self.success_rate:.1%}",
+            "avg_duration_ms": f"{self.avg_duration_ms:.0f}",
+            "recently_used": self.is_recently_used(),
+        }
+
+    def __repr__(self) -> str:
+        return f"<Skill '{self.meta.name}' level={self.experience_level.name}>"
+
+
+================================================================================
+# FILE: skill\loader.py
+================================================================================
+"""
+engine/skill/loader.py — 标准 Skill 加载器
+
+一个文件夹 = 一个 Skill = {name}.yaml + {name}.md
+
+skills/code_review/
+├── code_review.yaml ← 元数据
+└── code_review.md   ← system prompt（按 ## 分段）
+"""
+
+import os
+import re
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from .base import Skill, SkillMeta
+
+logger = logging.getLogger(__name__)
+
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore
+
+
+class SkillPromptParser:
+    """
+    Markdown 提示词解析器。
+
+    解析 skill.md，按 ## 标题分段存储。
+    支持文件变更检测（热重载）。
+    """
+
+    SECTION_PATTERN = re.compile(r'^##\s+(.+)$', re.MULTILINE)
+
+    def __init__(self, md_path: str):
+        self._path = Path(md_path)
+        self._sections: Dict[str, str] = {}
+        self._mtime: float = 0.0  # 文件修改时间戳
+        self._load()
+
+    def _load(self):
+        if not self._path.exists():
+            self._sections["system"] = ""
+            self._mtime = 0.0
+            return
+
+        self._mtime = self._path.stat().st_mtime
+        content = self._path.read_text(encoding="utf-8")
+        matches = list(self.SECTION_PATTERN.finditer(content))
+
+        if not matches:
+            self._sections["system"] = content.strip()
+            return
+
+        for i, match in enumerate(matches):
+            section_name = match.group(1).strip().lower()
+            start = match.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+            self._sections[section_name] = content[start:end].strip()
+
+    def _check_reload(self):
+        """检测文件是否变更，自动重载"""
+        if self._path.exists():
+            current_mtime = self._path.stat().st_mtime
+            if current_mtime > self._mtime:
+                logger.debug(f"检测到文件变更，自动重载: {self._path}")
+                self._sections.clear()
+                self._load()
+
+    def get(self, section: str, default: str = "") -> str:
+        self._check_reload()
+        return self._sections.get(section.lower(), default)
+
+    def has(self, section: str) -> bool:
+        self._check_reload()
+        return section.lower() in self._sections
+
+    def reload(self):
+        self._sections.clear()
+        self._load()
+
+    def get_full_prompt(self) -> str:
+        """返回所有节内容，按文件顺序拼接"""
+        self._check_reload()
+        if not self._sections:
+            return ""
+
+        parts = []
+        for section_name, content in self._sections.items():
+            if not content:
+                continue
+            # system 节直接拼接，其他节带标题
+            if section_name == "system":
+                parts.append(content)
+            elif section_name == "examples":
+                parts.append(f"## 参考示例\n{content}")
+            elif section_name == "constraints":
+                parts.append(f"## 约束条件\n{content}")
+            else:
+                parts.append(f"## {section_name.capitalize()}\n{content}")
+
+        return "\n\n".join(parts)
+
+
+class StandardSkill(Skill):
+    """
+    标准 Skill — 从 skill.yaml + skill.md 加载的纯配置 Skill。
+
+    不再构建 DAG，改为为 AgentLoop 提供 system prompt。
+    """
+
+    def __init__(self, skill_dir: str):
+        super().__init__()
+        self._dir = Path(skill_dir)
+        self._config = self._load_yaml()
+        self._cached_keywords: Optional[List[str]] = None  # 关键词缓存
+
+        skill_name = self._config.get("name", self._dir.name)
+        md_path = self._dir / f"{skill_name}.md"
+        self._prompts = SkillPromptParser(str(md_path))
+
+    @classmethod
+    def from_dir(cls, skill_dir: str) -> "StandardSkill":
+        return cls(skill_dir)
+
+    def _load_yaml(self) -> dict:
+        if yaml is None:
+            raise ImportError("需要 PyYAML，请运行: pip install pyyaml")
+        skill_name = self._dir.name
+        yaml_path = self._dir / f"{skill_name}.yaml"
+        if not yaml_path.exists():
+            raise FileNotFoundError(f"Skill 配置文件不存在: {yaml_path}")
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+
+    # ── Skill 接口 ──
+
+    @property
+    def meta(self) -> SkillMeta:
+        return SkillMeta(
+            name=self._config["name"],
+            display_name=self._config.get("display_name", self._config["name"]),
+            description=self._config.get("description", ""),
+            icon=self._config.get("icon", "⚡"),
+            tags=self._config.get("tags", []),
+            tool_hints=self.get_tool_hints(),
+            fallback=self.get_fallback(),
+        )
+
+    @property
+    def trigger_keywords(self) -> List[str]:
+        """从 tags + when_to_use + description 中提取关键词（带缓存）"""
+        if self._cached_keywords is not None:
+            return self._cached_keywords
+        self._cached_keywords = self._extract_keywords()
+        return self._cached_keywords
+
+    def _extract_keywords(self) -> List[str]:
+        """实际提取关键词的逻辑"""
+        keywords = list(self._config.get("tags", []))
+
+        when = self._config.get("when_to_use", "")
+        if when:
+            # 提取中文关键词（2-6字短语）
+            import re
+            words = re.findall(r'[\u4e00-\u9fff]{2,6}', when)
+            keywords.extend(words)
+
+        desc = self._config.get("description", "")
+        if desc:
+            # 提取描述中的中文关键词
+            words = re.findall(r'[\u4e00-\u9fff]{2,4}', desc)
+            keywords.extend(words)
+
+        return list(set(keywords))
+
+    def can_handle(self, user_input: str) -> float:
+        """
+        StandardSkill 的增强匹配：
+        - tags 精确匹配 → 高置信度
+        - when_to_use 匹配 → 中置信度
+        - description 匹配 → 低置信度
+        - 精确 name/display_name 匹配 → 最高置信度
+        """
+        user_lower = user_input.lower().strip()
+        config = self._config
+
+        # 1. 精确名称匹配
+        name = config.get("name", "").lower()
+        display = config.get("display_name", "").lower()
+        if user_lower == name or user_lower == display:
+            return 1.0
+        if name in user_lower or display in user_lower:
+            return 0.9
+
+        # 2. Tag 匹配（精确）
+        tags = config.get("tags", [])
+        for tag in tags:
+            if tag.lower() in user_lower:
+                return 0.85
+
+        # 3. when_to_use 场景匹配
+        when = config.get("when_to_use", "")
+        if when:
+            # 提取关键场景词
+            import re
+            scenes = re.findall(r'[\u4e00-\u9fff]{2,6}', when)
+            matches = sum(1 for s in scenes if s in user_lower)
+            if matches >= 2:
+                return 0.75
+            if matches == 1:
+                return 0.5
+
+        # 4. 回退到基类匹配
+        return super().can_handle(user_input)
+
+    def get_tool_hints(self) -> List[str]:
+        """返回本 Skill 推荐使用的工具列表"""
+        return self._config.get("tools", [])
+
+    def get_fallback(self) -> Optional[str]:
+        """返回降级 Skill 名称，None 表示无降级"""
+        return self._config.get("fallback")
+
+    def get_system_prompt(self) -> str:
+        """为 AgentLoop 提供领域 system prompt"""
+        return self._prompts.get_full_prompt()
+
+    def get_config_value(self, key: str, default: str = "") -> str:
+        """获取 yaml 配置中的任意值"""
+        return str(self._config.get(key, default))
+
+    def get_all_config(self) -> dict:
+        """获取所有 yaml 配置"""
+        return dict(self._config)
+
+    def __repr__(self):
+        return f"<StandardSkill '{self._config['name']}' from {self._dir.name}>"
+
+
+================================================================================
+# FILE: skill\matcher.py
+================================================================================
+"""
+engine/skill/matcher.py — 技能匹配
+
+从 agent_loop.py 提取的技能匹配逻辑。
+"""
+
+import logging
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+MATCH_THRESHOLD = 3.0
+
+
+def match_skill(task: str) -> Optional[Any]:
+    """
+    根据任务描述自动匹配最合适的 Skill。
+
+    在 skills 目录中的每一个 Skill 都有一个 match_score(task) 方法，
+    返回 0-10 的分数。选出最高分且 >= MATCH_THRESHOLD 的 Skill。
+    """
+    if not task or not task.strip():
+        return None
+
+    try:
+        from skills import get_all_skills
+    except ImportError:
+        logger.debug("skills 包未安装，跳过技能匹配")
+        return None
+    except Exception as e:
+        logger.debug(f"skills 加载失败: {e}")
+        return None
+
+    try:
+        all_skills = get_all_skills()
+    except Exception as e:
+        logger.debug(f"get_all_skills() 失败: {e}")
+        return None
+
+    if not all_skills:
+        return None
+
+    best_score = 0.0
+    best_skill = None
+
+    for skill in all_skills:
+        try:
+            if not hasattr(skill, 'match_score'):
+                continue
+            score = skill.match_score(task)
+            if score > best_score:
+                best_score = score
+                best_skill = skill
+        except Exception as e:
+            logger.debug(f"Skill {getattr(skill, 'name', '?')} 匹配失败: {e}")
+            continue
+
+    if best_score >= MATCH_THRESHOLD:
+        logger.info(
+            f"🎯 技能匹配: {getattr(best_skill.meta, 'display_name', '?')} "
+            f"(score={best_score:.1f})"
+        )
+        return best_skill
+
+    return None
+
+
+def get_filtered_tools(tool_registry: Any, skill: Optional[Any] = None) -> List[Dict]:
+    """获取工具定义列表，交给 LLM 的 tools 参数。
+
+    如果当前有匹配的 Skill，只暴露该 Skill 需要的工具；
+    否则暴露全部可用工具。
+    """
+    if hasattr(tool_registry, 'get_tool_defs_for_llm'):
+        all_tools = tool_registry.get_tool_defs_for_llm()
+    else:
+        all_tools = []
+
+    if not skill:
+        return all_tools
+
+    allowed = set()
+    try:
+        if hasattr(skill, 'get_allowed_tools'):
+            allowed = set(skill.get_allowed_tools() or [])
+    except Exception:
+        return all_tools
+
+    if not allowed:
+        return all_tools
+
+    filtered = [t for t in all_tools if t.get("function", {}).get("name") in allowed]
+
+    if not filtered:
+        return all_tools
+
+    return filtered
+
+
+================================================================================
+# FILE: skill\registry.py
+================================================================================
+"""
+skill/registry.py — Skill 注册中心
+
+负责：
+ 1. 注册/注销 Skill
+ 2. 根据用户输入路由到最合适的 Skill
+ 3. 维护 Skill 统计信息
+"""
+
+import logging
+from typing import Dict, List, Optional, Tuple, Set, Callable, Type, Any
+
+from .base import Skill, SkillMeta
+
+logger = logging.getLogger(__name__)
+
+
+class SkillRegistry:
+    """Skill 注册中心（支持按需加载）"""
+
+    def __init__(self):
+        self._skills: Dict[str, Skill] = {}
+        self._load_callbacks: List[Callable] = []
+
+    def register(self, skill: Skill) -> "SkillRegistry":
+        """注册一个 Skill"""
+        name = skill.meta.name
+
+        if name in self._skills:
+            logger.warning(f"Skill '{name}' 已存在，将被覆盖")
+
+        self._skills[name] = skill
+        logger.info(f"✅ 注册 Skill: {skill.meta.icon} {skill.meta.display_name} "
+                     f"({name}) level={skill.experience_level.name}")
+
+        # 触发回调
+        for cb in self._load_callbacks:
+            try:
+                cb(skill)
+            except Exception as e:
+                logger.warning(f"回调异常: {e}")
+
+        return self
+
+    def on_load(self, callback: Callable) -> None:
+        """
+        注册加载回调。每个 Skill 被注册时都会调用。
+
+        示例:
+          registry.on_load(lambda skill: print(f"已加载: {skill.meta.name}"))
+        """
+        self._load_callbacks.append(callback)
+
+    def register_many(self, skills: List[Skill]) -> "SkillRegistry":
+        """批量注册"""
+        for skill in skills:
+            self.register(skill)
+        return self
+
+    def unregister(self, name: str) -> bool:
+        """注销 Skill"""
+        if name in self._skills:
+            del self._skills[name]
+            logger.info(f"🗑️ 注销 Skill: {name}")
+            return True
+        return False
+
+    # ── 查询 ──
+
+    def get(self, name: str) -> Optional[Skill]:
+        return self._skills.get(name)
+
+    def find(self, keyword: str) -> List[Skill]:
+        """按关键词查找 Skill"""
+        keyword = keyword.lower()
+        results = []
+        for skill in self._skills.values():
+            if (keyword in skill.meta.name.lower() or
+                keyword in skill.meta.display_name.lower() or
+                keyword in skill.meta.description.lower() or
+                any(keyword in t.lower() for t in skill.meta.tags)):
+                results.append(skill)
+        return results
+
+    def list_all(self) -> List[SkillMeta]:
+        """列出所有 Skill 元数据"""
+        return [s.meta for s in self._skills.values()]
+
+    def list_skills(self) -> List[Skill]:
+        """列出所有 Skill 实例"""
+        return list(self._skills.values())
+
+    def count(self) -> int:
+        """已注册 Skill 数量"""
+        return len(self._skills)
+
+    # ── 路由 ──
+
+    @staticmethod
+    def _keyword_match(text: str, keywords: List[str]) -> float:
+        """关键词预筛：快速过滤不匹配的 Skill"""
+        if not keywords:
+            return 0.0
+
+        text_lower = text.lower().strip()
+
+        # 计算匹配得分
+        max_score = 0.0
+        matched_count = 0
+
+        for kw in keywords:
+            kw_lower = kw.lower().strip()
+            if not kw_lower:
+                continue
+            if len(kw_lower) < 2:
+                continue
+
+            if kw_lower in text_lower:
+                # 完整匹配：长度越长权重越大
+                score = min(1.0, len(kw_lower) / 10.0)
+                max_score = max(max_score, score)
+                matched_count += 1
+            else:
+                # 部分匹配：关键词的某个子串出现在输入中
+                for i in range(max(1, len(kw_lower) - 2), len(kw_lower)):
+                    sub = kw_lower[:i]
+                    if len(sub) >= 2 and sub in text_lower:
+                        max_score = max(max_score, 0.4)
+                        break
+
+        # 多个关键词匹配加分
+        if matched_count >= 2:
+            max_score = min(1.0, max_score + 0.15)
+
+        return max_score
+
+    def route(self, user_input: str, top_k: int = 3) -> List[Tuple[Skill, float]]:
+        """
+        根据用户输入路由到最合适的 Skill（纯关键词匹配，无 LLM 调用）。
+
+        如需 LLM 语义回退，使用 route_with_fallback()。
+        """
+        # 1. 关键词预筛
+        candidates: List[Skill] = []
+        for skill in self._skills.values():
+            kw_score = self._keyword_match(user_input, skill.trigger_keywords)
+            if kw_score > 0:
+                candidates.append(skill)
+
+        # 2. 如果没有关键词匹配，fallback 到所有 Skill
+        if not candidates:
+            candidates = list(self._skills.values())
+
+        # 3. 精确评分
+        scored: List[Tuple[Skill, float]] = []
+        for skill in candidates:
+            confidence = skill.can_handle(user_input)
+            if confidence > 0:
+                scored.append((skill, confidence))
+
+        scored.sort(
+            key=lambda x: (
+                x[1],
+                x[0].experience_level.value,
+                x[0].success_rate,
+                x[0].meta.name,
+            ),
+            reverse=True,
+        )
+
+        return scored[:top_k]
+
+    async def route_with_fallback(
+        self,
+        user_input: str,
+        llm_client: Any = None,
+        top_k: int = 3,
+        min_confidence: float = 0.6,
+    ) -> List[Tuple[Skill, float]]:
+        """
+        关键词预筛 + LLM 语义匹配。
+
+        流程:
+          1. 先走纯关键词匹配
+          2. 如果最佳匹配置信度 >= min_confidence，直接返回
+          3. 否则调用 LLM 做多 Skill 语义匹配
+
+        Args:
+            user_input: 用户输入
+            llm_client: LLM 客户端
+            top_k: 返回前 k 个
+            min_confidence: 关键词匹配的最低置信度阈值
+        """
+        # 先走关键词
+        results = self.route(user_input, top_k=top_k)
+
+        if results and results[0][1] >= min_confidence:
+            return results[:top_k]
+
+        # 置信度不足 → LLM 语义匹配（多 Skill）
+        if llm_client:
+            llm_results = await self.route_with_llm(
+                user_input, llm_client, top_k=top_k
+            )
+            if llm_results:
+                names = [r[0].meta.name for r in llm_results]
+                logger.info(f"🔮 LLM 路由: {', '.join(names)}")
+                return llm_results
+
+        return results[:top_k]
+
+    async def route_with_llm(
+        self,
+        user_input: str,
+        llm_client: Any,
+        top_k: int = 3,
+    ) -> List[Tuple[Skill, float]]:
+        """
+        用 LLM 一次性匹配多个 Skill，返回排序列表。
+
+        与旧 _llm_route 的区别:
+        - 传完整 Skill 信息（tags、when_to_use、description）
+        - 返回多个 Skill 而非只选一个
+        - 更高的置信度区分（0.9/0.75/0.6）
+        """
+        skills = self.list_skills()
+        if not skills:
+            return []
+
+        # 构建完整 skill 描述
+        skill_descriptions = []
+        for s in skills:
+            tags_str = ", ".join(s.meta.tags[:5])
+            when = getattr(s, '_config', {}).get('when_to_use', '')
+            desc = f"- **{s.meta.name}** ({s.meta.display_name})\n"
+            desc += f"  {s.meta.description[:100]}\n"
+            desc += f"  标签: {tags_str}"
+            if when:
+                desc += f"\n  场景: {when}"
+            skill_descriptions.append(desc)
+
+        prompt = (
+            "根据用户请求，从以下 Skill 中匹配最相关的（可多个，按相关性排序）。\n\n"
+            f"用户请求: {user_input}\n\n"
+            "可用 Skill:\n" + "\n".join(skill_descriptions) + "\n\n"
+            f"返回 JSON 数组，最多 {top_k} 个:\n"
+            '[{"name": "skill名", "reason": "原因"}]\n\n'
+            "都不匹配返回 []。只返回 JSON:"
+        )
+
+        try:
+            response = await llm_client.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=300,
+            )
+            content = response.get("choices", [{}])[0].get("message", {}).get("content", "[]")
+            import json
+            matches = json.loads(content) if isinstance(content, str) else content
+
+            results = []
+            for i, m in enumerate(matches[:top_k]):
+                skill = self.get(m.get("name", ""))
+                if skill:
+                    confidence = 0.9 - (i * 0.15)
+                    results.append((skill, confidence))
+            return results
+        except Exception as e:
+            logger.debug(f"LLM 路由失败: {e}")
+            return []
+
+    async def _llm_route(self, user_input: str, llm_client: Any) -> Optional[Skill]:
+        """旧版 LLM 路由，保留兼容，内部委托给 route_with_llm"""
+        results = await self.route_with_llm(user_input, llm_client, top_k=1)
+        return results[0][0] if results else None
+
+    def route_exact(self, skill_name: str) -> Optional[Skill]:
+        """精确路由"""
+        return self._skills.get(skill_name)
+
+    # ── 工具收集（保留兼容接口，实际工具由 ToolRegistry 统一管理）──
+
+    def collect_tools(self, skill_names: Optional[List[str]] = None) -> Set[Type]:
+        """返回空集 — 工具由 ToolRegistry 统一管理"""
+        return set()
+
+    # ── 统计 ──
+
+    def get_stats(self) -> List[Dict]:
+        """获取所有 Skill 统计信息"""
+        stats = []
+        for skill in self._skills.values():
+            stats.append(skill.get_stats())
+        stats.sort(key=lambda x: x["success_count"], reverse=True)
+        return stats
+
+    def print_stats(self):
+        """打印统计摘要"""
+        print(f"\n{'='*60}")
+        print(f"📊 Skill 统计 ({self.count()} 个)")
+        print(f"{'─'*60}")
+
+        for stat in self.get_stats():
+            level_icon = {
+                "NOVICE": "🌱",
+                "PRACTITIONER": "🌿",
+                "EXPERT": "🌳",
+                "MASTER": "👑",
+            }.get(stat["level"], "❓")
+
+            print(f" {level_icon} {stat['display_name']:20s} "
+                  f"{stat['level']:15s} "
+                  f"✅{stat['success_count']:3d} ❌{stat['failure_count']:2d} "
+                  f"成功率:{stat['success_rate']} "
+                  f"平均耗时:{stat['avg_duration_ms']}ms")
+
+        print(f"{'='*60}\n")
+
+
+================================================================================
+# FILE: skill\router.py
+================================================================================
+"""
+skill/router.py — Skill 路由器
+
+统一走 AgentLoop 执行，不再区分 DAG multi-mode 路径。
+"""
+
+import asyncio
+import logging
+import time
+from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
+
+from ..tool.registry import ToolRegistry
+from .registry import SkillRegistry
+from .base import Skill, SkillResult
+
+from ..agent_loop import AgentLoop
+
+logger = logging.getLogger(__name__)
+
+
+class SkillRouter:
+    """
+    Skill 路由器 — 统一走 AgentLoop
+
+    流程:
+    1. 路由 → 匹配 Skill
+    2. 构建 system_prompt（base + Skill domain）
+    3. AgentLoop.run() 执行
+    """
+
+    def __init__(
+        self,
+        llm_client: Any,
+        skill_registry: Optional[SkillRegistry] = None,
+        tool_registry: Optional[ToolRegistry] = None,
+    ):
+        self.llm_client = llm_client
+        self.skill_registry = skill_registry or SkillRegistry()
+        self.tool_registry = tool_registry or ToolRegistry()
+
+    async def process(
+        self,
+        user_input: str,
+        skill_name: Optional[str] = None,
+        history: Optional[Any] = None,
+        on_event: Optional[Callable[[str, Dict], Awaitable[None]]] = None,
+        **kwargs,
+    ) -> SkillResult:
+        """
+        处理用户输入
+
+        Args:
+            user_input: 用户输入
+            skill_name: 指定 Skill 名称（None = 自动路由）
+            history: 消息历史
+            on_event: 事件回调 async fn(event_type, data)
+            **kwargs: 传给 AgentLoop.run() 的额外参数
+
+        Returns:
+            SkillResult
+        """
+        # 1. 路由（关键词 + LLM 语义回退）
+        if skill_name:
+            skill = self.skill_registry.route_exact(skill_name)
+            if not skill:
+                logger.info(f"🎯 指定 Skill '{skill_name}' 不存在")
+                return SkillResult(success=False, error=f"Skill '{skill_name}' 不存在")
+            candidates = [(skill, 1.0)] if skill else []
+            logger.info(f"🎯 指定 Skill: {skill.meta.display_name} ({skill.meta.name})")
+        else:
+            candidates = await self.skill_registry.route_with_fallback(
+                user_input, llm_client=self.llm_client, top_k=3
+            )
+            skill = candidates[0][0] if candidates else None
+            if skill:
+                names = [c[0].meta.name for c in candidates]
+                logger.info(
+                    f"🎯 Skill 匹配: {', '.join(names)} | "
+                    f"主: {skill.meta.display_name} ({candidates[0][1]:.0%})"
+                )
+            else:
+                logger.info("🎯 无匹配 Skill，走 AgentLoop 自主执行")
+
+        # 2. 构建 system_prompt（主 skill + 辅 skill 知识）
+        skill_prompts = []
+        skills_for_prompt = candidates if len(candidates) > 1 else ([(skill, 1.0)] if skill else [])
+        for s, conf in skills_for_prompt:
+            sp = s.get_system_prompt()
+            if sp:
+                label = "**主 Skill**" if s == skill else f"参考 ({conf:.0%})"
+                skill_prompts.append(f"## {label}: {s.meta.display_name}\n{sp}")
+
+        system_prompt = "\n\n".join(skill_prompts) if skill_prompts else ""
+        logger.info(f"📝 Skill: {skill.meta.display_name if skill else '无'}" + (
+            f" + {len(candidates)-1} 辅 Skill" if len(candidates) > 1 else ""
+        ))
+
+        # 3. AgentLoop 执行
+        loop = AgentLoop(
+            llm_client=self.llm_client,
+            tool_registry=self.tool_registry,
+            system_prompt=system_prompt,
+            skill=skill,
+        )
+
+        history_list: Optional[List[Dict]] = None
+        if history is not None:
+            if hasattr(history, "get_for_llm"):
+                history_list = history.get_for_llm()
+            elif isinstance(history, list):
+                history_list = history
+
+        try:
+            # AgentLoop.run() 只接受部分参数，过滤掉多余的 kwargs
+            ALLOWED_LOOP_KWARGS = {
+                "working_dir", "resume_from", "skip_last_user",
+                "compressed_until", "compressed_summary", "model_override",
+            }
+            loop_kwargs = {k: v for k, v in kwargs.items() if k in ALLOWED_LOOP_KWARGS}
+            result = await loop.run(
+                task=user_input,
+                history=history_list,
+                on_event=on_event,
+                **loop_kwargs,
+            )
+        except Exception as e:
+            logger.exception(f"AgentLoop 执行失败: {e}")
+            return SkillResult(success=False, error=f"AgentLoop 执行失败: {e}")
+
+        return SkillResult(
+            success=result.get("success", False),
+            content=result.get("content", ""),
+            data={"agent_steps": result.get("rounds", 0)},
+        )
+
+
+================================================================================
+# FILE: storage\__init__.py
+================================================================================
+"""存储层"""
+from .store import MessageStore
+
+
+================================================================================
+# FILE: storage\store.py
+================================================================================
+"""
+存储抽象接口
+"""
+
+from abc import ABC, abstractmethod
+from typing import Optional, Dict, Any, List
+
+from ..session.session import Session
+
+
+class MessageStore(ABC):
+    """消息存储抽象接口"""
+
+    @abstractmethod
+    async def save_session(self, session: Session) -> None:
+        """保存会话"""
+        pass
+
+    @abstractmethod
+    async def load_session(self, session_id: str) -> Optional[Session]:
+        """加载会话"""
+        pass
+
+    @abstractmethod
+    async def delete_session(self, session_id: str) -> bool:
+        """删除会话"""
+        pass
+
+    @abstractmethod
+    async def session_exists(self, session_id: str) -> bool:
+        """检查会话是否存在"""
+        pass
+
+    @abstractmethod
+    async def list_sessions(
+        self,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """列出会话摘要"""
+        pass
+
+
+================================================================================
+# FILE: tool\__init__.py
+================================================================================
+"""工具系统"""
+from .base import BaseTool, ToolParameter
+from .base import ToolDefinition as ToolSchema  # 向后兼容
+from .registry import ToolRegistry
+from .executor import ToolExecutor
+from .policy import ToolPolicy, AccessLevel
+from .parser import make_tool_result, parse_tool_args, fix_common_json_errors
+
+__all__ = [
+    "BaseTool", "ToolParameter", "ToolSchema", "ToolRegistry",
+    "ToolExecutor", "ToolPolicy", "AccessLevel",
+    "make_tool_result", "parse_tool_args", "fix_common_json_errors",
+]
+
+
+================================================================================
+# FILE: tool\base.py
+================================================================================
+"""
+工具基类 — v3.0 原子工具架构
+
+核心设计：
+  - 每个大类（ExcelTool）是一个命名空间
+  - 每个原子工具（excel_read_sheet）有独立名称、描述、参数
+  - LLM 直接调用原子工具名，不需要 action 字段
+  - Registry 将原子工具扁平化
+
+分类常量：
+  CATEGORY_FILE / CATEGORY_CODE / CATEGORY_DATA
+  CATEGORY_SYSTEM / CATEGORY_NETWORK / CATEGORY_SECURITY / CATEGORY_VERSION
+"""
+
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Callable, Awaitable, Union
+
+from ..core.types import ToolResult
+
+# ── 标准分类常量 ──
+CATEGORY_FILE = "file"
+CATEGORY_CODE = "code"
+CATEGORY_DATA = "data"
+CATEGORY_SYSTEM = "system"
+CATEGORY_NETWORK = "network"
+CATEGORY_SECURITY = "security"
+CATEGORY_VERSION = "version"
+
+
+@dataclass
+class ToolParameter:
+    """工具参数定义"""
+    name: str
+    type: str        # "string" | "number" | "boolean" | "object" | "array"
+    description: str
+    required: bool = False
+    default: Any = None
+    enum: Optional[List[str]] = None
+
+
+@dataclass
+class ToolDefinition:
+    """原子工具定义
+
+    LLM 直接看到的工具单位。
+    每个原子工具有完整独立的 name/description/parameters。
+    """
+    name: str
+    description: str
+    parameters: List[ToolParameter]
+    examples: List[str] = field(default_factory=list)
+    constraints: List[str] = field(default_factory=list)
+    is_read: bool = False   # 是否只读（并行执行优化）
+
+    def to_openai_format(self) -> Dict:
+        """转换为 OpenAI function calling 格式"""
+        properties = {}
+        required = []
+
+        for param in self.parameters:
+            prop = {
+                "type": param.type,
+                "description": param.description,
+            }
+            if param.enum:
+                prop["enum"] = param.enum
+            if param.default is not None:
+                prop["default"] = param.default
+            properties[param.name] = prop
+            if param.required:
+                required.append(param.name)
+
+        # 构建 description（含示例和约束）
+        desc_parts = [self.description]
+        if self.examples:
+            desc_parts.append("\n示例：")
+            for ex in self.examples:
+                desc_parts.append(f"  {ex}")
+        if self.constraints:
+            desc_parts.append("\n注意：")
+            for c in self.constraints:
+                desc_parts.append(f"  - {c}")
+
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": "\n".join(desc_parts),
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
+class BaseTool(ABC):
+    """工具大类基类
+
+    子类必须实现：
+      name       — 大类名称（命名空间，如 "excel"）
+      tools      — 原子工具列表
+
+    可选覆盖：
+      category   — 分类
+      version    — 版本号
+    """
+
+    # ── 类型检查映射表 ──
+    TYPE_CHECKS = {
+        "string": lambda v: isinstance(v, str),
+        "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+        "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+        "boolean": lambda v: isinstance(v, bool),
+        "array": lambda v: isinstance(v, list),
+        "object": lambda v: isinstance(v, dict),
+    }
+
+    TYPE_NAMES = {
+        "string": "字符串",
+        "number": "数字",
+        "integer": "整数",
+        "boolean": "布尔值",
+        "array": "数组",
+        "object": "对象",
+    }
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """大类名称（命名空间，不直接暴露给 LLM）"""
+        ...
+
+    @property
+    @abstractmethod
+    def tools(self) -> List[ToolDefinition]:
+        """该大类下所有原子工具的定义"""
+        ...
+
+    @property
+    def category(self) -> str:
+        return "general"
+
+    @property
+    def version(self) -> str:
+        return "3.0.0"
+
+    # ── 工具查找 ──
+
+    def get_tool_def(self, tool_name: str) -> Optional[ToolDefinition]:
+        for td in self.tools:
+            if td.name == tool_name:
+                return td
+        return None
+
+    def get_tool_names(self) -> List[str]:
+        return [t.name for t in self.tools]
+
+    def is_read_tool(self, tool_name: str) -> bool:
+        td = self.get_tool_def(tool_name)
+        return td.is_read if td else False
+
+    # ── 参数校验 ──
+
+    def validate_args(self, tool_name: str, args: Dict) -> tuple[bool, Optional[str]]:
+        td = self.get_tool_def(tool_name)
+        if not td:
+            return False, f"未知工具: {tool_name}"
+
+        missing = []
+        type_errors = []
+
+        for param in td.parameters:
+            if param.required and param.name not in args:
+                missing.append(param.name)
+                continue
+
+            if param.name in args:
+                value = args[param.name]
+
+                # 使用 TYPE_CHECKS 映射表进行类型检查（支持 string/number/boolean/array/object）
+                checker = self.TYPE_CHECKS.get(param.type)
+                if checker and not checker(value):
+                    expected_name = self.TYPE_NAMES.get(param.type, param.type)
+                    type_errors.append(
+                        f"参数 '{param.name}' 必须是 {expected_name}，当前是 {type(value).__name__}"
+                    )
+
+                if param.enum and value not in param.enum:
+                    type_errors.append(
+                        f"参数 '{param.name}' 必须是以下之一: {param.enum}"
+                    )
+
+        if missing:
+            return False, f"缺少必需参数: {', '.join(missing)}"
+        if type_errors:
+            return False, "; ".join(type_errors)
+        return True, None
+
+    # ── 统一调度入口 ──
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        """执行原子工具
+
+        子类必须实现自己的 execute() 方法做调度。
+        此基类方法仅做参数校验和错误包装。
+        """
+        td = self.get_tool_def(tool_name)
+        if not td:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+
+        # 参数校验
+        ok, err = self.validate_args(tool_name, kwargs)
+        if not ok:
+            return ToolResult.fail(call_id, tool_name, err)
+
+        return ToolResult.ok(call_id, tool_name, {"message": f"工具 {tool_name} 的 execute() 未被子类实现"})
+
+
+================================================================================
+# FILE: tool\executor.py
+================================================================================
+"""
+engine/tool/executor.py — 工具执行器（懒加载触发点）
+"""
+import asyncio
+import json
+import logging
+from typing import List, Optional
+
+from ..core.types import ToolCall, ToolResult
+from .registry import ToolRegistry
+from .policy import ToolPolicy, AccessLevel
+
+logger = logging.getLogger("ToolExecutor")
+
+
+class ToolExecutor:
+    """工具执行器（带超时控制 + 权限策略）"""
+
+    def __init__(self, registry: Optional[ToolRegistry] = None,
+                 default_timeout: float = 30.0,
+                 policy: Optional[ToolPolicy] = None):
+        self.registry = registry or ToolRegistry()
+        self._max_parallel = 10
+        self._default_timeout = default_timeout
+        self.policy = policy
+
+    def set_max_parallel(self, max_parallel: int) -> None:
+        self._max_parallel = max_parallel
+
+    async def execute_one(self, call: ToolCall, timeout: Optional[float] = None, max_retries: int = 2) -> ToolResult:
+        """执行单个工具调用（带超时控制 + 权限检查 + 自动重试）"""
+        # ── 权限检查 ──
+        if self.policy:
+            access = self.policy.check(call.name, call.id)
+            if access == AccessLevel.DENY:
+                return ToolResult.error(
+                    call.id, call.name,
+                    f"工具 '{call.name}' 已被禁止执行"
+                )
+            elif access == AccessLevel.REQUIRE_APPROVAL:
+                logger.warning(f"⏸️ 工具 '{call.name}' 等待审批 (call_id={call.id[:12]})")
+                return ToolResult.error(
+                    call.id, call.name,
+                    f"工具 '{call.name}' 需要人类审批才能执行"
+                )
+
+        tool = self.registry.get(call.name)
+        if not tool:
+            return ToolResult.error(call.id, call.name, f"工具 '{call.name}' 未注册")
+
+        is_valid, error_msg = tool.validate_args(call.name, call.arguments)
+        if not is_valid:
+            return ToolResult.error(call.id, call.name, error_msg or "参数无效")
+
+        # 使用工具级重试配置
+        tool_retry_errors = getattr(tool, 'retryable_exceptions', (ConnectionError, TimeoutError, OSError))
+        tool_max_retries = getattr(tool, 'max_retries', max_retries)
+
+        last_error = None
+        retryable_errors = tool_retry_errors
+        timeout_val = timeout if timeout is not None else self._default_timeout
+
+        logger.info(
+            f"🔧 执行工具: {call.name} | "
+            f"参数: {json.dumps(call.arguments, ensure_ascii=False)[:200]}"
+        )
+
+        for attempt in range(tool_max_retries + 1):
+            try:
+                if attempt > 0:
+                    backoff = 2 ** attempt  # 指数退避: 2s, 4s
+                    cause = last_error.error_message if last_error and hasattr(last_error, 'error_message') else (str(last_error) if last_error else '超时')
+                    logger.warning(f"🔄 工具 '{call.name}' 第 {attempt}/{tool_max_retries} 次重试 (原因: {cause}) (等待 {backoff}s)")
+                    await asyncio.sleep(backoff)
+
+                result = await asyncio.wait_for(
+                    tool.execute(call.id, **call.arguments),
+                    timeout=timeout_val
+                )
+
+                # 工具自身返回错误但可重试
+                if result.is_success or attempt >= tool_max_retries:
+                    return result
+
+                last_error = result
+                logger.warning(f"工具 '{call.name}' 返回错误: {result.error_message}, 准备重试")
+
+            except asyncio.TimeoutError:
+                last_error = ToolResult.error(call.id, call.name, f"工具执行超时 ({timeout_val}s)")
+                if attempt >= tool_max_retries:
+                    return last_error
+                logger.warning(f"工具 '{call.name}' 超时，准备重试 (attempt {attempt + 1})")
+
+            except retryable_errors as e:
+                last_error = ToolResult.error(call.id, call.name, str(e))
+                if attempt >= tool_max_retries:
+                    return last_error
+                logger.warning(f"工具 '{call.name}' 可重试异常: {e}, 准备重试")
+
+            except Exception as e:
+                logger.exception(f"工具 {call.name} 异常: {e}")
+                return ToolResult.error(call.id, call.name, str(e))
+
+        return last_error or ToolResult.error(call.id, call.name, "执行失败: 未知错误")
+
+    async def execute_parallel(
+        self,
+        calls: List[ToolCall],
+        timeout: Optional[float] = None,
+    ) -> List[ToolResult]:
+        """并行执行多个工具（带超时）"""
+        if not calls:
+            return []
+
+        semaphore = asyncio.Semaphore(self._max_parallel)
+
+        async def execute_with_limit(call: ToolCall):
+            async with semaphore:
+                return await self.execute_one(call, timeout=timeout)
+
+        results = await asyncio.gather(
+            *[execute_with_limit(c) for c in calls],
+            return_exceptions=True
+        )
+
+        final_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                final_results.append(
+                    ToolResult.error(calls[i].id, calls[i].name, str(result))
+                )
+            else:
+                final_results.append(result)
+        return final_results
+
+
+================================================================================
+# FILE: tool\mcp.py
+================================================================================
+"""
+tool/mcp.py — MCP (Model Context Protocol) 工具适配器
+
+支持通过 MCP 协议自动发现和调用外部工具，无需手动注册。
+
+支持的 transport:
+  - stdio: 子进程通信 (mcp-server-filesystem 等官方服务)
+  - sse: HTTP SSE 通信 (远程 MCP 服务)
+
+用法:
+  # 注册一个 MCP stdio 服务
+  registry.register(MCPToolAdapter(
+      name="mcp_fs",
+      transport="stdio",
+      command=["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
+      description="文件系统 MCP 服务"
+  ))
+
+  # 注册一个 MCP SSE 服务
+  registry.register(MCPToolAdapter(
+      name="mcp_remote",
+      transport="sse",
+      url="http://localhost:3001/mcp",
+      description="远程 MCP 服务"
+  ))
+"""
+
+import asyncio
+import json
+import logging
+import subprocess
+from typing import Any, Dict, List, Optional
+
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
+
+from .base import BaseTool, ToolParameter, ToolResult
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════
+#  资源泄漏防护：注册 atexit 清理
+# ═════════════════════════════════════==
+import atexit as _atexit
+_mcp_instances: list = []
+
+
+def _close_all_mcp():
+    """关闭所有 MCP 适配器（atexit 回调）"""
+    import asyncio
+    for inst in _mcp_instances[:]:
+        try:
+            if inst._process:
+                inst._process.terminate()
+                inst._process.wait(timeout=3)
+        except Exception:
+            pass
+        try:
+            if inst._client:
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(inst._client.aclose())
+                loop.close()
+        except Exception:
+            pass
+        inst._initialized = False
+    _mcp_instances.clear()
+
+
+_atexit.register(_close_all_mcp)
+
+
+class MCPToolAdapter(BaseTool):
+    """
+    MCP 协议适配器 — 自动发现并代理 MCP 服务的所有工具。
+
+    每个 MCPToolAdapter 实例对应一个 MCP 服务（含多个工具）。
+    通过 `__getattr__` 或 `get_tool(name)` 获取子工具。
+    """
+
+    def __init__(
+        self,
+        name: str,
+        description: str = "MCP 工具服务",
+        transport: str = "stdio",
+        command: Optional[List[str]] = None,
+        url: Optional[str] = None,
+        timeout: float = 30.0,
+    ):
+        self._name = name
+        self._desc = description
+        self.transport = transport
+        self.command = command or []
+        self.url = url
+        self.timeout = timeout
+
+        self._process: Optional[subprocess.Popen] = None
+        self._client: Optional[httpx.AsyncClient] = None
+        self._session_id: Optional[str] = None
+        self._tools: List[Dict] = []  # 自动发现的工具列表
+        self._initialized = False
+        self._finalized = False
+        self._stderr_task: Optional[asyncio.Task] = None  # stderr 读取任务
+
+        # 注册到全局清理列表（防泄漏）
+        _mcp_instances.append(self)
+        self._lock = asyncio.Lock()
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        discovered = len(self._tools)
+        if discovered:
+            return f"{self._desc} ({discovered} 个子工具 via MCP)"
+        return self._desc
+
+    @property
+    def parameters(self) -> List[ToolParameter]:
+        return [
+            ToolParameter("tool", "string", "要调用的子工具名称", required=True),
+            ToolParameter("args", "object", "子工具的参数", required=True),
+        ]
+
+    async def initialize(self) -> bool:
+        """初始化 MCP 连接并自动发现工具"""
+        if self._initialized:
+            return True
+
+        async with self._lock:
+            if self._initialized:
+                return True
+
+            try:
+                if self.transport == "stdio":
+                    await self._init_stdio()
+                elif self.transport == "sse":
+                    await self._init_sse()
+                else:
+                    logger.error(f"不支持的 transport: {self.transport}")
+                    return False
+
+                # 自动发现工具
+                await self._discover_tools()
+                self._initialized = True
+                logger.info(f"MCP [{self._name}] 初始化完成: {len(self._tools)} 个工具")
+                return True
+
+            except Exception as e:
+                logger.error(f"MCP [{self._name}] 初始化失败: {e}")
+                return False
+
+    async def _init_stdio(self):
+        """启动 stdio 子进程"""
+        if not self.command:
+            raise ValueError("stdio transport 需要 command 参数")
+
+        self._process = subprocess.Popen(
+            self.command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        logger.info(f"MCP [{self._name}] stdio 进程已启动: {' '.join(self.command)}")
+
+        # 检测进程是否立即退出（启动失败场景）
+        await asyncio.sleep(0.1)
+        if self._process.poll() is not None:
+            stderr_output = self._process.stderr.read() if self._process.stderr else ""
+            raise RuntimeError(
+                f"MCP 进程启动失败 (exit={self._process.returncode}): {stderr_output[:500]}"
+            )
+
+        # 启动 stderr 读取任务（防止缓冲区满阻塞子进程）
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+    async def _drain_stderr(self):
+        """异步读取 stderr，防止管道缓冲区满阻塞子进程"""
+        if not self._process or not self._process.stderr:
+            return
+        try:
+            while self._process.poll() is None:
+                line = await asyncio.get_event_loop().run_in_executor(
+                    None, self._process.stderr.readline
+                )
+                if not line:
+                    break
+                line = line.strip()
+                if line:
+                    logger.debug(f"MCP [{self._name}] stderr: {line[:200]}")
+        except Exception as e:
+            logger.debug(f"MCP [{self._name}] stderr 读取异常: {e}")
+
+    async def _init_sse(self):
+        """初始化 SSE 连接"""
+        if not HAS_HTTPX:
+            raise ImportError("SSE transport 需要 httpx 库: pip install httpx")
+        if not self.url:
+            raise ValueError("SSE transport 需要 url 参数")
+
+        self._client = httpx.AsyncClient(timeout=self.timeout)
+        resp = await self._client.post(f"{self.url}/session", json={})
+        if resp.status_code == 200:
+            data = resp.json()
+            self._session_id = data.get("sessionId")
+            logger.info(f"MCP [{self._name}] SSE 会话已创建: {self._session_id}")
+
+    async def _discover_tools(self):
+        """调用 MCP list_tools 方法发现所有工具"""
+        result = await self._send_request("list_tools", {})
+        if result and "tools" in result:
+            self._tools = result["tools"]
+        else:
+            logger.warning(f"MCP [{self._name}] list_tools 返回空")
+
+    async def _send_request(self, method: str, params: Dict) -> Optional[Dict]:
+        """发送 MCP JSON-RPC 请求"""
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        }
+
+        if self.transport == "stdio":
+            return await self._send_stdio(request)
+        elif self.transport == "sse":
+            return await self._send_sse(request)
+        return None
+
+    async def _send_stdio(self, request: Dict) -> Optional[Dict]:
+        """通过 stdio 发送请求"""
+        if not self._process or not self._process.stdin:
+            return None
+
+        line = json.dumps(request, ensure_ascii=False) + "\n"
+        self._process.stdin.write(line)
+        self._process.stdin.flush()
+
+        response_line = self._process.stdout.readline() if self._process.stdout else ""
+        if response_line:
+            try:
+                return json.loads(response_line.strip())
+            except json.JSONDecodeError as e:
+                logger.error(f"MCP stdio 响应解析失败: {e}, 原始: {response_line[:200]}")
+        return None
+
+    async def _send_sse(self, request: Dict) -> Optional[Dict]:
+        """通过 SSE HTTP 发送请求"""
+        if not self._client:
+            return None
+
+        try:
+            resp = await self._client.post(
+                f"{self.url}/message",
+                json=request,
+                params={"sessionId": self._session_id} if self._session_id else {},
+            )
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            logger.error(f"MCP SSE 请求失败: {e}")
+        return None
+
+    async def execute(self, call_id: str, **kwargs) -> ToolResult:
+        """执行 MCP 工具的某个子工具"""
+        tool_name = kwargs.get("tool", "")
+        tool_args = kwargs.get("args", {})
+
+        if not tool_name:
+            return ToolResult.error(call_id, self._name, "缺少 tool 参数")
+
+        # 确保已初始化
+        if not self._initialized:
+            ok = await self.initialize()
+            if not ok:
+                return ToolResult.error(call_id, self._name, "MCP 初始化失败")
+
+        # 检查工具是否存在
+        discovered = {t.get("name", "") for t in self._tools}
+        if tool_name not in discovered:
+            available = ", ".join(sorted(discovered)) if discovered else "(无)"
+            return ToolResult.error(
+                call_id, self._name,
+                f"子工具 '{tool_name}' 不存在。可用工具: {available}"
+            )
+
+        # 调用 MCP tool_call
+        result = await self._send_request("tools/call", {
+            "name": tool_name,
+            "arguments": tool_args,
+        })
+
+        if result is None:
+            return ToolResult.error(call_id, self._name, "MCP 调用无响应")
+
+        if "error" in result:
+            return ToolResult.error(call_id, self._name, str(result["error"]))
+
+        content = result.get("content", [])
+        # MCP 返回的 content 是 content item 列表，提取文本
+        texts = []
+        for item in content if isinstance(content, list) else [content]:
+            if isinstance(item, dict):
+                texts.append(item.get("text", str(item)))
+            else:
+                texts.append(str(item))
+
+        return ToolResult.success(call_id, self._name, {
+            "tool": tool_name,
+            "result": "\n".join(texts),
+        })
+
+    def get_discovered_tools(self) -> List[Dict]:
+        """获取自动发现的所有子工具列表"""
+        return self._tools.copy()
+
+    def expand_to_tools(self) -> List["MCPSubTool"]:
+        """
+        将 MCP 服务的子工具展开为独立的 MCPSubTool 实例。
+
+        这样 LLM 直接看到 `mcp_fs_read`、`mcp_fs_write` 等具体工具，
+        而不是一个 `mcp_fs(tool="...")` 二级调用。
+        """
+        sub_tools = []
+        for t in self._tools:
+            sub_tool = MCPSubTool(
+                parent=self,
+                sub_name=t.get("name", ""),
+                description=t.get("description", ""),
+                input_schema=t.get("inputSchema", {}),
+            )
+            sub_tools.append(sub_tool)
+        return sub_tools
+
+    def get_tool_names(self) -> List[str]:
+        """获取自动发现的工具名称列表"""
+        return [t.get("name", "") for t in self._tools]
+
+    async def aclose(self):
+        """异步关闭（在事件循环中使用，推荐）"""
+        if self._finalized:
+            return
+        self._finalized = True
+
+        # 取消 stderr 读取任务
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
+            try:
+                await self._stderr_task
+            except asyncio.CancelledError:
+                pass
+            self._stderr_task = None
+
+        if self._process:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._process.kill()
+                except Exception:
+                    pass
+            finally:
+                self._process = None
+
+        if self._client:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+            self._client = None
+
+        self._initialized = False
+        # 从全局清理列表移除
+        try:
+            _mcp_instances.remove(self)
+        except ValueError:
+            pass
+        logger.info(f"MCP [{self._name}] 已关闭")
+
+    def close(self):
+        """同步关闭（在非事件循环中使用）"""
+        if self._finalized:
+            return
+        self._finalized = True
+
+        # 取消 stderr 读取任务（尽力而为）
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
+            self._stderr_task = None
+
+        if self._process:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._process.kill()
+                except Exception:
+                    pass
+            finally:
+                self._process = None
+
+        if self._client:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if not loop.is_running():
+                    loop.run_until_complete(self._client.aclose())
+            except RuntimeError:
+                # 没有可用的事件循环，直接跳过
+                pass
+            self._client = None
+
+        self._initialized = False
+        # 从全局清理列表移除
+        try:
+            _mcp_instances.remove(self)
+        except ValueError:
+            pass
+        logger.info(f"MCP [{self._name}] 已关闭")
+
+
+class MCPSubTool(BaseTool):
+    """
+    MCP 子工具包装——每个子工具独立注册，LLM 直接可见。
+
+    由 MCPToolAdapter.expand_to_tools() 生成。
+    执行时委托给父 adapter 处理。
+    """
+
+    def __init__(
+        self,
+        parent: MCPToolAdapter,
+        sub_name: str,
+        description: str = "",
+        input_schema: Optional[Dict] = None,
+    ):
+        self._parent = parent
+        self._sub_name = sub_name
+        self._desc = description
+        self._input_schema = input_schema or {}
+
+    @property
+    def name(self) -> str:
+        return f"{self._parent.name}_{self._sub_name}"
+
+    @property
+    def description(self) -> str:
+        return self._desc or f"MCP 子工具: {self._sub_name}"
+
+    @property
+    def parameters(self) -> List[ToolParameter]:
+        """从 MCP inputSchema 转换为 ToolParameter 列表"""
+        params = []
+        schema = self._input_schema
+        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        required_list = schema.get("required", []) if isinstance(schema, dict) else []
+
+        for pname, pinfo in properties.items():
+            if isinstance(pinfo, dict):
+                ptype = pinfo.get("type", "string")
+                pdesc = pinfo.get("description", "")
+            else:
+                ptype, pdesc = "string", ""
+            params.append(ToolParameter(
+                name=pname,
+                type=ptype,
+                description=pdesc,
+                required=pname in required_list,
+            ))
+        return params
+
+    async def execute(self, call_id: str, **kwargs) -> ToolResult:
+        """委托 parent 执行"""
+        # 先确保 parent 已初始化
+        if not self._parent._initialized:
+            ok = await self._parent.initialize()
+            if not ok:
+                return ToolResult.error(call_id, self.name, "MCP 初始化失败")
+
+        result = await self._parent._send_request("tools/call", {
+            "name": self._sub_name,
+            "arguments": kwargs,
+        })
+
+        if result is None:
+            return ToolResult.error(call_id, self.name, "MCP 调用无响应")
+
+        if "error" in result:
+            return ToolResult.error(call_id, self.name, str(result["error"]))
+
+        content = result.get("content", [])
+        texts = []
+        for item in content if isinstance(content, list) else [content]:
+            if isinstance(item, dict):
+                texts.append(item.get("text", str(item)))
+            else:
+                texts.append(str(item))
+
+        return ToolResult.success(call_id, self.name, {
+            "tool": self._sub_name,
+            "result": "\n".join(texts),
+        })
+
+    def close(self):
+        """委托到 parent 关闭"""
+        self._parent.close()
+
+
+================================================================================
+# FILE: tool\parser.py
+================================================================================
+"""
+engine/tool/parser.py — JSON 解析 + 结果格式化
+
+从 agent_loop.py 提取的 JSON 解析工具和 tool result 构建函数。
+"""
+
+import ast
+import json
+import logging
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+def make_tool_result(call_id: str, content: str) -> Dict:
+    """统一构建 tool result 消息，确保永远不会漏掉 tool_call_id"""
+    return {
+        "role": "tool",
+        "tool_call_id": call_id or "",
+        "content": content,
+    }
+
+
+def parse_tool_args(
+    tool_name: str,
+    tool_args_raw: str,
+    tool_registry: Optional[Any] = None,
+) -> Tuple[Dict, bool]:
+    """多层 JSON 解析。
+    返回 (parsed_dict, ok)，不涉及 messages 副作用（由调用方处理）。
+    """
+    stripped = tool_args_raw.strip()
+
+    # 第 1 层：直接 json.loads
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return parsed, True
+    except json.JSONDecodeError:
+        pass
+
+    # 第 2 层：修复常见 JSON 错误后再试
+    try:
+        fixed = fix_common_json_errors(stripped)
+        parsed = json.loads(fixed)
+        if isinstance(parsed, dict):
+            return parsed, True
+    except (json.JSONDecodeError, Exception):
+        pass
+
+    # 第 3 层：ast.literal_eval（处理单引号等 Python 风格字典）
+    if stripped.startswith("{") and stripped.endswith("}") and len(stripped) < 10000:
+        try:
+            parsed = ast.literal_eval(stripped)
+            if isinstance(parsed, dict):
+                return parsed, True
+        except (ValueError, SyntaxError, MemoryError):
+            pass
+
+    # 第 4 层：正则修复 command 字段中未转义的双引号
+    try:
+        fixed = re.sub(
+            r'"command"\s*:\s*"(.+?)"(?=\s*[,}]|\s*\n\s*"(?!command))',
+            lambda m: f'"command": {json.dumps(m.group(1))}',
+            stripped,
+            flags=re.DOTALL,
+        )
+        parsed = json.loads(fixed)
+        if isinstance(parsed, dict):
+            return parsed, True
+    except (json.JSONDecodeError, Exception):
+        pass
+
+    # 全部失败
+    return {}, False
+
+
+def get_tool_param_hint(tool_registry: Any, tool_name: str) -> str:
+    """获取工具的参数格式提示。"""
+    if tool_registry is None:
+        return ""
+    tool_def = (
+        tool_registry.get_tool_def(tool_name)
+        if hasattr(tool_registry, "get_tool_def") else None
+    )
+    if tool_def and hasattr(tool_def, "parameters"):
+        param_lines = []
+        for p in tool_def.parameters:
+            req = "(必填)" if getattr(p, "required", False) else "(可选)"
+            desc = getattr(p, "description", "")[:80]
+            param_lines.append(f"  - {p.name} {req}: {desc}")
+        if param_lines:
+            return "\n期望参数格式:\n" + "\n".join(param_lines)
+    return ""
+
+
+def fix_common_json_errors(raw: str) -> str:
+    """修复常见 JSON 格式错误。"""
+    # 移除尾部逗号: ,} → } 和 ,] → ]
+    raw = re.sub(r",\s*}", "}", raw)
+    raw = re.sub(r",\s*]", "]", raw)
+
+    # 单引号 → 双引号（仅在看起来像 Python 字典时）
+    if "'" in raw and '"' not in raw:
+        raw = raw.replace("'", '"')
+
+    # 修复 True/False/None → true/false/null（Python → JSON）
+    raw = re.sub(r"\bTrue\b", "true", raw)
+    raw = re.sub(r"\bFalse\b", "false", raw)
+    raw = re.sub(r"\bNone\b", "null", raw)
+
+    return raw
+
+
+================================================================================
+# FILE: tool\policy.py
+================================================================================
+"""
+tool/policy.py — 工具权限策略
+
+定义工具的访问控制：
+- ALLOW: 无条件允许
+- DENY: 无条件拒绝
+- REQUIRE_APPROVAL: 需要人类审批
+
+使用方式：
+    policy = ToolPolicy()
+    policy.set("shell_execute", AccessLevel.REQUIRE_APPROVAL)
+    policy.set("file_write", AccessLevel.REQUIRE_APPROVAL)
+
+    executor = ToolExecutor(registry, policy=policy)
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+from enum import Enum
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class AccessLevel(Enum):
+    ALLOW = "allow"
+    DENY = "deny"
+    REQUIRE_APPROVAL = "require_approval"
+
+
+DEFAULT_POLICY: Dict[str, AccessLevel] = {
+    # Shell — 默认禁止，需显式授权
+    "shell_execute": AccessLevel.DENY,
+    "shell_run": AccessLevel.REQUIRE_APPROVAL,
+
+    # 文件写操作 — 默认需审批
+    "file_write": AccessLevel.REQUIRE_APPROVAL,
+    "file_append": AccessLevel.REQUIRE_APPROVAL,
+
+    # 代码编辑 — 默认需审批（小修改动态放行）
+    "code_write": AccessLevel.REQUIRE_APPROVAL,
+    "code_create": AccessLevel.REQUIRE_APPROVAL,
+    "code_append": AccessLevel.REQUIRE_APPROVAL,
+
+    # 进程管理 — 默认禁止
+    "process_list": AccessLevel.DENY,
+
+    # Git 写操作 — 默认需审批
+    "git_commit": AccessLevel.REQUIRE_APPROVAL,
+    "git_push": AccessLevel.REQUIRE_APPROVAL,
+
+    # 其余工具默认 allow
+}
+
+
+@dataclass
+class ToolPolicy:
+    """
+    工具权限策略
+
+    支持规则的动态添加和查询。
+    approve() 和 deny() 用于在运行时临时覆盖（如人类确认后）。
+    """
+
+    _rules: Dict[str, AccessLevel] = field(default_factory=lambda: dict(DEFAULT_POLICY))
+    _pending_approvals: Dict[str, str] = field(default_factory=dict)  # tool_name -> call_id
+
+    def get(self, tool_name: str) -> AccessLevel:
+        """获取工具的访问级别"""
+        return self._rules.get(tool_name, AccessLevel.ALLOW)
+
+    def set(self, tool_name: str, level: AccessLevel) -> None:
+        """设置工具的访问级别"""
+        self._rules[tool_name] = level
+        logger.info(f"策略: {tool_name} -> {level.value}")
+
+    def check(self, tool_name: str, call_id: str = "") -> AccessLevel:
+        """
+        检查工具是否允许执行
+
+        Returns:
+            AccessLevel: ALLOW / DENY / REQUIRE_APPROVAL
+        """
+        level = self.get(tool_name)
+
+        if level == AccessLevel.DENY:
+            logger.warning(f"🔒 工具被禁止: {tool_name}")
+        elif level == AccessLevel.REQUIRE_APPROVAL:
+            self._pending_approvals[call_id] = tool_name
+            logger.info(f"📝 需要审批: {tool_name} (call_id={call_id[:12]})")
+
+        return level
+
+    def check_dynamic(self, tool_name: str, tool_args: Dict, call_id: str = "") -> AccessLevel:
+        """
+        带参数感知的动态检查。
+
+        某些工具在小修改时自动放行（如 code_write ≤50 行）。
+        """
+        # code_write/code_append/code_create: 小修改自动放行
+        if tool_name in ("code_write", "code_append", "code_create"):
+            new_text = tool_args.get("new_text", "")
+            if isinstance(new_text, str):
+                line_count = len(new_text.splitlines())
+                if line_count <= 50:
+                    return AccessLevel.ALLOW
+
+        return self.check(tool_name, call_id)
+
+    def approve(self, call_id: str) -> bool:
+        """批准一个待审批的调用"""
+        if call_id in self._pending_approvals:
+            tool_name = self._pending_approvals.pop(call_id)
+            logger.info(f"✅ 已批准: {tool_name}")
+            return True
+        return False
+
+    def deny(self, call_id: str) -> bool:
+        """拒绝一个待审批的调用"""
+        if call_id in self._pending_approvals:
+            tool_name = self._pending_approvals.pop(call_id)
+            logger.info(f"❌ 已拒绝: {tool_name}")
+            return True
+        return False
+
+    def reset(self) -> None:
+        """重置为默认策略"""
+        self._rules = dict(DEFAULT_POLICY)
+        self._pending_approvals.clear()
+        logger.info("策略已重置为默认值")
+
+
+================================================================================
+# FILE: tool\registry.py
+================================================================================
+"""
+工具注册中心 — v3.0 原子工具扁平化
+
+设计：
+  - 注册的是工具大类（BaseTool 子类）
+  - 导出的是扁平化原子工具列表（供 LLM 调用）
+  - 执行时按原子工具名路由到对应大类的 handler
+"""
+
+import json
+import logging
+import re
+import time
+from typing import Dict, List, Optional, Type, Any
+
+from .base import BaseTool, ToolDefinition
+
+logger = logging.getLogger("ToolRegistry")
+
+
+class ToolRegistry:
+    """
+    工具注册中心
+
+    注册大类 → 导出原子工具 → 按名执行
+    """
+
+    _instance: Optional["ToolRegistry"] = None
+    _singleton_enabled: bool = True  # 类变量控制，测试时可禁用
+
+    def __new__(cls):
+        if cls._singleton_enabled and cls._instance is not None:
+            return cls._instance
+        instance = super().__new__(cls)
+        if cls._singleton_enabled:
+            cls._instance = instance
+            instance._initialized = False
+        else:
+            instance._initialized = False
+        return instance
+
+    @classmethod
+    def disable_singleton(cls):
+        """测试用：禁用单例模式，允许创建独立实例"""
+        cls._singleton_enabled = False
+        cls._instance = None
+
+    @classmethod
+    def enable_singleton(cls):
+        """恢复单例模式"""
+        cls._singleton_enabled = True
+        cls._instance = None
+
+    def __init__(self):
+        if self._initialized:
+            return
+
+        # 大类注册表: {namespace: (tool_class, init_kwargs)}
+        self._categories: Dict[str, tuple] = {}
+
+        # 大类实例缓存: {namespace: instance}
+        self._instances: Dict[str, BaseTool] = {}
+
+        # 扁平化原子工具: {atomic_name: (namespace, ToolDefinition)}
+        self._atomic_tools: Dict[str, tuple] = {}
+
+        # OpenAI 格式缓存
+        self._openai_cache: Optional[List[Dict]] = None
+
+        # 结果缓存
+        self._result_cache: Dict[str, tuple] = {}
+        self._result_cache_ttl: float = 300.0
+
+        self._lock = __import__('threading').Lock()
+
+        self._initialized = True
+        logger.debug("ToolRegistry v3 初始化（原子工具扁平化）")
+
+    @classmethod
+    def reset(cls):
+        if cls._instance:
+            cls._instance.clear()
+        cls._instance = None
+
+    # ── 注册（懒加载）──
+
+    def register(self, tool_class: Type[BaseTool], **init_kwargs) -> "ToolRegistry":
+        """注册工具大类"""
+        with self._lock:
+            try:
+                temp = tool_class(**init_kwargs)
+                ns = temp.name
+            except Exception as e:
+                logger.error(f"实例化失败 {tool_class.__name__}: {e}")
+                return self
+
+            self._categories[ns] = (tool_class, dict(init_kwargs))
+            self._instances.pop(ns, None)
+            self._atomic_tools.clear()
+            self._openai_cache = None
+
+            # 校验工具名规范
+            if not re.match(r'^[a-z][a-z0-9_]*$', ns):
+                logger.warning(f"大类名 '{ns}' 非 snake_case")
+
+            logger.debug(f"注册大类: {ns}")
+        return self
+
+    def register_many(self, tool_classes: List[Type[BaseTool]]) -> "ToolRegistry":
+        for tc in tool_classes:
+            self.register(tc)
+        return self
+
+    def register_with_config(self, config: Dict[Type[BaseTool], Dict]) -> "ToolRegistry":
+        for tc, kwargs in config.items():
+            self.register(tc, **kwargs)
+        return self
+
+    # ── 获取实例（懒加载）──
+
+    def _get_instance(self, namespace: str) -> Optional[BaseTool]:
+        if namespace in self._instances:
+            return self._instances[namespace]
+
+        if namespace in self._categories:
+            cls, kwargs = self._categories[namespace]
+            try:
+                inst = cls(**kwargs)
+                self._instances[namespace] = inst
+                return inst
+            except Exception as e:
+                logger.error(f"实例化失败 {namespace}: {e}")
+        return None
+
+    # ── 扁平化原子工具 ──
+
+    def _build_flattened_index(self):
+        """构建扁平化原子工具索引"""
+        if self._atomic_tools:
+            return
+
+        for ns in self._categories:
+            inst = self._get_instance(ns)
+            if not inst:
+                continue
+
+            tool_defs = inst.tools if callable(inst.tools) else inst.tools
+            for td in tool_defs:
+                if td.name in self._atomic_tools:
+                    prev_ns = self._atomic_tools[td.name][0]
+                    logger.warning(f"原子工具 '{td.name}' 冲突: {prev_ns} vs {ns}")
+                self._atomic_tools[td.name] = (ns, td)
+
+    # ── 查询 ──
+
+    def list_tools(self) -> List[str]:
+        """列出所有原子工具名"""
+        self._build_flattened_index()
+        return list(self._atomic_tools.keys())
+
+    def list_categories(self) -> List[str]:
+        """列出所有大类名"""
+        return list(self._categories.keys())
+
+    def get_all_definitions(self) -> List[ToolDefinition]:
+        """获取所有原子工具定义"""
+        self._build_flattened_index()
+        return [td for _, td in sorted(self._atomic_tools.values(), key=lambda x: x[0])]
+
+    def get_openai_tools(self) -> List[Dict]:
+        """获取 OpenAI 格式的工具列表（带缓存）"""
+        if self._openai_cache:
+            return self._openai_cache
+
+        defs = self.get_all_definitions()
+        result = [td.to_openai_format() for td in defs]
+        self._openai_cache = result
+        return result
+
+    def get(self, atomic_name: str) -> Optional[BaseTool]:
+        """【向后兼容】通过原子工具名获取所属大类的实例"""
+        self._build_flattened_index()
+        entry = self._atomic_tools.get(atomic_name)
+        if entry:
+            ns = entry[0]
+            return self._get_instance(ns)
+        return None
+
+    def get_tool_def(self, atomic_name: str) -> Optional[ToolDefinition]:
+        """获取原子工具定义"""
+        self._build_flattened_index()
+        entry = self._atomic_tools.get(atomic_name)
+        return entry[1] if entry else None
+
+    def is_read_tool(self, atomic_name: str) -> bool:
+        """判断原子工具是否只读"""
+        td = self.get_tool_def(atomic_name)
+        return td.is_read if td else False
+
+    def has_tool(self, atomic_name: str) -> bool:
+        self._build_flattened_index()
+        return atomic_name in self._atomic_tools
+
+    def count_atomic(self) -> int:
+        self._build_flattened_index()
+        return len(self._atomic_tools)
+
+    def count_categories(self) -> int:
+        return len(self._categories)
+
+    # ── 执行 ──
+
+    async def execute(self, atomic_name: str, call_id: str, **kwargs) -> Any:
+        """执行原子工具
+
+        Args:
+            atomic_name: 原子工具名（如 "excel_read_sheet"）
+            call_id: 调用 ID
+            **kwargs: 工具参数
+        Returns:
+            ToolResult
+        """
+        self._build_flattened_index()
+        entry = self._atomic_tools.get(atomic_name)
+        if not entry:
+            raise ValueError(f"未知工具: {atomic_name}")
+
+        ns, td = entry
+        inst = self._get_instance(ns)
+        if not inst:
+            raise ValueError(f"无法实例化工具类: {ns}")
+
+        return await inst.execute(call_id, atomic_name, **kwargs)
+
+    # ── 状态 ──
+
+    def get_status(self) -> Dict:
+        return {
+            "categories": self.count_categories(),
+            "atomic_tools": self.count_atomic(),
+            "names": self.list_tools(),
+            "category_list": self.list_categories(),
+        }
+
+    # ── 结果缓存 ──
+
+    def get_cached_result(self, tool_name: str, args: Dict) -> Optional[Any]:
+        key = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
+        entry = self._result_cache.get(key)
+        if not entry:
+            return None
+        cached_at, result = entry
+        if time.monotonic() - cached_at > self._result_cache_ttl:
+            self._result_cache.pop(key, None)
+            return None
+        return result
+
+    def cache_result(self, tool_name: str, args: Dict, result: Any) -> None:
+        key = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
+        self._result_cache[key] = (time.monotonic(), result)
+        if len(self._result_cache) > 1000:
+            sorted_items = sorted(
+                self._result_cache.items(),
+                key=lambda x: x[1][0],
+            )
+            for k, _ in sorted_items[:len(sorted_items) // 2]:
+                self._result_cache.pop(k, None)
+
+    # ── 校验 ──
+
+    def validate_all(self) -> List[str]:
+        """检查所有工具的一致性"""
+        issues = []
+        self._build_flattened_index()
+
+        seen_names = {}
+        for atomic_name, (ns, td) in self._atomic_tools.items():
+            # 命名重复检查
+            if atomic_name in seen_names:
+                issues.append(f"原子工具名冲突: '{atomic_name}' (大类 {seen_names[atomic_name]} vs {ns})")
+            seen_names[atomic_name] = ns
+
+            # 规范检查
+            if not re.match(r'^[a-z][a-z0-9_]*$', atomic_name):
+                issues.append(f"'{atomic_name}': 名称非 snake_case")
+
+        return issues
+
+    # ── 管理 ──
+
+    def remove(self, ns: str) -> bool:
+        with self._lock:
+            self._categories.pop(ns, None)
+            self._instances.pop(ns, None)
+            self._atomic_tools.clear()
+            self._openai_cache = None
+        return ns not in self._categories
+
+    def clear_cache(self):
+        with self._lock:
+            self._instances.clear()
+            self._atomic_tools.clear()
+            self._openai_cache = None
+
+    def clear(self):
+        with self._lock:
+            self._categories.clear()
+            self._instances.clear()
+            self._atomic_tools.clear()
+            self._openai_cache = None
+
+    def print_summary(self) -> None:
+        status = self.get_status()
+        logger.info(
+            f"ToolRegistry v3: {status['categories']} 个大类, "
+            f"{status['atomic_tools']} 个原子工具"
+        )
+        for ns in sorted(self.list_categories()):
+            inst = self._get_instance(ns)
+            tool_names = inst.get_tool_names() if inst else []
+            logger.info(f"  📦 {ns} ({len(tool_names)} 个工具): {', '.join(tool_names)}")
+
+
+================================================================================
+# FILE: tracer.py
+================================================================================
+"""
+engine/tracer.py — Agent 轻量级可观测性追踪器
+
+零外部依赖，基于 dataclass + time 实现。
+全局单例 tracer。
+
+用法:
+  from engine.tracer import tracer
+  tracer.start_trace(request_id)
+  tracer.start_span(request_id, name, type)
+  ... do work ...
+  tracer.end_span(request_id, tokens_prompt=..., tokens_completion=..., model=...)
+  tracer.print_summary(request_id)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ── 模型定价表 ──────────────────────────────────
+# (input_price_per_1M, output_price_per_1M) 美元
+MODEL_PRICES: Dict[str, tuple[float, float]] = {
+    # DeepSeek
+    "deepseek-chat": (0.14, 0.28),
+    "deepseek-reasoner": (0.55, 2.19),
+    # OpenAI
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4o-2024-08-06": (2.50, 10.00),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o-mini-2024-07-18": (0.15, 0.60),
+    "gpt-3.5-turbo": (0.50, 1.50),
+    # 通用 fallback
+    "default": (0.50, 1.50),
+}
+
+
+@dataclass
+class TraceSpan:
+    """追踪的一个 Span（节点、LLM 调用、工具调用等）"""
+    name: str
+    type: str                         # llm | tool | node | graph | router
+    start_time: float                 # time.time()
+    end_time: Optional[float] = None
+    tokens_prompt: int = 0
+    tokens_completion: int = 0
+    cost: float = 0.0
+    error: Optional[str] = None
+    model: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def duration_ms(self) -> float:
+        if self.end_time:
+            return (self.end_time - self.start_time) * 1000
+        return 0.0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.tokens_prompt + self.tokens_completion
+
+
+class AgentTracer:
+    """
+    轻量级 Agent 追踪器
+
+    用法：
+        tracer = AgentTracer()
+
+        # 开始一次完整追踪
+        tracer.start_trace("req_abc123")
+
+        # 开始一个 Span
+        tracer.start_span("req_abc123", "think", "llm")
+
+        # ... 执行 LLM 调用 ...
+
+        # 结束 Span
+        tracer.end_span("req_abc123", model="gpt-4o",
+                        tokens_prompt=100, tokens_completion=50)
+
+        # 打印摘要
+        tracer.print_summary("req_abc123")
+    """
+
+    MAX_TRACES = 1000  # 追踪数量上限，防止内存无限增长
+
+    def __init__(self):
+        self.traces: Dict[str, List[TraceSpan]] = {}
+        self._active_stacks: Dict[str, List[TraceSpan]] = defaultdict(list)
+        # request_id -> 创建时间，用于总时长计算
+        self._started_at: Dict[str, float] = {}
+
+    # ── 生命周期 ──
+
+    def start_trace(self, request_id: str) -> None:
+        """开始一次完整追踪"""
+        # 超过上限时，清理最早的追踪
+        if len(self.traces) >= self.MAX_TRACES:
+            oldest_key = min(
+                self.traces.keys(),
+                key=lambda k: self._started_at.get(k, 0)
+            )
+            self.cleanup(oldest_key)
+
+        self.traces[request_id] = []
+        self._started_at[request_id] = time.time()
+
+    def cleanup(self, request_id: str) -> None:
+        """清理指定追踪的数据，释放内存"""
+        self.traces.pop(request_id, None)
+        self._active_stacks.pop(request_id, None)
+        self._started_at.pop(request_id, None)
+
+    def start_span(self, request_id: str, name: str, span_type: str) -> None:
+        """
+        开始一个 Span
+
+        Args:
+            request_id: 追踪 ID
+            name: Span 名称（如节点名）
+            span_type: 类型（"llm"、"tool"、"node"、"router"、"graph"）
+        """
+        span = TraceSpan(name=name, type=span_type, start_time=time.time())
+        self._active_stacks[request_id].append(span)
+
+    def end_span(self, request_id: str, **kwargs) -> None:
+        """
+        结束当前活跃的 Span
+
+        可接受的 kwargs：
+            model: str               — LLM 模型名
+            tokens_prompt: int       — 输入 token 数
+            tokens_completion: int   — 输出 token 数
+            error: str               — 错误信息
+            metadata: dict           — 附加元数据
+        """
+        stack = self._active_stacks.get(request_id)
+        if not stack:
+            logger.warning(f"[tracer] end_span 无活跃 span: {request_id}")
+            return
+
+        span = stack.pop()
+        span.end_time = time.time()
+
+        # 注入 kwargs
+        for key, val in kwargs.items():
+            if key == "metadata" and isinstance(val, dict):
+                span.metadata.update(val)
+            elif hasattr(span, key):
+                setattr(span, key, val)
+
+        # 自动计算成本
+        if span.type == "llm":
+            span.cost = self._calculate_cost(
+                span.model or "default",
+                span.tokens_prompt,
+                span.tokens_completion,
+            )
+
+        self.traces[request_id].append(span)
+        logger.debug(f"[tracer] span done: {span.type}:{span.name} "
+                     f"{span.duration_ms:.0f}ms tokens={span.total_tokens} "
+                     f"cost=${span.cost:.6f}")
+
+    # ── 查询 ──
+
+    def get_summary(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """生成追踪摘要（可用于前端渲染或日志输出）"""
+        spans = self.traces.get(request_id)
+        if spans is None:
+            return None
+
+        started = self._started_at.get(request_id, 0)
+        total_duration = (time.time() - started) * 1000 if started else 0
+
+        total_cost = sum(s.cost for s in spans)
+        total_tokens = sum(s.total_tokens for s in spans)
+        errors = [s for s in spans if s.error]
+
+        # 按类型分组
+        by_type: Dict[str, list] = defaultdict(list)
+        for s in spans:
+            by_type[s.type].append(s)
+
+        span_entries = []
+        for s in spans:
+            span_entries.append({
+                "name": s.name,
+                "type": s.type,
+                "duration_ms": round(s.duration_ms, 1),
+                "tokens_prompt": s.tokens_prompt,
+                "tokens_completion": s.tokens_completion,
+                "total_tokens": s.total_tokens,
+                "cost": round(s.cost, 6),
+                "error": s.error,
+                "model": s.model,
+            })
+
+        return {
+            "request_id": request_id,
+            "total_duration_ms": round(total_duration, 1),
+            "total_tokens": total_tokens,
+            "total_cost": round(total_cost, 6),
+            "total_cost_display": f"${total_cost:.6f}",
+            "span_count": len(spans),
+            "error_count": len(errors),
+            "by_type": {t: len(v) for t, v in by_type.items()},
+            "spans": span_entries,
+        }
+
+    def print_summary(self, request_id: str) -> None:
+        """将追踪摘要打印到控制台"""
+        summary = self.get_summary(request_id)
+        if not summary:
+            return
+
+        # 计算各类型的图标
+        icons = {
+            "llm": "🧠",
+            "tool": "🔧",
+            "node": "📦",
+            "router": "🔀",
+            "graph": "🌐",
+        }
+
+        print(f"\n{'=' * 60}")
+        print(f"📊 Agent Trace: {summary['request_id']}")
+        print(f"  总耗时: {summary['total_duration_ms']:.0f}ms")
+        print(f"  总Token: {summary['total_tokens']:,}")
+        print(f"  总成本: {summary['total_cost_display']}")
+        print(f"  Spans: {summary['span_count']} | Errors: {summary['error_count']} | "
+              f"类型: {summary['by_type']}")
+        print(f"{'─' * 60}")
+
+        for span in summary["spans"]:
+            icon = icons.get(span["type"], "•")
+            status = "❌" if span["error"] else "✅"
+            token_info = f" tokens={span['total_tokens']}" if span["total_tokens"] else ""
+            model_info = f" [{span['model']}]" if span["model"] else ""
+            error_info = f" | {span['error'][:40]}" if span["error"] else ""
+
+            print(f"  {icon} {span['name']:20s} "
+                  f"{span['duration_ms']:6.0f}ms "
+                  f"${span['cost']:.6f}{token_info}{model_info}"
+                  f" {status}{error_info}")
+
+        print(f"{'=' * 60}\n")
+
+    def to_json(self, request_id: str) -> Optional[str]:
+        """导出为 JSON 字符串"""
+        summary = self.get_summary(request_id)
+        if not summary:
+            return None
+        return json.dumps(summary, ensure_ascii=False, indent=2)
+
+    # ── 内部方法 ──
+
+    @staticmethod
+    def _calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+        """计算 LLM 调用成本"""
+        prices = MODEL_PRICES.get(model) or MODEL_PRICES.get("default")
+        if not prices:
+            return 0.0
+        input_price, output_price = prices
+        cost = (
+            (prompt_tokens / 1_000_000) * input_price
+            + (completion_tokens / 1_000_000) * output_price
+        )
+        return round(cost, 6)
+
+
+# 全局单例
+tracer = AgentTracer()
+
+

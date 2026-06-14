@@ -1,0 +1,8 @@
+name: file_operation
+display_name: 文件批量操作
+icon: 📁
+description: 批量处理文件（重命名/分类/转换）
+when_to_use: 用户要批量操作文件时
+tools: [file, shell]
+fallback: null
+tags: [文件, 批量, 重命名]

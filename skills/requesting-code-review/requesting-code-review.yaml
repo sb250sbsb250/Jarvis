@@ -1,0 +1,13 @@
+name: requesting-code-review
+display_name: 请求代码审查
+icon: 🔍
+description: 完成任务、实现主要功能后，或合并前需要验证工作时
+when_to_use: 完成任务、实现主要功能后，或合并前需要验证工作时
+tools:
+- task
+- git
+tags:
+- 代码审查
+- code review
+- 质量检查
+- 代码质量

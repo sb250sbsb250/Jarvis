@@ -65,6 +65,7 @@ class SkillRouter:
             if not skill:
                 logger.info(f"🎯 指定 Skill '{skill_name}' 不存在")
                 return SkillResult(success=False, error=f"Skill '{skill_name}' 不存在")
+            candidates = [(skill, 1.0)] if skill else []
             logger.info(f"🎯 指定 Skill: {skill.meta.display_name} ({skill.meta.name})")
         else:
             candidates = await self.skill_registry.route_with_fallback(
@@ -111,10 +112,11 @@ class SkillRouter:
 
         try:
             # AgentLoop.run() 只接受部分参数，过滤掉多余的 kwargs
-            loop_kwargs = {}
-            for k in ("working_dir",):
-                if k in kwargs:
-                    loop_kwargs[k] = kwargs[k]
+            ALLOWED_LOOP_KWARGS = {
+                "working_dir", "resume_from", "skip_last_user",
+                "compressed_until", "compressed_summary", "model_override",
+            }
+            loop_kwargs = {k: v for k, v in kwargs.items() if k in ALLOWED_LOOP_KWARGS}
             result = await loop.run(
                 task=user_input,
                 history=history_list,

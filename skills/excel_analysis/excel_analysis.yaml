@@ -1,0 +1,8 @@
+name: excel_analysis
+display_name: Excel 数据分析
+icon: 📊
+description: 读取、分析、统计 Excel 数据
+when_to_use: 用户要查看、分析或统计 Excel 数据时
+tools: [excel, shell]
+fallback: data_explore
+tags: [excel, 数据分析, 表格]

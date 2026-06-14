@@ -18,10 +18,11 @@ const app = createApp({
     const conversations = ref([]);
     const currentSessionId = ref(null);
     const modelName = ref('deepseek-v4-pro');
-    const isProModel = ref(true);
+    const searchEnabled = ref(false);
     
-    function toggleModel() {
-      modelName.value = isProModel.value ? 'deepseek-v4-pro' : 'deepseek-v4-flash';
+    function selectModel(model) {
+      if (sending.value) return;
+      modelName.value = model;
     }
 
     const showSettings = ref(false);
@@ -30,6 +31,11 @@ const app = createApp({
     const inputEl = ref(null);
     const msgContainer = ref(null);
     const interrupting = ref(false);
+
+    // ── Claude Code: Todo + Approval 状态 ──
+    const todoItems = ref([]);
+    const todoStats = ref({});
+    const pendingApprovals = ref([]);  // [{call_id, tool, message, args_preview, risk_level}]
 
     let _currentMsgIndex = -1;
     let _msgUid = 0;
@@ -42,80 +48,32 @@ const app = createApp({
         .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
     }
 
-    // ── Markdown 渲染 ──
+    // ── Markdown 渲染（使用 marked.js）──
     function renderMarkdown(text) {
       if (!text) return '';
-      let html = escapeHtml(text);
-
-      // 代码块
-      html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-        const langClass = lang ? ` class="language-${escapeHtml(lang)}"` : '';
-        const escapedCode = escapeHtml(code);
-        const safeCode = btoa(unescape(encodeURIComponent(code)));
-        return `<pre><button class="copy-btn" data-code="${safeCode}">📋 复制</button><code${langClass}>${escapedCode}</code></pre>`;
-      });
-
-      // 行内代码
-      html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-      // 表格
-      html = html.replace(/\n\|(.+)\|\n\|([-| :]+)\|\n((?:\|.+\|\n?)*)/g, (_, header, alignLine, body) => {
-        const headers = header.split('|').map(h => h.trim()).filter(Boolean);
-        const aligns = alignLine.split('|').map(a => a.trim()).filter(Boolean).map(a => {
-          if (a.startsWith(':') && a.endsWith(':')) return 'center';
-          if (a.endsWith(':')) return 'right';
-          return 'left';
-        });
-        const rows = body.trim().split('\n').map(row => {
-          const cols = row.split('|').map(c => c.trim()).filter(Boolean);
-          return `<tr>${cols.map((c, i) => `<td style="text-align:${aligns[i] || 'left'}">${c}</td>`).join('')}</tr>`;
-        }).join('');
-        return `\n<table><thead><tr>${headers.map((h, i) => `<th style="text-align:${aligns[i] || 'left'}">${h}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table>\n`;
-      });
-
-      // 引用
-      html = html.replace(/^&gt;\s?(.+)$/gm, '<blockquote>$1</blockquote>');
-
-      // 粗体/斜体
-      html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-      html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-
-      // 无序列表
-      html = html.replace(/^[*-]\s+(.+)$/gm, '<li>$1</li>');
-      html = html.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
-
-      // 有序列表
-      html = html.replace(/^\d+\.\s+(.+)$/gm, '<li>$1</li>');
-
-      // 标题
-      html = html.replace(/^###\s+(.+)$/gm, '<h4>$1</h4>');
-      html = html.replace(/^##\s+(.+)$/gm, '<h3>$1</h3>');
-
-      // 链接
-      html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-
-      // 段落
-      html = html.replace(/\n\n/g, '</p><p>');
-      html = '<p>' + html + '</p>';
-
-      // 清理嵌套
-      const cleanPairs = [
-        [/<p><ul>/g, '<ul>'], [/<\/ul><\/p>/g, '</ul>'],
-        [/<p><ol>/g, '<ol>'], [/<\/ol><\/p>/g, '</ol>'],
-        [/<p><blockquote>/g, '<blockquote>'], [/<\/blockquote><\/p>/g, '</blockquote>'],
-        [/<p><table>/g, '<table>'], [/<\/table><\/p>/g, '</table>'],
-        [/<p><h([34])>/g, '<h$1>'], [/<\/h([34])><\/p>/g, '</h$1>'],
-        [/<p><pre>/g, '<pre>'], [/<\/pre><\/p>/g, '</pre>'],
-      ];
-      for (const [re, replace] of cleanPairs) {
-        html = html.replace(re, replace);
+      if (typeof marked === 'undefined') {
+        // fallback: 纯文本
+        return `<p>${escapeHtml(text)}</p>`;
       }
 
-      return html;
+      const renderer = new marked.Renderer();
+      renderer.code = ({ text: codeText, lang }) => {
+        const langClass = lang ? ` class="language-${escapeHtml(lang)}"` : '';
+        const safeCode = btoa(unescape(encodeURIComponent(codeText)));
+        return `<pre><button class="copy-btn" data-code="${safeCode}">📋 复制</button><code${langClass}>${escapeHtml(codeText)}</code></pre>`;
+      };
+
+      marked.setOptions({
+        renderer,
+        breaks: true,
+        gfm: true,
+      });
+
+      return marked.parse(text);
     }
 
-    // ── 渲染消息 ──
-    function renderMessage(msg) {
+    // ── 构建消息 HTML（不触发响应式）──
+    function buildMessageHtml(msg) {
       if (!msg) return '';
       let html = '';
 
@@ -148,7 +106,13 @@ const app = createApp({
         html += `<div class="final-reply">${renderMarkdown(msg.content)}</div>`;
       }
 
-      msg.html = html;
+      return html;
+    }
+
+    // ── 渲染消息 ──
+    function renderMessage(msg) {
+      if (!msg) return '';
+      msg.html = buildMessageHtml(msg);
       
       // ✅ 强制触发 Vue 响应式更新：替换整个 messages 数组引用
       // Vue 3 无法追踪普通对象数组的 push/splice 变更，
@@ -231,15 +195,68 @@ const app = createApp({
           if (data.type === 'info') {
             statusText.value = data.content || '⏳ 处理中...';
             statusClass.value = 'executing';
+
           } else if (data.type === 'session') {
             currentSessionId.value = data.session_id;
             loadConversations();
+
           } else if (data.type === 'chunk') {
             const msg = getAssistantMsg();
             if (!msg) break;
             msg.content = (msg.content || '') + (data.content || '');
             renderMessage(msg);
             scrollToBottom();
+
+          } else if (data.type === 'approval') {
+            // Claude Code: 审批事件
+            if (data.auto_approved) {
+              // 自动模式：在 steps 中显示通知条
+              const msg = getAssistantMsg();
+              if (msg) {
+                msg.steps.push({
+                  tool: data.tool || '审批',
+                  icon: '🔓',
+                  state: 'done',
+                  args: {},
+                  result: data.message || '已自动审批'
+                });
+                renderMessage(msg);
+                scrollToBottom();
+              }
+            } else {
+              // 手动模式：弹出审批按钮
+              pendingApprovals.value.push({
+                call_id: data.call_id,
+                tool: data.tool,
+                message: data.message,
+                args_preview: data.args_preview,
+                risk_level: data.risk_level || 'medium',
+              });
+              statusText.value = '⏸️ 等待审批: ' + (data.tool || '');
+              statusClass.value = 'executing';
+            }
+
+          } else if (data.type === 'todo_update') {
+            // Claude Code: Todo 更新
+            todoItems.value = data.todos || [];
+            todoStats.value = data.stats || {};
+            // 同时在 steps 中展示
+            const msg = getAssistantMsg();
+            if (msg) {
+              const summary = (data.todos || [])
+                .map(t => `${t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : t.status === 'cancelled' ? '⛔' : '⬜'} ${t.content}`)
+                .join('\n');
+              msg.steps.push({
+                tool: 'todo_write',
+                icon: '📋',
+                state: 'done',
+                args: {},
+                result: summary || '任务列表已更新'
+              });
+              renderMessage(msg);
+              scrollToBottom();
+            }
+
           } else {
             console.log('Unknown SSE event:', data);
           }
@@ -280,7 +297,7 @@ const app = createApp({
       await nextTick();
 
       // SSE 连接
-      const { stream, controller } = API.createChatStream(text, currentSessionId.value, modelName.value);
+      const { stream, controller } = API.createChatStream(text, currentSessionId.value, modelName.value, searchEnabled.value);
       _abortController = controller;
 
       try {
@@ -289,20 +306,21 @@ const app = createApp({
         let buffer = '';
 
         while (true) {
-          let { done, value } = await reader.read();
-          if (done) break;
+          let { done: streamDone, value } = await reader.read();
+          if (streamDone) break;
 
           buffer += decoder.decode(value, { stream: true });
           const parts = buffer.split('\n\n');
           buffer = parts.pop() || '';
 
+          let shouldStop = false;
           for (const part of parts) {
             for (const line of part.split('\n')) {
               if (line.startsWith('data: ')) {
                 const payload = line.slice(6);
                 if (payload === '[DONE]') {
                   console.log('SSE stream done');
-                  done = true;
+                  shouldStop = true;
                   break;
                 }
                 try {
@@ -312,7 +330,9 @@ const app = createApp({
                 }
               }
             }
+            if (shouldStop) break;
           }
+          if (shouldStop) break;
         }
       } catch (err) {
         if (err.name === 'AbortError') {
@@ -358,6 +378,28 @@ const app = createApp({
       }
     }
 
+    // ── Claude Code: 审批响应 ──
+    async function respondApproval(callId, approved) {
+      try {
+        const resp = await fetch('/api/approval/respond', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            session_id: currentSessionId.value,
+            call_id: callId,
+            approved: approved,
+          }),
+        });
+        if (!resp.ok) {
+          console.error('审批响应失败:', await resp.text());
+        }
+        // 从待审批列表中移除
+        pendingApprovals.value = pendingApprovals.value.filter(a => a.call_id !== callId);
+      } catch (e) {
+        console.error('审批响应错误:', e);
+      }
+    }
+
     // ── 新对话 ──
     async function newConversation() {
       try {
@@ -377,31 +419,99 @@ const app = createApp({
       currentSessionId.value = sid;
       try {
         const data = await API.getConversation(sid);
-        messages.value = [];
+        const mergedMessages = [];
+        let pendingAssistant = null;  // 正在收集 tool 步骤的 assistant 消息
+
         if (data.messages) {
           for (const m of data.messages) {
-            const msg = {
-              _uid: ++_msgUid,
-              role: m.role || 'assistant',
-              content: m.content || '',
-              steps: m.steps || []
-            };
-            // 如果是 V3 格式，消息结构略有不同
-            if (m.role === 'user') {
-              msg.html = `<p>${escapeHtml(m.content || '')}</p>`;
+            const role = m.role || 'assistant';
+
+            if (role === 'user') {
+              // 先收尾前一个 pending assistant（如果有）
+              if (pendingAssistant) {
+                mergedMessages.push(pendingAssistant);
+                pendingAssistant = null;
+              }
+              mergedMessages.push({
+                _uid: ++_msgUid,
+                role: 'user',
+                content: m.content || '',
+                steps: [],
+                html: `<p>${escapeHtml(m.content || '')}</p>`
+              });
+
+            } else if (role === 'tool') {
+              // tool 消息 → 合并到当前 assistant 的 steps 中
+              if (!pendingAssistant) {
+                pendingAssistant = {
+                  _uid: ++_msgUid,
+                  role: 'assistant',
+                  content: '',
+                  steps: [],
+                  html: ''
+                };
+              }
+              pendingAssistant.steps.push({
+                tool: m.name || m.tool || '工具调用',
+                icon: '✅',
+                state: 'done',
+                args: m.args || {},
+                result: (m.content || '').slice(0, 200)
+              });
+
             } else {
-              msg.html = '';
-              if (msg.steps.length > 0) {
-                for (const step of msg.steps) {
-                  step.state = step.state || 'done';
-                  step.icon = step.state === 'done' ? '✅' : step.state === 'error' ? '❌' : '⏳';
+              // role === 'assistant'
+              if (m.tool_calls && m.tool_calls.length > 0) {
+                // 带工具调用的 assistant → 开始新的 pending 消息
+                if (pendingAssistant) {
+                  mergedMessages.push(pendingAssistant);
+                }
+                pendingAssistant = {
+                  _uid: ++_msgUid,
+                  role: 'assistant',
+                  content: '',
+                  steps: [],
+                  html: ''
+                };
+                for (const tc of m.tool_calls) {
+                  const fn = tc.function || {};
+                  pendingAssistant.steps.push({
+                    tool: fn.name || tc.name || '工具调用',
+                    icon: '⚡',
+                    state: 'done',
+                    args: (() => { try { return JSON.parse(fn.arguments || '{}'); } catch { return {}; } })(),
+                    result: ''
+                  });
+                }
+              } else {
+                // 最终回答 → 合并到 pending 或作为独立消息
+                if (pendingAssistant) {
+                  pendingAssistant.content = m.content || '';
+                  pendingAssistant.html = buildMessageHtml(pendingAssistant);
+                  mergedMessages.push(pendingAssistant);
+                  pendingAssistant = null;
+                } else {
+                  mergedMessages.push({
+                    _uid: ++_msgUid,
+                    role: 'assistant',
+                    content: m.content || '',
+                    steps: [],
+                    html: m.content ? `<div class="final-reply">${renderMarkdown(m.content)}</div>` : ''
+                  });
                 }
               }
-              renderMessage(msg);
             }
-            messages.value.push(msg);
+          }
+
+          // 收尾最后的 pending assistant
+          if (pendingAssistant) {
+            pendingAssistant.html = buildMessageHtml(pendingAssistant);
+            mergedMessages.push(pendingAssistant);
+            pendingAssistant = null;
           }
         }
+
+        messages.value = mergedMessages;  // 一次原子更新
         await nextTick();
         scrollToBottom();
       } catch (e) {
@@ -451,8 +561,12 @@ const app = createApp({
       try {
         await API.saveApiKey(provider.id, provider.newKey);
         provider.configured = true;
-        provider.masked = provider.newKey.slice(-4);
-        provider.masked = '****' + provider.newKey.slice(-4);
+        const key = provider.newKey;
+        if (key.length >= 8) {
+          provider.masked = key.slice(0, 6) + '****' + key.slice(-4);
+        } else {
+          provider.masked = '****' + key.slice(-4);
+        }
         provider.newKey = '';
         alert('✅ API Key 已保存');
       } catch (e) {
@@ -542,14 +656,16 @@ const app = createApp({
 
     return {
       messages, inputText, sending, statusText, statusClass,
-      conversations, currentSessionId, modelName, isProModel, toggleModel,
+      conversations, currentSessionId, modelName, searchEnabled, selectModel,
       showSettings, apiProviders,
       sendMessage, interruptSession, newConversation,
       switchConversation, deleteConversation,
       copyMessage, resendMessage,
       saveApiKey,
       formatTime, escapeHtml,
-      onInputKeydown, msgContainer, inputEl, interrupting
+      onInputKeydown, msgContainer, inputEl, interrupting,
+      // Claude Code 增强
+      todoItems, todoStats, pendingApprovals, respondApproval,
     };
   }
 });

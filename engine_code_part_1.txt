@@ -1,0 +1,2846 @@
+================================================================================
+# FILE: __init__.py
+================================================================================
+# engine/__init__.py
+"""
+Jarvis V3 Engine — 自主 Agent 引擎
+
+核心设计：
+  AgentLoop — 纯 LLM + 工具循环（Claude Code 模式）
+  Skill — 纯配置驱动的 system prompt 提供者
+  Tool — 统一的工具注册和执行系统
+"""
+
+from .agent_loop import AgentLoop
+from .llm_client import LLMClient
+from .session.session import Session
+from .tool.registry import ToolRegistry
+from .tool.base import BaseTool, ToolParameter
+from .tool.base import ToolDefinition as ToolSchema  # 向后兼容
+from .tool.executor import ToolExecutor
+from .tool.policy import ToolPolicy, AccessLevel
+
+__all__ = [
+    "AgentLoop", "LLMClient",
+    "Session",
+    "ToolRegistry", "BaseTool", "ToolSchema", "ToolParameter",
+    "ToolExecutor", "ToolPolicy", "AccessLevel",
+]
+
+================================================================================
+# FILE: agent_loop.py
+================================================================================
+"""
+engine/agent_loop.py — 自主 Agent 循环（编排层）
+
+基于 Claude Code 模式：
+    while not done:
+        response = llm.chat(messages, tools)
+        if tool_calls: 执行 → 追加到 messages
+        else: done = True
+
+设计原则：
+  - messages 是唯一真相源，不维护额外状态结构
+  - 框架只做编排，所有功能逻辑在子模块中
+  - 工具加载时输出完整诊断信息，便于调试
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from typing import Any, Dict, List, Set, Optional, Callable, Awaitable
+
+from .tool.executor import ToolExecutor
+from .tool.policy import ToolPolicy
+from .tool.parser import make_tool_result, parse_tool_args, get_tool_param_hint
+from .lint.runner import LintRunner
+from .checkpoint import Checkpoint
+from .llm_client import InsufficientBalanceError, LLMClient
+from .prompt.complexity import ComplexityRouter, ResponseMode
+from .prompt.context import (
+    ContextBuilder, sanitize_tool_messages, _trim_history_messages,
+)
+from .core.approval import ApprovalGate
+from .core.file_guard import FileEditGuard
+from .core.script_detector import ScriptSuggestionDetector
+from .core.types import ToolCallRecord, ToolResult
+from .core.guard import (
+    GuardState, ENABLE_RESULT_CACHE, ENABLE_HARD_INTERRUPT,
+    ENABLE_EMPTY_REPLY_FIX, ENABLE_JSON_CORRECTION,
+    ENABLE_KEY_FINDINGS, ENABLE_ERROR_GRADING,
+    check_stuck, check_stuck_hard, guard_repeated_target,
+    suggest_next_action, handle_tool_error, suggest_alternatives,
+    detect_loop, record_get, safe_inject_system,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ── 常量（仅 agent_loop 独有的）──
+
+MAX_LLM_ERRORS = 3
+MAX_TOOL_ERRORS = 8
+TOOL_DEFAULT_TIMEOUT = 60.0
+CHECKPOINT_INTERVAL = 10
+MAX_TOOL_RESULT_CHARS = 80000
+
+# 诊断开关
+DIAG_ENABLED = True
+DIAG_PRINT_LLM_INPUT = True
+DIAG_MAX_MESSAGE_CHARS = 0
+DIAG_PRINT_FULL_SYSTEM = False
+
+
+def _diag_print(*args, **kwargs):
+    if DIAG_ENABLED:
+        print(*args, **kwargs)
+
+
+class AgentLoop:
+    """自主 Agent 循环 — 纯 LLM + 工具模式。"""
+
+    def __init__(
+        self,
+        llm_client: Any,
+        tool_registry: Any,
+        max_rounds: int = 200,
+        system_prompt: str = "",
+
+        auto_lint: bool = True,
+        lint_runner: Optional[LintRunner] = None,
+        enable_checkpoint: bool = True,
+    ):
+        self.llm_client = llm_client
+        self.tool_registry = tool_registry
+        self.max_rounds = max_rounds
+        self.base_system = system_prompt
+
+        self.auto_lint = auto_lint
+        self.lint_runner = lint_runner or LintRunner()
+        self.edited_files: Set[str] = set()
+        self.enable_checkpoint = enable_checkpoint
+        self.skill: Optional[Any] = None
+
+        policy = ToolPolicy()
+        self._executor = ToolExecutor(
+            registry=tool_registry,
+            default_timeout=TOOL_DEFAULT_TIMEOUT,
+            policy=policy,
+        )
+
+        # Claude Code 风格增强组件
+        self._policy = policy
+        self._approval_gate = ApprovalGate(policy, auto_approve=True)
+        self._file_guard: Optional[FileEditGuard] = None
+        self._script_detector = ScriptSuggestionDetector()
+        self._current_on_event: Optional[Callable] = None
+
+        self._checkpoint: Optional[Checkpoint] = None
+        self._injector: Any = None
+        self._topic_store: Any = None
+        self._total_tokens_used: int = 0
+        self._last_llm_usage: Optional[Dict] = None
+        self._has_compressed: bool = False
+
+        # 子模块实例（由子模块管理各自状态）
+        self._context_builder = ContextBuilder()
+        self._guard_state = GuardState()
+
+        # 模型路由状态
+        self._task_mode = None
+        self._task_mode_info = None
+        self._routed_model = None
+        self._model_override = None
+        self._effective_model = None
+        self._routed_temperature = None
+        self._routed_max_tokens = None
+
+    # ═══════════════════════════════════════════════════════════════
+    #  主循环
+    # ═══════════════════════════════════════════════════════════════
+
+    async def run(
+            self,
+            task: str,
+            working_dir: str = ".",
+            history: Optional[List[Dict]] = None,
+            on_event: Optional[Callable[[str, Dict], Awaitable[None]]] = None,
+            resume_from: Optional[str] = None,
+            skip_last_user: bool = True,
+            compressed_until: int = 0,
+            compressed_summary: str = "",
+            model_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """自主执行任务。"""
+        self.edited_files.clear()
+        self._total_tokens_used = 0
+        self._last_llm_usage = None
+        self._has_compressed = False
+
+        # 守卫状态重置
+        self._guard_state = GuardState()
+
+        # 组件初始化
+        self._file_guard = FileEditGuard(working_dir)
+        self._script_detector.reset()
+        self._current_on_event = on_event
+
+        empty_count = 0
+        tool_calls_log: List[ToolCallRecord] = []
+        findings: List[str] = []
+        llm_errors = 0
+        tool_errors = 0
+        start_round = 0
+
+        # 🎯 自动技能匹配
+        from .skill.matcher import match_skill
+        self.skill = match_skill(task)
+        if self.skill:
+            logger.info(
+                f"🎯 自动匹配技能: {self.skill.meta.icon} "
+                f"{self.skill.meta.display_name} "
+                f"({self.skill.meta.name})"
+            )
+        else:
+            logger.info("🎯 无匹配技能，使用通用模式")
+
+        # 诊断：启动时打印完整工具注册信息
+        self._diag_print_startup(task, working_dir)
+
+        # ── 检查点 ──
+        if self.enable_checkpoint and not resume_from:
+            self._checkpoint = Checkpoint(task)
+            if self._checkpoint.exists():
+                logger.info(f"🔁 发现未清理的检查点: {self._checkpoint.path}")
+                if on_event:
+                    await on_event("checkpoint", {"type": "found", "path": self._checkpoint.path})
+                resume_from = self._checkpoint.path
+
+        if resume_from:
+            cp = Checkpoint(task, save_dir=os.path.dirname(os.path.abspath(resume_from)))
+            state = cp.load()
+            if state:
+                messages = state.get("messages", [])
+                tool_calls_log = state.get("tool_calls_log", [])
+                start_round = state.get("round", 0)
+                findings = state.get("findings", [])
+                self._context_builder.compressed_summary = state.get("compressed_summary", "")
+                self._total_tokens_used = state.get("total_tokens_used", 0)
+                logger.info(
+                    f"⏮️ 恢复检查点 (round={start_round}, "
+                    f"messages={len(messages)}, "
+                    f"tokens={self._total_tokens_used})"
+                )
+                if on_event:
+                    await on_event(
+                        "checkpoint",
+                        {"type": "restored", "round": start_round, "total_tokens": self._total_tokens_used},
+                    )
+                messages = sanitize_tool_messages(messages)
+            else:
+                logger.warning(f"⚠️ 检查点加载失败，重新开始")
+                messages = await self._context_builder.build_messages(
+                    task=task, working_dir=working_dir,
+                    skill=self.skill, base_system=self.base_system,
+                    history=history, skip_last_user=skip_last_user,
+                    compressed_until=compressed_until,
+                    compressed_summary=compressed_summary,
+                )
+        else:
+            messages = await self._context_builder.build_messages(
+                task=task, working_dir=working_dir,
+                skill=self.skill, base_system=self.base_system,
+                history=history, skip_last_user=skip_last_user,
+                compressed_until=compressed_until,
+                compressed_summary=compressed_summary,
+            )
+
+        # ── 长期记忆注入 ──
+        if self._has_compressed:
+            await self._try_save_topics(messages)
+        else:
+            self._injector = None
+
+        # ── 模型路由 ──
+        self._model_override = model_override
+        try:
+            router = ComplexityRouter(self.llm_client)
+            mode, info = router.route(task)
+            self._task_mode = mode
+            self._task_mode_info = info
+            if info:
+                self._routed_model = info.get("model")
+                self._routed_temperature = info.get("temperature")
+                self._routed_max_tokens = info.get("max_tokens")
+            _diag_print(
+                f"  ComplexityRouter: mode={mode.name}, "
+                f"model={self._routed_model or 'default'}, "
+                f"tokens={self._routed_max_tokens or 'default'}"
+            )
+        except Exception as e:
+            logger.debug(f"ComplexityRouter 不可用: {e}")
+            self._task_mode = ResponseMode.STANDARD
+            self._task_mode_info = None
+
+        self._effective_model = self._model_override or self._routed_model
+
+        # ═══════════════════════════════════════════════════════════
+        #  主循环
+        # ═══════════════════════════════════════════════════════════
+
+        final_content = ""
+
+        for round_display in range(start_round, self.max_rounds):
+            try:
+                round_idx = round_display - start_round
+
+                # ── 守卫检测（在 LLM 调用前检查）──
+                stuck_msg = check_stuck(self._guard_state, tool_calls_log)
+                if stuck_msg:
+                    safe_inject_system(messages, stuck_msg)
+                    tool_calls_log.append(ToolCallRecord(
+                        tool="__system__", args={}, round=round_display,
+                        call_id="", error=stuck_msg,
+                    ))
+                    logger.info(f"🛡️ 守卫触发: {stuck_msg[:60]}")
+
+                # ── 准备工具列表 ──
+                from .skill.matcher import get_filtered_tools
+                tools = get_filtered_tools(self.tool_registry, self.skill)
+
+                # ── LLM 调用 ──
+                kwargs = {}
+                if self._routed_temperature is not None:
+                    kwargs["temperature"] = self._routed_temperature
+                if self._routed_max_tokens is not None:
+                    kwargs["max_tokens"] = self._routed_max_tokens
+                if self._effective_model:
+                    kwargs["model"] = self._effective_model
+
+                response = await self.llm_client.chat_completion(
+                    messages=messages,
+                    tools=tools if tools else None,
+                    **kwargs,
+                )
+
+                # ── 用量统计 ──
+                usage = response.get("usage", {})
+                if usage:
+                    total_tokens = usage.get("total_tokens", 0) or usage.get(
+                        "total_tokens_used", 0
+                    )
+                    if total_tokens:
+                        self._total_tokens_used = total_tokens
+                    self._last_llm_usage = usage
+
+                choice = response.get("choices", [{}])[0]
+                message = choice.get("message", {})
+                content = message.get("content", "") or ""
+                tool_calls = message.get("tool_calls", None)
+
+                # 诊断输出
+                self._diag_print_llm_response(response, round_display)
+
+                # ── Token 预算检查 + 压缩 ──
+                if self._context_builder.should_compress(messages):
+                    if ENABLE_KEY_FINDINGS and self._guard_state.key_findings:
+                        kf_text = "## 已获取的关键信息（无需重复读取）\n" + "\n".join(
+                            f"- {path}: {info[:200]}"
+                            for path, info in list(self._guard_state.key_findings.items())[-20:]
+                        )
+                    else:
+                        kf_text = ""
+                    await self._context_builder.compress(
+                        messages, self.llm_client, round_display,
+                        key_findings_text=kf_text,
+                    )
+                    self._has_compressed = True
+
+                # ── 空回复处理 (Fix 2) ──
+                if not content and not tool_calls:
+                    if ENABLE_EMPTY_REPLY_FIX:
+                        empty_count += 1
+                        if empty_count == 1:
+                            suggestion = suggest_next_action(messages, tool_calls_log)
+                            logger.info(f"💬 空回复干预: 注入 user 角色建议")
+                            messages.append({"role": "user", "content": suggestion})
+                            continue
+                        elif empty_count >= 2:
+                            logger.warning(f"🚫 连续 {empty_count} 次空回复，强制终止")
+                            done = True
+                            final_content = (
+                                f"[系统终止] 连续 {empty_count} 次输出空内容，"
+                                f"已终止任务。\n\n"
+                                f"## 已完成的操作\n"
+                                + _format_tool_log(tool_calls_log[-10:])
+                                + "\n\n## 总结\n任务未能完成，原因是 Agent 持续输出空内容。"
+                            )
+                            break
+                    else:
+                        # 原有逻辑：最多容忍 3 次空回复
+                        empty_count += 1
+                        if empty_count >= 3:
+                            logger.warning(f"🚫 连续 {empty_count} 次空回复，强制终止")
+                            done = True
+                            final_content = f"[系统终止] 连续 {empty_count} 次空回复"
+                            break
+                        else:
+                            continue
+
+                if tool_calls:
+                    empty_count = 0  # 有正常输出，重置计数器
+
+                    # ── 处理工具调用 ──
+                    for tc in tool_calls:
+                        tool_name = tc.get("function", {}).get("name", "")
+                        tool_args_raw = tc.get("function", {}).get("arguments", "{}")
+                        call_id = tc.get("id", "")
+
+                        if isinstance(tool_args_raw, dict):
+                            tool_args = tool_args_raw
+                        elif isinstance(tool_args_raw, str) and tool_args_raw.strip():
+                            if ENABLE_JSON_CORRECTION:
+                                tool_args, parse_ok = parse_tool_args(
+                                    tool_name, tool_args_raw, self.tool_registry,
+                                )
+                                if not parse_ok:
+                                    param_hint = get_tool_param_hint(self.tool_registry, tool_name)
+                                    correction = (
+                                        f"[系统提示] 你上次调用 `{tool_name}` 的参数 JSON 解析失败。\n"
+                                        f"原始内容: {tool_args_raw[:300]}\n"
+                                        f"{param_hint}\n"
+                                        f"请用正确的 JSON 格式重新调用此工具。"
+                                    )
+                                    logger.warning(f"⚠️ JSON 解析全失败，注入修正请求")
+                                    messages.append({"role": "user", "content": correction})
+                                    tool_calls_log.append(ToolCallRecord(
+                                        tool=tool_name, args={}, round=round_display,
+                                        call_id=call_id, error="JSON 解析失败",
+                                    ))
+                                    continue
+                            else:
+                                # 原有三层解析逻辑
+                                try:
+                                    tool_args = json.loads(tool_args_raw)
+                                except json.JSONDecodeError:
+                                    stripped = tool_args_raw.strip()
+                                    if stripped.startswith("{") and stripped.endswith("}"):
+                                        try:
+                                            import ast
+                                            if len(stripped) < 10000:
+                                                parsed = ast.literal_eval(stripped)
+                                                tool_args = parsed if isinstance(parsed, dict) else {"raw": tool_args_raw}
+                                            else:
+                                                tool_args = {"raw": tool_args_raw}
+                                        except (ValueError, SyntaxError, MemoryError):
+                                            tool_args = None
+                                    else:
+                                        tool_args = None
+                                    if tool_args is None:
+                                        try:
+                                            fixed = re.sub(
+                                                r'"command"\s*:\s*"(.+?)"(?=\s*[,}]|\s*\n\s*"(?!command))',
+                                                lambda m: f'"command": {json.dumps(m.group(1))}',
+                                                tool_args_raw, flags=re.DOTALL,
+                                            )
+                                            tool_args = json.loads(fixed)
+                                        except (json.JSONDecodeError, Exception):
+                                            logger.warning(f"[tc] arguments 解析失败: {tool_args_raw[:200]}")
+                                            tool_args = {"raw": tool_args_raw}
+                        else:
+                            tool_args = {}
+
+                        # ── 参数校验 ──
+                        tool_def = self.tool_registry.get_tool_def(tool_name) if hasattr(self.tool_registry, 'get_tool_def') else None
+                        has_required = False
+                        if tool_def:
+                            has_required = any(p.required for p in tool_def.parameters)
+                        meaningful = any(
+                            v and str(v).strip() for v in tool_args.values()
+                        ) if tool_args else False
+                        if has_required and not meaningful:
+                            required_names = [p.name for p in tool_def.parameters if p.required]
+                            logger.warning(f"⚠️ [{tool_name}] 缺少必填参数: {required_names}")
+                            messages.append(make_tool_result(
+                                call_id,
+                                f"[系统提示] `{tool_name}` 缺少必填参数: {', '.join(required_names)}。请提供完整参数后重试。",
+                            ))
+                            tool_calls_log.append(ToolCallRecord(
+                                tool=tool_name, args=tool_args, round=round_display,
+                                call_id=call_id, error="缺少必填参数",
+                            ))
+                            continue
+
+                        # ── 同意门 ──
+                        if self._approval_gate:
+                            approved = self._approval_gate.check_and_wait(
+                                tool_name, tool_args, default_approve=True,
+                                on_event=self._current_on_event,
+                                messages=messages, call_id=call_id,
+                            )
+                            if approved is False:
+                                messages.append(make_tool_result(
+                                    call_id,
+                                    f"[用户拒绝] `{tool_name}` 已被用户拒绝。",
+                                ))
+                                tool_calls_log.append(ToolCallRecord(
+                                    tool=tool_name, args=tool_args, round=round_display,
+                                    call_id=call_id, error="用户拒绝",
+                                ))
+                                continue
+
+                        # ── 目标追踪 + 硬中断 ──
+                        guard_repeated_target(self._guard_state, tool_name, tool_args)
+                        if ENABLE_HARD_INTERRUPT:
+                            hard_msg = check_stuck_hard(self._guard_state, tool_name, tool_args)
+                            if hard_msg:
+                                logger.warning(f"🚫 硬中断: {tool_name} 已连续调用 3 次相同参数")
+                                messages.append(make_tool_result(call_id, hard_msg))
+                                tool_calls_log.append(ToolCallRecord(
+                                    tool=tool_name, args=tool_args,
+                                    round=round_display, call_id=call_id,
+                                    error="硬中断-重复调用",
+                                ))
+                                continue
+
+                        # ── 执行工具 ──
+                        try:
+                            result = await self._execute_tool(
+                                tool_name, tool_args, call_id,
+                            )
+                        except Exception as e:
+                            result = ToolResult.fail(
+                                call_id=call_id, tool_name=tool_name,
+                                error=str(e),
+                            )
+
+                        # ── 处理结果 ──
+                        is_success = hasattr(result, 'success') and result.success
+                        result_str = str(result.content) if hasattr(result, 'content') and result.content else ""
+                        error_str = str(result.error) if hasattr(result, 'error') and result.error else ""
+
+                        if not is_success and not error_str and not result_str:
+                            error_str = "工具执行返回空"
+
+                        if error_str:
+                            logger.warning(f"❌ [{tool_name}] 错误: {error_str[:200]}")
+                            tool_errors += 1
+
+                        # ── 格式化结果 ──
+                        if result_str and len(result_str) > MAX_TOOL_RESULT_CHARS:
+                            result_str = result_str[:MAX_TOOL_RESULT_CHARS] + "\n... [结果已截断]"
+
+                        # ── 统一添加 tool result ──
+                        messages.append(make_tool_result(call_id, result_str))
+
+                        # ── 记录 ──
+                        tool_calls_log.append(ToolCallRecord(
+                            tool=tool_name, args=tool_args,
+                            round=round_display, call_id=call_id,
+                            error=error_str if not is_success else None,
+                        ))
+
+                        # ── Fix 4: 捕获关键发现 ──
+                        if ENABLE_KEY_FINDINGS and is_success:
+                            if (hasattr(self.tool_registry, 'is_read_tool')
+                                    and self.tool_registry.is_read_tool(tool_name)):
+                                file_path = tool_args.get("path", tool_args.get("url", ""))
+                                if file_path and result_str:
+                                    lines_count = result_str.count("\n") + 1
+                                    self._guard_state.key_findings[file_path] = (
+                                        f"Round {round_display}, {len(result_str)} chars, "
+                                        f"{lines_count} lines, preview: {result_str[:300]}"
+                                    )
+
+                        # ── Fix 5: 错误分级引导 ──
+                        if not is_success and ENABLE_ERROR_GRADING:
+                            handle_tool_error(
+                                messages, tool_name, error_str,
+                                tool_calls_log, self.tool_registry,
+                            )
+
+                        # ── ScriptSuggestionDetector ──
+                        self._script_detector.record(tool_name, tool_args, is_success)
+
+                        # ── Todo 更新事件 ──
+                        if (on_event and error_str and "todo_write" in error_str
+                                and "已完成" in error_str):
+                            try:
+                                await on_event("todo_update", {"message": error_str})
+                            except Exception:
+                                pass
+
+                    # ── 轮次内 lint 检查 ──
+                    if self.auto_lint and round_idx > 0 and round_idx % 5 == 0:
+                        await self._auto_lint_check(findings, round_idx, on_event)
+
+                    # ── 循环检测 ──
+                    if detect_loop(tool_calls_log):
+                        logger.warning("⚠️ 检测到循环模式")
+                        safe_inject_system(
+                            messages,
+                            "⚠️ 检测到重复操作循环。请跳出当前思路，"
+                            "考虑完全不同的方法或基于已有信息输出结论。"
+                        )
+
+                    # ── 检查点 ──
+                    if self.enable_checkpoint and self._checkpoint:
+                        if round_idx > 0 and round_idx % CHECKPOINT_INTERVAL == 0:
+                            self._checkpoint.save(
+                                messages=messages,
+                                tool_calls_log=tool_calls_log,
+                                round=round_display,
+                                findings=findings,
+                                compressed_summary=self._context_builder.compressed_summary,
+                                total_tokens_used=self._total_tokens_used,
+                            )
+                            logger.info(f"💾 检查点保存 (round={round_display})")
+
+                    # ── 工具错误率检查 ──
+                    if tool_errors >= MAX_TOOL_ERRORS:
+                        logger.warning(
+                            f"🚫 工具错误数已达 {tool_errors}/{MAX_TOOL_ERRORS}，终止"
+                        )
+                        done = True
+                        final_content = (
+                            f"[系统终止] 工具错误数已达上限 ({tool_errors})，终止任务。\n\n"
+                            f"## 已完成的操作\n"
+                            + _format_tool_log(tool_calls_log[-10:])
+                        )
+                        break
+
+                    # ── LLM 错误检查 ──
+                    if llm_errors >= MAX_LLM_ERRORS:
+                        logger.warning(f"🚫 LLM 错误已达 {llm_errors}，终止")
+                        done = True
+                        final_content = f"[系统终止] LLM 错误达上限"
+                        break
+
+                else:
+                    # ── LLM 直接回答（无工具调用）→ 结束 ──
+                    done = True
+                    final_content = content or ""
+                    break
+
+            except InsufficientBalanceError as e:
+                logger.warning(f"🚫 余额不足: {e}")
+                if on_event:
+                    await on_event("insufficient_balance", {"error": str(e)})
+                return {
+                    "success": False,
+                    "error": f"余额不足: {e}",
+                    "messages": messages,
+                    "total_tokens": self._total_tokens_used,
+                    "llm_usage": self._last_llm_usage,
+                }
+            except Exception as e:
+                llm_errors += 1
+                logger.error(f"💥 round {round_display} 异常: {e}", exc_info=True)
+                if llm_errors >= MAX_LLM_ERRORS:
+                    done = True
+                    final_content = f"[系统终止] LLM 调用异常: {e}"
+                    break
+                else:
+                    messages.append({
+                        "role": "system",
+                        "content": f"⚠️ 上轮异常: {e}，请继续。",
+                    })
+                    continue
+        else:
+            # 自然达到 max_rounds
+            final_content = f"[达到最大轮数 {self.max_rounds}]"
+
+        # ═══════════════════════════════════════════════════════════
+        #  返回结果
+        # ═══════════════════════════════════════════════════════════
+
+        result = {
+            "success": True,
+            "content": final_content,
+            "messages": messages,
+            "tool_calls_log": tool_calls_log,
+            "total_tokens": self._total_tokens_used,
+            "llm_usage": self._last_llm_usage,
+            "compressed_until": self._context_builder.compressed_until,
+            "compressed_summary": self._context_builder.compressed_summary,
+            "rounds": round_display,
+        }
+
+        if self.enable_checkpoint and self._checkpoint:
+            self._checkpoint.cleanup()
+
+        if self.auto_lint and findings:
+            result["lint_findings"] = findings
+
+        if on_event:
+            try:
+                await on_event("done", result)
+            except Exception:
+                pass
+
+        return result
+
+    # ═══════════════════════════════════════════════════════════════
+    #  工具执行
+    # ═══════════════════════════════════════════════════════════════
+
+    async def _execute_tool(self, tool_name: str, tool_args: Dict, call_id: str = "") -> Any:
+        """工具执行（含结果缓存逻辑）。"""
+        # ── Fix 1: 只读工具结果缓存 ──
+        _is_read = (
+            ENABLE_RESULT_CACHE
+            and hasattr(self.tool_registry, 'is_read_tool')
+            and self.tool_registry.is_read_tool(tool_name)
+        )
+        if _is_read:
+            cache_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+            if cache_key in self._guard_state.result_cache:
+                cached = self._guard_state.result_cache[cache_key]
+                logger.info(f"🔄 [{tool_name}] 缓存命中，跳过实际执行")
+                return ToolResult.ok(
+                    call_id, tool_name,
+                    f"[缓存结果 — 已在前面步骤中获取，无需重复读取]\n{cached}",
+                )
+
+        # ── 写操作：清除相关缓存 ──
+        if tool_name in ("file_write", "code_write", "code_create", "code_append",
+                         "file_append", "file_rename", "shell_run"):
+            if self._guard_state.result_cache:
+                self._guard_state.result_cache.clear()
+                logger.debug("🗑️ 写操作/Shell 执行，已清除结果缓存")
+
+        # v3.0: 使用 registry.execute() 扁平化调度
+        if hasattr(self.tool_registry, 'execute'):
+            logger.info(f"⚡ [{tool_name}] | 参数: {tool_args}")
+            if tool_name in ("edit", "write_file", "code_editor", "diff_file", "file"):
+                file_path = tool_args.get("path", tool_args.get("file_path", ""))
+                if file_path:
+                    self.edited_files.add(file_path)
+            start = time.time()
+            result = await self.tool_registry.execute(tool_name, call_id, **tool_args)
+            elapsed = time.time() - start
+            logger.info(f"✅ [{tool_name}] 完成 ({elapsed:.1f}s)")
+
+            # 缓存只读工具的成功结果
+            if _is_read and hasattr(result, 'success') and result.success:
+                content_str = str(result.content)[:5000] if result.content else ""
+                if content_str:
+                    self._guard_state.result_cache[cache_key] = content_str
+
+            return result
+
+        # 向后兼容
+        tool = self.tool_registry.get(tool_name) if hasattr(self.tool_registry, 'get') else None
+        if not tool:
+            raise ValueError(f"未知工具: {tool_name}")
+        logger.info(f"⚡ [{tool_name}] | 参数: {tool_args}")
+        if tool_name in ("edit", "write_file", "code_editor", "diff_file", "file"):
+            file_path = tool_args.get("path", tool_args.get("file_path", ""))
+            if file_path:
+                self.edited_files.add(file_path)
+        start = time.time()
+        result = await tool.execute(call_id, **tool_args)
+        elapsed = time.time() - start
+        logger.info(f"✅ [{tool_name}] 完成 ({elapsed:.1f}s)")
+
+        if _is_read and hasattr(result, 'success') and result.success:
+            content_str = str(result.content)[:5000] if result.content else ""
+            if content_str:
+                self._guard_state.result_cache[cache_key] = content_str
+
+        return result
+
+    # ═══════════════════════════════════════════════════════════════
+    #  长期记忆
+    # ═══════════════════════════════════════════════════════════════
+
+    def _ensure_injector(self) -> None:
+        if self._injector is not None:
+            return
+        try:
+            from engine.longterm.topic_inject import get_injector
+            self._injector = get_injector()
+            self._topic_store = self._injector.store
+        except Exception as e:
+            logger.debug(f"长期记忆未启用: {e}")
+            self._injector = None
+
+    async def _try_save_topics(self, messages: List[Dict]) -> None:
+        self._ensure_injector()
+        if not self._injector or not self._topic_store:
+            return
+        try:
+            from engine.longterm.topic_compress import compress_dialogue
+            topics = await compress_dialogue(
+                messages=messages[-40:],
+                llm_client=self.llm_client,
+                store=self._topic_store,
+                min_importance=0.3,
+            )
+            if topics:
+                logger.info(f"💾 提取 {len(topics)} 个长期记忆")
+        except Exception as e:
+            logger.debug(f"长期记忆保存跳过: {e}")
+
+    # ═══════════════════════════════════════════════════════════════
+    #  Lint 检查
+    # ═══════════════════════════════════════════════════════════════
+
+    async def _auto_lint_check(
+        self, findings: List[str], round_idx: int,
+        on_event: Optional[Callable] = None,
+    ) -> None:
+        for file_path in list(self.edited_files):
+            if not os.path.isfile(file_path):
+                continue
+            try:
+                passes = await self.lint_runner.run(file_path)
+                if passes:
+                    if on_event:
+                        await on_event("lint_pass", {"file": file_path})
+                else:
+                    msg = f"⚠️ Lint 提醒: {file_path} 有代码风格问题"
+                    findings.append(msg)
+                    if on_event:
+                        await on_event("lint_error", {"file": file_path})
+            except Exception as e:
+                logger.debug(f"Lint 跳过 {file_path}: {e}")
+
+    # ═══════════════════════════════════════════════════════════════
+    #  诊断输出
+    # ═══════════════════════════════════════════════════════════════
+
+    def _diag_print_startup(self, task: str, working_dir: str) -> None:
+        _diag_print(f"{'=' * 80}")
+        _diag_print(f"🤖 AgentLoop 启动")
+        _diag_print(f"  Task: {task[:200]}")
+        _diag_print(f"  CWD: {working_dir}")
+        _diag_print(f"  Model: {self.llm_client.model if hasattr(self.llm_client, 'model') else 'default'}")
+        _diag_print(f"  Skill: {self.skill.meta.display_name if self.skill else 'None'}")
+
+        try:
+            tool_count = len(self.tool_registry.list_tools()) if hasattr(self.tool_registry, 'list_tools') else 0
+            _diag_print(f"  Tools: {tool_count} registered")
+        except Exception:
+            pass
+
+        _diag_print(f"{'=' * 80}")
+
+    def _diag_print_llm_response(self, response: Dict, round_num: int) -> None:
+        if not DIAG_ENABLED:
+            return
+        choice = response.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        finish_reason = choice.get("finish_reason", "?")
+        content = message.get("content", "") or ""
+        tcs = message.get("tool_calls", None)
+
+        if tcs:
+            names = [tc.get("function", {}).get("name", "?") for tc in tcs]
+            _diag_print(f"  🤖 R{round_num} → {', '.join(names)} ({finish_reason})")
+        else:
+            _diag_print(
+                f"  🤖 R{round_num} → 回答 ({finish_reason}) "
+                f"content={content[:120]}"
+            )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  模块级辅助函数
+# ═══════════════════════════════════════════════════════════════
+
+def _format_tool_log(tool_calls_log: List) -> str:
+    """格式化工具调用日志（用于终止消息）。"""
+    lines = []
+    _get = record_get
+    for t in tool_calls_log:
+        name = _get(t, "tool", "?")
+        err = _get(t, "error")
+        status = "✅" if not err else "❌"
+        error_info = f": {err[:80]}" if err else ""
+        lines.append(f"  {status} {name}{error_info}")
+    return "\n".join(lines)
+
+
+================================================================================
+# FILE: checkpoint.py
+================================================================================
+"""
+engine/checkpoint.py — Agent 检查点系统
+
+每 N 轮自动保存状态，支持中断恢复。
+
+用法：
+    cp = Checkpoint(task_id)
+    # 每轮结束后
+    cp.save(round_idx, messages, tool_calls_log)
+    # 启动时
+    if cp.exists():
+        state = cp.load()
+        # 从断点恢复
+"""
+
+import json
+import hashlib
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# 检查点存储目录
+CHECKPOINT_DIR = Path.home() / ".jarvis" / "checkpoints"
+
+
+class Checkpoint:
+    """Agent 检查点 — 保存/恢复执行状态"""
+
+    def __init__(self, task_id: str, save_dir: Optional[str] = None):
+        """
+        Args:
+            task_id: 任务唯一标识（用于文件命名）
+            save_dir: 检查点存储目录，默认 ~/.jarvis/checkpoints/
+        """
+        # 用 task_id 的 hash 做文件名，避免文件名过长
+        task_hash = hashlib.md5(task_id.encode()).hexdigest()[:12]
+        self._name = f"{task_hash}"
+        self._dir = Path(save_dir or CHECKPOINT_DIR)
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._path = self._dir / f"{self._name}.json"
+        self._last_save_time: float = 0.0
+
+    @property
+    def path(self) -> str:
+        return str(self._path)
+
+    def exists(self) -> bool:
+        """检查是否存在有效的检查点"""
+        if not self._path.exists():
+            return False
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            return data.get("valid", False)
+        except Exception:
+            return False
+
+    def save(
+        self,
+        round_idx: int,
+        messages: List[Dict],
+        tool_calls_log: List,
+        findings: List[str],
+        edited_files: Optional[List[str]] = None,
+    ) -> None:
+        """
+        保存检查点。
+
+        Args:
+            round_idx: 当前轮次
+            messages: 消息列表（序列化用）
+            tool_calls_log: 工具调用日志
+            findings: 发现列表
+        """
+        # 序列化 messages（移除不可 JSON 序列化的内容）
+        safe_messages = []
+        for m in messages:
+            safe = {}
+            for k, v in m.items():
+                if isinstance(v, (str, int, float, bool, list, dict, type(None))):
+                    safe[k] = v
+                else:
+                    safe[k] = str(v)
+            safe_messages.append(safe)
+
+        data = {
+            "valid": True,
+            "saved_at": time.time(),
+            "round": round_idx,
+            "tool_calls_count": len(tool_calls_log),
+            "messages": safe_messages,
+            "tool_calls_log": [
+                r.to_dict() if hasattr(r, "to_dict") else r
+                for r in tool_calls_log
+            ],
+            "findings": findings,
+        }
+
+
+        if edited_files is not None:
+            data["edited_files"] = edited_files
+
+        self._path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        self._last_save_time = time.time()
+        logger.info(
+            f"💾 检查点已保存: 第{round_idx}轮, "
+            f"{len(safe_messages)}条消息, "
+            f"{self._fmt_size(self._path.stat().st_size)}"
+        )
+
+    def load(self) -> Optional[Dict]:
+        """加载检查点"""
+        if not self._path.exists():
+            return None
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            logger.info(
+                f"📂 检查点已加载: 第{data.get('round', '?')}轮, "
+                f"{len(data.get('messages', []))}条消息"
+            )
+            return data
+        except Exception as e:
+            logger.warning(f"检查点加载失败: {e}")
+            return None
+
+    def cleanup(self, remove_file: bool = True) -> None:
+        """清理检查点"""
+        if remove_file and self._path.exists():
+            self._path.unlink()
+            logger.debug(f"检查点已删除: {self._path}")
+
+    def time_since_save(self) -> float:
+        """距离上次保存的秒数"""
+        if self._last_save_time == 0 and self._path.exists():
+            try:
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+                self._last_save_time = data.get("saved_at", 0)
+            except Exception:
+                pass
+        if self._last_save_time == 0:
+            return float("inf")
+        return time.time() - self._last_save_time
+
+    @staticmethod
+    def _fmt_size(size: int) -> str:
+        if size < 1024:
+            return f"{size}B"
+        elif size < 1024 * 1024:
+            return f"{size/1024:.0f}KB"
+        else:
+            return f"{size/1024/1024:.1f}MB"
+
+    @staticmethod
+    def list_checkpoints() -> List[Dict]:
+        """列出所有检查点"""
+        cp_dir = Path(CHECKPOINT_DIR)
+        if not cp_dir.exists():
+            return []
+        checkpoints = []
+        for f in sorted(cp_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if data.get("valid"):
+                    checkpoints.append({
+                        "file": f.name,
+                        "saved_at": time.strftime(
+                            "%Y-%m-%d %H:%M:%S",
+                            time.localtime(data.get("saved_at", 0))
+                        ),
+                        "round": data.get("round", 0),
+                        "messages": len(data.get("messages", [])),
+                        "tool_calls": data.get("tool_calls_count", 0),
+                        "size": f.stat().st_size,
+                    })
+            except Exception:
+                pass
+        return checkpoints
+
+
+================================================================================
+# FILE: conversation.py
+================================================================================
+"""
+engine/conversation.py — 连贯对话管理器 (v3.0)
+
+双消息格式:
+  _messages (llm) — 完整 LLM 格式（system/tool_call_id/content...）
+  display_messages — 前端展示用（去除 system 消息，简化 tool 结果）
+
+压缩追踪:
+  compressed_until — 已压缩到的消息索引（避免重复 LLM 摘要）
+  compressed_summary — 历史操作日志摘要文本
+"""
+
+import logging
+from typing import Any, Dict, List, Optional, Callable, Awaitable
+
+from .agent_loop import AgentLoop
+
+logger = logging.getLogger(__name__)
+
+
+class ConversationSession:
+    """
+    连贯对话管理器。
+
+    让 AgentLoop 的 messages 在多次 run() 之间保持连贯。
+    会话内的每一轮对话自动继承前面的完整上下文，
+    包括所有中间工具调用结果。
+
+    用法:
+        session = ConversationSession(loop_factory=create_agent_loop)
+        await session.chat("提取这个PDF的内容")
+        await session.chat("把内容转成Word")  # 自动带上前面的上下文
+        await session.reset()  # 可选：重置对话
+    """
+
+    def __init__(
+        self,
+        loop_factory: Callable[[], AgentLoop],
+        session_id: str = "",
+    ):
+        self._loop_factory = loop_factory
+        self.session_id: str = session_id
+        self._messages: List[Dict] = []       # LLM 格式的完整对话历史
+        self._turn_count: int = 0
+
+        # 压缩状态
+        self.compressed_until: int = 0
+        self.compressed_summary: str = ""
+
+        # Token 统计
+        self._estimated_tokens: int = 0
+        self._TOTAL_TOKEN_WARN = 100_000
+        self._TOTAL_TOKEN_HARD = 110_000
+
+    # ── 消息访问 ──
+
+    @property
+    def messages(self) -> List[Dict]:
+        """LLM 格式的消息列表（深拷贝）"""
+        import copy
+        return copy.deepcopy(self._messages)
+
+    @property
+    def display_messages(self) -> List[Dict]:
+        """前端展示用消息列表 — 去掉 system/压缩摘要，简化 tool 结果"""
+        result = []
+        for m in self._messages:
+            role = m.get("role", "")
+            if role in ("system",):
+                continue  # 前端不需要 system 消息
+
+            display = {"role": role}
+            if role == "tool":
+                # 简化 tool 结果展示
+                display["content"] = m.get("content", "")[:500]
+                display["tool_call_id"] = m.get("tool_call_id", "")
+            elif role == "assistant":
+                display["content"] = m.get("content", "")
+                if m.get("tool_calls"):
+                    display["tool_calls"] = [
+                        tc.get("function", {}).get("name", "?")
+                        for tc in m.get("tool_calls", [])
+                    ]
+            else:
+                display["content"] = m.get("content", "")
+
+            result.append(display)
+        return result
+
+    @property
+    def turn_count(self) -> int:
+        return self._turn_count
+
+    @property
+    def token_estimate(self) -> int:
+        return self._estimated_tokens
+
+    # ── 对话 ──
+
+    async def chat(
+        self,
+        task: str,
+        working_dir: str = ".",
+        on_event: Optional[Callable[[str, Dict], Awaitable[None]]] = None,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        发送一条消息，自动携带前面所有对话历史。
+
+        Args:
+            task: 用户输入
+            working_dir: 工作目录
+            on_event: 事件回调
+            model: 指定使用的模型名称（可选）
+
+        Returns:
+            AgentLoop.run() 的完整返回值
+        """
+        self._turn_count += 1
+        loop = self._loop_factory()
+
+        history = self._messages if self._turn_count > 1 else None
+
+        logger.info(
+            f"🧵 [会话 {self.session_id[:8]}] 第 {self._turn_count} 轮 | "
+            f"历史 {len(self._messages)} 条消息 | "
+            f"压缩到 {self.compressed_until} | "
+            f"估算 {self._estimated_tokens} tokens"
+        )
+
+        result = await loop.run(
+            task=task,
+            working_dir=working_dir,
+            history=history,
+            on_event=on_event,
+            skip_last_user=False,
+            compressed_until=self.compressed_until,
+            compressed_summary=self.compressed_summary,
+            model_override=model,
+        )
+
+        # ── 保存本轮完整消息列表 ──
+        new_messages = result.get("messages", [])
+        if new_messages:
+            self._messages = new_messages
+            self._update_token_estimate()
+
+        # ── 持久化压缩状态 ──
+        self.compressed_until = result.get("compressed_until", self.compressed_until)
+        self.compressed_summary = result.get("compressed_summary", self.compressed_summary)
+
+        logger.info(
+            f"🧵 第 {self._turn_count} 轮结束: "
+            f"AgentLoop 返回 {len(new_messages)} 条消息, "
+            f"compressed_until={self.compressed_until}, "
+            f"success={result.get('success')}, rounds={result.get('rounds')}"
+        )
+
+        return result
+
+    def _update_token_estimate(self) -> None:
+        try:
+            from .core.token_estimator import estimate_message_dict
+            total = sum(estimate_message_dict(m) for m in self._messages)
+        except Exception:
+            total = sum(len(str(m.get("content", ""))) for m in self._messages) // 4
+            total += len(self._messages) * 15
+
+        self._estimated_tokens = total
+
+        if total > self._TOTAL_TOKEN_HARD:
+            logger.warning(f"💰 Token 水位 {total}，强制压缩历史")
+        elif total > self._TOTAL_TOKEN_WARN:
+            logger.info(f"💰 Token 水位 {total}/{self._TOTAL_TOKEN_HARD}")
+
+    # ── 管理 ──
+
+    async def reset(self) -> None:
+        """重置对话"""
+        self._messages.clear()
+        self._turn_count = 0
+        self._estimated_tokens = 0
+        self.compressed_until = 0
+        self.compressed_summary = ""
+        logger.info(f"🧵 [会话 {self.session_id[:8]}] 已重置")
+
+    def import_history(self, messages: List[Dict]) -> None:
+        """从消息列表导入已有对话历史"""
+        self._messages = list(messages)
+        self._turn_count = sum(1 for m in messages if m.get("role") == "user")
+        self._update_token_estimate()
+        logger.info(f"🧵 [会话 {self.session_id[:8]}] 导入 {len(messages)} 条历史")
+
+    def summary(self) -> Dict[str, Any]:
+        """会话摘要"""
+        return {
+            "session_id": self.session_id,
+            "turn_count": self._turn_count,
+            "message_count": len(self._messages),
+            "estimated_tokens": self._estimated_tokens,
+            "compressed_until": self.compressed_until,
+            "compressed_summary_len": len(self.compressed_summary) if self.compressed_summary else 0,
+        }
+
+
+================================================================================
+# FILE: core\__init__.py
+================================================================================
+"""核心类型和错误定义"""
+from .types import Message, ToolCall, ToolResult, Role
+from .errors import (
+    EngineError, ToolNotFoundError, ToolExecutionError,
+    LoopTimeoutError, MaxRetriesExceededError,
+)
+from .guard import GuardState, ENABLE_RESULT_CACHE, ENABLE_HARD_INTERRUPT
+
+__all__ = [
+    "Message", "ToolCall", "ToolResult", "Role",
+    "EngineError", "ToolNotFoundError", "ToolExecutionError",
+    "LoopTimeoutError", "MaxRetriesExceededError",
+    "GuardState", "ENABLE_RESULT_CACHE", "ENABLE_HARD_INTERRUPT",
+]
+
+
+================================================================================
+# FILE: core\approval.py
+================================================================================
+"""
+engine/core/approval.py — 审批门
+
+Claude Code 风格的工具执行拦截器。
+高风险操作（file_write, shell_run, git_push 等）需要审批。
+
+两种模式:
+- auto 模式 (默认): 自动放行 + SSE 通知前端
+- manual 模式: 暂停执行，等待用户通过 API 确认/拒绝
+"""
+
+import asyncio
+import logging
+from typing import Callable, Dict, Optional, Any
+
+from ..tool.policy import ToolPolicy, AccessLevel
+
+logger = logging.getLogger(__name__)
+
+
+# ── 高风险工具描述 ──
+HIGH_RISK_TOOLS: Dict[str, str] = {
+    "file_write": "写入/覆盖文件",
+    "file_append": "追加文件内容",
+    "shell_run": "执行 Shell 命令",
+    "git_push": "推送到远程仓库",
+    "git_commit": "提交代码",
+    "code_write": "修改代码文件",
+    "code_create": "创建代码文件",
+    "code_append": "追加代码",
+}
+
+
+class ApprovalGate:
+    """
+    审批门 — Claude Code 风格的工具执行拦截器
+
+    用法:
+        gate = ApprovalGate(policy, auto_approve=True)
+
+        # 工具执行前调用
+        approved = await gate.check_and_wait(tool_name, tool_args, call_id, on_event)
+        if not approved:
+            raise PermissionError(...)
+    """
+
+    def __init__(self, policy: ToolPolicy, auto_approve: bool = True):
+        self._policy = policy
+        self._auto_approve = auto_approve
+        # call_id -> asyncio.Event (manual 模式下阻塞等待)
+        self._pending: Dict[str, asyncio.Event] = {}
+        # call_id -> bool (审批结果)
+        self._results: Dict[str, bool] = {}
+
+    def set_auto_approve(self, enabled: bool) -> None:
+        """切换自动审批模式"""
+        self._auto_approve = enabled
+        logger.info(f"审批门: auto_approve={enabled}")
+
+    def is_auto_approve(self) -> bool:
+        return self._auto_approve
+
+    async def check_and_wait(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        call_id: str,
+        on_event: Optional[Callable] = None,
+    ) -> bool:
+        """
+        检查工具是否需要审批，必要时等待用户确认。
+
+        Args:
+            tool_name: 工具名称
+            tool_args: 工具参数
+            call_id: 调用 ID
+            on_event: SSE 事件回调
+
+        Returns:
+            True = 允许执行
+            False = 被拒绝
+        """
+        # 动态检查（考虑参数内容）
+        level = self._policy.check_dynamic(tool_name, tool_args, call_id)
+
+        if level == AccessLevel.ALLOW:
+            return True
+
+        if level == AccessLevel.DENY:
+            logger.warning(f"🔒 工具被禁止: {tool_name}")
+            return False
+
+        # REQUIRE_APPROVAL
+        risk_desc = HIGH_RISK_TOOLS.get(tool_name, f"执行 {tool_name}")
+
+        if self._auto_approve:
+            # 自动模式：放行 + 通知前端
+            logger.info(f"🔓 自动审批: {tool_name} ({risk_desc})")
+            if on_event:
+                await on_event("approval", {
+                    "tool": tool_name,
+                    "call_id": call_id,
+                    "risk_level": "high" if tool_name in ("file_write", "shell_run", "git_push") else "medium",
+                    "auto_approved": True,
+                    "message": f"已自动审批: {risk_desc}",
+                    "args_preview": _args_preview(tool_args),
+                })
+            return True
+
+        # 手动模式：暂停等待
+        logger.info(f"⏸️ 等待审批: {tool_name} ({risk_desc}) call_id={call_id[:12]}")
+
+        event = asyncio.Event()
+        self._pending[call_id] = event
+
+        if on_event:
+            await on_event("approval", {
+                "tool": tool_name,
+                "call_id": call_id,
+                "risk_level": "high" if tool_name in ("file_write", "shell_run", "git_push") else "medium",
+                "auto_approved": False,
+                "message": f"等待审批: {risk_desc}",
+                "args_preview": _args_preview(tool_args),
+            })
+
+        # 等待用户响应（超时 5 分钟）
+        try:
+            await asyncio.wait_for(event.wait(), timeout=300)
+        except asyncio.TimeoutError:
+            logger.warning(f"⏰ 审批超时: {tool_name} (call_id={call_id[:12]})")
+            self._pending.pop(call_id, None)
+            return False
+
+        result = self._results.pop(call_id, False)
+        self._pending.pop(call_id, None)
+
+        if result:
+            logger.info(f"✅ 已批准: {tool_name}")
+        else:
+            logger.info(f"❌ 已拒绝: {tool_name}")
+
+        return result
+
+    def approve(self, call_id: str) -> bool:
+        """批准一个待审批的调用"""
+        if call_id in self._pending:
+            self._results[call_id] = True
+            self._pending[call_id].set()
+            return True
+        # 也尝试通过 policy 批准
+        return self._policy.approve(call_id)
+
+    def deny(self, call_id: str) -> bool:
+        """拒绝一个待审批的调用"""
+        if call_id in self._pending:
+            self._results[call_id] = False
+            self._pending[call_id].set()
+            return True
+        return self._policy.deny(call_id)
+
+    def get_pending(self) -> Dict[str, str]:
+        """获取所有待审批的 call_id -> tool_name"""
+        return {cid: self._policy._pending_approvals.get(cid, "") for cid in self._pending}
+
+
+def _args_preview(args: Dict[str, Any], max_len: int = 200) -> str:
+    """参数预览（用于审批请求展示）"""
+    import json
+    try:
+        s = json.dumps(args, ensure_ascii=False)
+        return s[:max_len] + ("..." if len(s) > max_len else "")
+    except Exception:
+        return str(args)[:max_len]
+
+
+================================================================================
+# FILE: core\errors.py
+================================================================================
+"""
+core/errors.py — 自定义异常定义
+"""
+
+
+class EngineError(Exception):
+    """引擎基础异常"""
+    pass
+
+
+class ToolNotFoundError(EngineError):
+    """工具未找到"""
+    pass
+
+
+class ToolExecutionError(EngineError):
+    """工具执行失败"""
+    pass
+
+
+class ToolRetryExhaustedError(EngineError):
+    """工具重试耗尽"""
+    def __init__(self, tool_name: str, attempts: int, last_error: str):
+        super().__init__(f"Tool '{tool_name}' failed after {attempts} attempts: {last_error}")
+        self.tool_name = tool_name
+        self.attempts = attempts
+        self.last_error = last_error
+
+
+class InvalidStateTransitionError(EngineError):
+    """非法状态转换"""
+    pass
+
+
+class LoopTimeoutError(EngineError):
+    """循环超时"""
+    pass
+
+
+class MaxRetriesExceededError(EngineError):
+    """超过最大重试次数"""
+    pass
+
+
+class SessionNotFoundError(EngineError):
+    """会话未找到"""
+    pass
+
+
+class MessageLimitExceededError(EngineError):
+    """消息数量超限"""
+    pass
+
+
+# ═══════════════════════════════════════
+#  Skill 层级异常
+# ═══════════════════════════════════════
+
+class SkillExecutionError(EngineError):
+    """Skill 执行失败"""
+    def __init__(self, skill_name: str, message: str, suggestion: str = None):
+        super().__init__(f"Skill '{skill_name}': {message}")
+        self.skill_name = skill_name
+        self.suggestion = suggestion
+
+
+================================================================================
+# FILE: core\file_guard.py
+================================================================================
+"""
+engine/core/file_guard.py — 文件编辑守卫
+
+自动备份代码文件，支持回滚。
+Claude Code 风格：编辑前备份，失败时回滚。
+
+覆盖工具: code_write, code_append, code_create
+"""
+
+import logging
+import shutil
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class FileEditGuard:
+    """
+    文件编辑守卫 — 集中管理代码文件的备份和回滚
+
+    备份策略:
+    - 备份目录: {working_dir}/.jarvis/backups/
+    - 命名规则: {timestamp}_{filename}.bak
+    - 保留策略: 每个文件最多保留 10 个版本
+    """
+
+    GUARDED_TOOLS = {"code_write", "code_append", "code_create"}
+    MAX_BACKUPS_PER_FILE = 10
+
+    def __init__(self, working_dir: str = "."):
+        self._working_dir = Path(working_dir).resolve()
+        self._backup_dir = self._working_dir / ".jarvis" / "backups"
+        # file_path -> [backup_path, ...] (时间顺序)
+        self._backup_index: Dict[str, List[str]] = {}
+
+    def should_guard(self, tool_name: str) -> bool:
+        """判断工具是否需要备份"""
+        return tool_name in self.GUARDED_TOOLS
+
+    def backup_before_edit(self, file_path: str) -> Optional[str]:
+        """
+        在编辑前备份文件。
+
+        Args:
+            file_path: 被编辑的文件路径
+
+        Returns:
+            备份文件路径，如果文件不存在则返回 None
+        """
+        src = Path(file_path)
+        if not src.is_absolute():
+            src = self._working_dir / src
+
+        if not src.exists():
+            return None
+
+        # 创建备份目录
+        self._backup_dir.mkdir(parents=True, exist_ok=True)
+
+        # 生成带时间戳的备份文件名
+        timestamp = int(time.time() * 1000)
+        backup_name = f"{timestamp}_{src.name}.bak"
+        backup_path = self._backup_dir / backup_name
+
+        # 复制文件
+        shutil.copy2(src, backup_path)
+
+        # 更新索引
+        key = str(src.resolve())
+        if key not in self._backup_index:
+            self._backup_index[key] = []
+        self._backup_index[key].append(str(backup_path))
+
+        # 清理超过上限的旧版本
+        backups = self._backup_index[key]
+        if len(backups) > self.MAX_BACKUPS_PER_FILE:
+            old_backups = backups[:len(backups) - self.MAX_BACKUPS_PER_FILE]
+            for old_path in old_backups:
+                try:
+                    Path(old_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self._backup_index[key] = backups[-self.MAX_BACKUPS_PER_FILE:]
+
+        logger.debug(f"🛡️ FileGuard: 已备份 {src} -> {backup_path}")
+        return str(backup_path)
+
+    def rollback(self, file_path: str, version: int = -1) -> bool:
+        """
+        从备份恢复文件。
+
+        Args:
+            file_path: 要恢复的文件路径
+            version: 版本索引，-1 表示最近一次备份
+
+        Returns:
+            是否恢复成功
+        """
+        src = Path(file_path)
+        if not src.is_absolute():
+            src = self._working_dir / src
+
+        key = str(src.resolve())
+        backups = self._backup_index.get(key, [])
+
+        if not backups:
+            logger.warning(f"FileGuard: 无备份可恢复: {file_path}")
+            return False
+
+        try:
+            backup_path = backups[version]
+        except IndexError:
+            logger.warning(f"FileGuard: 版本 {version} 不存在: {file_path}")
+            return False
+
+        if not Path(backup_path).exists():
+            logger.warning(f"FileGuard: 备份文件不存在: {backup_path}")
+            return False
+
+        # 恢复文件
+        shutil.copy2(backup_path, src)
+
+        # 移除已使用的备份（及其之后的版本）
+        if version == -1:
+            version = len(backups) - 1
+        self._backup_index[key] = backups[:version]
+
+        logger.info(f"⏪ FileGuard: 已回滚 {file_path} <- {backup_path}")
+        return True
+
+    def list_backups(self, file_path: str) -> List[Dict]:
+        """列出文件的所有备份版本"""
+        src = Path(file_path)
+        if not src.is_absolute():
+            src = self._working_dir / src
+
+        key = str(src.resolve())
+        backups = self._backup_index.get(key, [])
+
+        result = []
+        for i, backup_path in enumerate(backups):
+            bp = Path(backup_path)
+            if bp.exists():
+                stat = bp.stat()
+                result.append({
+                    "version": i,
+                    "path": backup_path,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                })
+        return result
+
+    def get_backup_dir(self) -> str:
+        """返回备份目录路径"""
+        return str(self._backup_dir)
+
+    def get_backup_count(self, file_path: str) -> int:
+        """获取文件的备份数量"""
+        src = Path(file_path)
+        if not src.is_absolute():
+            src = self._working_dir / src
+        key = str(src.resolve())
+        return len(self._backup_index.get(key, []))
+
+
+================================================================================
+# FILE: core\guard.py
+================================================================================
+"""
+engine/core/guard.py — 守卫系统
+
+从 agent_loop.py 提取的守卫逻辑：重复检测、硬中断、空回复干预、错误分级。
+使用 GuardState 封装所有守卫状态。
+"""
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# ── LLM 行为修复开关 ──
+ENABLE_RESULT_CACHE = True        # Fix 1: 只读工具结果缓存
+ENABLE_HARD_INTERRUPT = True      # Fix 1: 完全相同调用硬中断
+ENABLE_EMPTY_REPLY_FIX = True     # Fix 2: 空回复立即干预
+ENABLE_JSON_CORRECTION = True     # Fix 3: JSON 解析失败→修正请求
+ENABLE_KEY_FINDINGS = True        # Fix 4: 关键发现压缩保护
+ENABLE_ERROR_GRADING = True       # Fix 5: 错误分级引导
+
+# 轻量守卫阈值
+STUCK_SAME_TARGET = 3
+STUCK_CONSECUTIVE_FAILS = 3
+
+
+@dataclass
+class GuardState:
+    """守卫状态容器"""
+    last_tool_target: str = ""
+    same_target_count: int = 0
+    result_cache: Dict[str, str] = field(default_factory=dict)
+    exact_call_signatures: List[str] = field(default_factory=list)
+    key_findings: Dict[str, str] = field(default_factory=dict)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  辅助
+# ═══════════════════════════════════════════════════════════════
+
+def record_get(record, key: str, default=None):
+    """兼容 ToolCallRecord 和 dict 的字段访问。"""
+    if hasattr(record, key):
+        return getattr(record, key, default)
+    if isinstance(record, dict):
+        return record.get(key, default)
+    return default
+
+
+def safe_inject_system(messages: List[Dict], content: str) -> None:
+    """安全地在 messages 末尾追加 system 消息（避开 tool_calls 块）。"""
+    if (messages and messages[-1].get("role") == "assistant"
+            and messages[-1].get("tool_calls")):
+        insert_at = len(messages) - 1
+        messages.insert(insert_at, {"role": "system", "content": content})
+    else:
+        messages.append({"role": "system", "content": content})
+
+
+# ═══════════════════════════════════════════════════════════════
+#  守卫函数
+# ═══════════════════════════════════════════════════════════════
+
+def guard_repeated_target(state: GuardState, tool_name: str, tool_args: Dict) -> None:
+    """追踪同一目标的连续操作次数。"""
+    target = tool_args.get("path") or tool_args.get("query") or tool_args.get("file_path", "")
+    if not target:
+        state.last_tool_target = ""
+        state.same_target_count = 0
+        return
+
+    if target == state.last_tool_target:
+        state.same_target_count += 1
+    else:
+        state.same_target_count = 1
+        state.last_tool_target = target
+
+
+def check_stuck(state: GuardState, tool_calls_log: List) -> Optional[str]:
+    """纯规则检测是否需要提醒 LLM。"""
+    if len(tool_calls_log) < STUCK_CONSECUTIVE_FAILS:
+        return None
+
+    if state.same_target_count >= STUCK_SAME_TARGET:
+        return (
+            f"⚠️ 你已经连续 {state.same_target_count} 次操作 `{state.last_tool_target}`。"
+            "如果目标没有变化，请基于已有信息直接输出结论，不要再重复。"
+        )
+
+    recent = tool_calls_log[-STUCK_CONSECUTIVE_FAILS:]
+    if all(record_get(t, "error") is not None for t in recent):
+        errors = [(record_get(t, "error", "") or "")[:80] for t in recent]
+        return (
+            f"连续 {STUCK_CONSECUTIVE_FAILS} 次操作失败。\n"
+            f"最近错误: {', '.join(errors)}\n"
+            "请分析失败原因，换一种完全不同的方式。"
+        )
+
+    return None
+
+
+def check_stuck_hard(state: GuardState, tool_name: str, tool_args: Dict) -> Optional[str]:
+    """Fix 1: 检测完全相同的调用（工具名+参数完全一致），3 次则硬中断。"""
+    try:
+        sig = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+    except (TypeError, ValueError):
+        sig = f"{tool_name}:{str(tool_args)}"
+
+    state.exact_call_signatures.append(sig)
+
+    if (len(state.exact_call_signatures) >= 3
+            and len(set(state.exact_call_signatures[-3:])) == 1):
+        return (
+            f"[系统拦截] 已连续 3 次调用 {tool_name} 且参数完全相同。\n"
+            f"该操作的结果不会改变，请基于已有信息直接输出结论，"
+            f"或换一种完全不同的方式完成任务。"
+        )
+    return None
+
+
+def suggest_next_action(messages: List[Dict], tool_calls_log: List) -> str:
+    """Fix 2: 根据上下文生成空回复干预建议。"""
+    user_input = ""
+    for m in messages:
+        if m.get("role") == "user":
+            content = str(m.get("content", ""))
+            if content and not content.startswith("[系统提示]"):
+                user_input = content[:200]
+                break
+
+    recent_tools = []
+    for record in tool_calls_log[-5:]:
+        name = record_get(record, "tool", "?")
+        err = record_get(record, "error")
+        status = "失败" if err else "成功"
+        recent_tools.append(f"  - {name}: {status}")
+
+    read_files = set()
+    for record in tool_calls_log:
+        name = record_get(record, "tool", "")
+        if name in ("file_read", "code_read", "web_fetch", "read_file"):
+            args = record_get(record, "args", {})
+            if isinstance(args, dict):
+                path = args.get("path", args.get("url", ""))
+                if path:
+                    read_files.add(path)
+
+    parts = [
+        "[系统提醒] 你刚才输出了空回复（无任何内容和工具调用），这会导致对话卡死。",
+    ]
+    if user_input:
+        parts.append(f"\n原始需求: {user_input}")
+    if read_files:
+        parts.append(f"\n已读取文件: {', '.join(list(read_files)[:10])}")
+    if recent_tools:
+        parts.append(f"\n最近操作:\n" + "\n".join(recent_tools))
+    parts.append(
+        "\n请选择下一步:\n"
+        "1) 信息已足够 → 直接输出最终结果\n"
+        "2) 需要更多信息 → 调用具体工具\n"
+        "3) 需要修改代码 → 调用 code_write 等编辑工具"
+    )
+    return "\n".join(parts)
+
+
+def handle_tool_error(
+    messages: List[Dict], tool_name: str,
+    error_str: str, tool_calls_log: List,
+    tool_registry: Optional[Any] = None,
+) -> None:
+    """Fix 5: 根据错误类型和连续失败次数，分级注入引导。"""
+    consecutive_fails = 0
+    for record in reversed(tool_calls_log):
+        if record_get(record, "error"):
+            consecutive_fails += 1
+        else:
+            break
+
+    error_lower = error_str.lower()
+
+    # Tier 1: 参数错误
+    is_param_error = any(
+        kw in error_lower
+        for kw in ("缺少", "参数", "invalid", "required", "missing", "argument")
+    )
+    if is_param_error:
+        if consecutive_fails >= 3:
+            from ..tool.parser import get_tool_param_hint
+            param_hint = get_tool_param_hint(tool_registry, tool_name)
+            if param_hint:
+                hint = (
+                    f"[系统提示] `{tool_name}` 连续 {consecutive_fails} 次参数错误。\n"
+                    f"正确参数:{param_hint}"
+                )
+                messages.append({"role": "user", "content": hint})
+                logger.info(f"📋 Tier 1: 注入 {tool_name} 参数格式")
+        return
+
+    # Tier 2: 文件不存在 / 权限问题
+    is_file_error = any(
+        kw in error_lower
+        for kw in ("not found", "permission", "不存在", "没有权限", "no such file", "access denied")
+    )
+    if is_file_error:
+        hint = (
+            f"[系统提示] `{tool_name}` 遇到文件/权限错误: {error_str[:150]}\n"
+            f"建议: 先用 file_list 或 shell('dir/ls') 确认文件路径是否正确。"
+        )
+        messages.append({"role": "user", "content": hint})
+        logger.info(f"📋 Tier 2: 文件/权限错误引导")
+        return
+
+    # Tier 3: 连续 ≥3 次失败（通用）
+    if consecutive_fails >= 3:
+        alternatives = suggest_alternatives(tool_name, error_str)
+        alt_text = "\n".join(f"  - {a}" for a in alternatives) if alternatives else "  - 检查参数后重试"
+        hint = (
+            f"[系统提示] `{tool_name}` 连续失败 {consecutive_fails} 次。\n"
+            f"错误: {error_str[:150]}\n"
+            f"建议替代方案:\n{alt_text}\n"
+            f"如果此步骤无法完成，可以跳过它继续后续任务。"
+        )
+        messages.append({"role": "user", "content": hint})
+        logger.info(f"📋 Tier 3: 连续失败 {consecutive_fails} 次，注入替代方案")
+
+
+def suggest_alternatives(tool_name: str, error_str: str) -> List[str]:
+    """Fix 5: 根据失败工具返回替代方案。"""
+    if tool_name in ("shell_run", "shell", "run_command", "execute"):
+        return [
+            "先写入脚本文件再用 shell_run 执行脚本文件",
+            "检查命令语法是否正确（引号、转义等）",
+            "尝试用更简单的命令分步执行",
+        ]
+    elif tool_name in ("file_read", "code_read", "read_file"):
+        return [
+            "用 file_list 或 shell('dir') 确认文件路径",
+            "检查文件是否存在或路径拼写是否正确",
+        ]
+    elif tool_name in ("web_fetch", "fetch_url", "http_get"):
+        return [
+            "改用 web_search 搜索相关内容",
+            "检查 URL 是否可访问",
+        ]
+    elif tool_name in ("file_write", "code_write", "code_create"):
+        return [
+            "确认目标目录是否存在",
+            "检查文件路径是否有写权限",
+        ]
+    else:
+        return [
+            "检查参数格式是否正确",
+            "跳过此步骤，继续后续任务",
+        ]
+
+
+def detect_loop(tool_calls_log: List) -> bool:
+    """检测固定模式循环。"""
+    if len(tool_calls_log) < 8:
+        return False
+    recent = tool_calls_log[-8:]
+    names = [record_get(t, "tool", "") for t in recent]
+    recent_errors = [record_get(t, "error") for t in recent]
+    if len(recent_errors) >= 4 and all(e is not None for e in recent_errors[-4:]):
+        return True
+    signatures = []
+    for t in recent:
+        sig = (record_get(t, "tool", ""), json.dumps(record_get(t, "args", {}), sort_keys=True))
+        signatures.append(sig)
+    if len(set(signatures[-5:])) == 1:
+        return True
+    if len(names) >= 6:
+        for cycle_len in (2, 3):
+            needed = cycle_len * 3
+            if len(names) >= needed:
+                cycle = names[:cycle_len]
+                expected = cycle * 3
+                if expected == names[:needed] and len(set(cycle)) >= 2:
+                    return True
+    return False
+
+
+================================================================================
+# FILE: core\logging_config.py
+================================================================================
+"""
+core/logging_config.py — 统一结构化日志配置
+
+用法:
+    from engine.core.logging_config import setup_logging
+    setup_logging(level="INFO")
+"""
+import logging
+import sys
+from typing import Optional
+
+
+def setup_logging(
+    level: str = "INFO",
+    json_output: bool = False,
+    component_filter: Optional[str] = None,
+):
+    """
+    统一日志配置
+
+    Args:
+        level: 日志级别 (DEBUG/INFO/WARNING/ERROR)
+        json_output: 是否输出 JSON 格式（生产环境用）
+        component_filter: 仅显示特定组件的日志（如 "dag"、"llm"）
+    """
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    # 清除已有 handler
+    root.handlers.clear()
+
+    if json_output:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(_JSONFormatter())
+    else:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(_ColoredFormatter())
+
+    root.addHandler(handler)
+
+    # 第三方库日志降噪
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+
+class _ColoredFormatter(logging.Formatter):
+    """带颜色的控制台日志格式"""
+
+    COLORS = {
+        "DEBUG": "\033[36m",     # 青色
+        "INFO": "\033[32m",      # 绿色
+        "WARNING": "\033[33m",   # 黄色
+        "ERROR": "\033[31m",     # 红色
+        "CRITICAL": "\033[41m",  # 红底
+    }
+    RESET = "\033[0m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = self.COLORS.get(record.levelname, "")
+        level = f"{color}{record.levelname:8s}{self.RESET}"
+        name = f"{record.name:<20s}"
+        msg = record.getMessage()
+        return f"{level} {name} {msg}"
+
+
+class _JSONFormatter(logging.Formatter):
+    """JSON 格式日志（生产环境）"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json
+        import datetime
+
+        log_entry = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0]:
+            log_entry["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(log_entry, ensure_ascii=False)
+
+
+================================================================================
+# FILE: core\script_detector.py
+================================================================================
+"""
+engine/core/script_detector.py — 脚本建议检测器
+
+Claude Code 风格：当 LLM 连续多次用同一类工具失败时，
+建议它把操作写入脚本文件再执行，而非反复在工具调用中嵌入复杂代码。
+
+触发条件（任一）:
+1. 连续 3 次同一工具名 + 全部失败
+2. 连续 3 次 shell_run 失败（各种命令）
+"""
+
+import logging
+from typing import List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+class ScriptSuggestionDetector:
+    """
+    脚本建议检测器
+
+    集成在 agent_loop 的工具执行结果处理后。
+    """
+
+    # 工具名 -> 分类标签
+    TOOL_CATEGORIES = {
+        "shell_run": "shell",
+        "shell_execute": "shell",
+        "code_write": "code_edit",
+        "code_append": "code_edit",
+        "file_write": "file_edit",
+    }
+
+    SUGGESTION_TEMPLATE = (
+        "[系统建议] 你已经连续 {count} 次使用 `{tool_name}` 失败。\n"
+        "建议: 将操作写入一个临时脚本文件（如 `_tmp_script.py` 或 `_tmp_script.sh`），\n"
+        "然后用 `shell_run(command=\"python _tmp_script.py\")` 执行。\n"
+        "这样可以避免 JSON 转义问题，也便于调试。执行完毕后记得清理临时文件。"
+    )
+
+    def __init__(self, threshold: int = 3):
+        self._threshold = threshold
+        # 追踪: [(tool_name, is_success), ...]
+        self._recent_calls: List[Tuple[str, bool]] = []
+        self._suggestion_injected: bool = False
+
+    def record(self, tool_name: str, is_success: bool) -> None:
+        """记录一次工具调用结果"""
+        self._recent_calls.append((tool_name, is_success))
+        # 只保留最近 10 条
+        if len(self._recent_calls) > 10:
+            self._recent_calls = self._recent_calls[-10:]
+        # 成功后重置建议标记
+        if is_success:
+            self._suggestion_injected = False
+
+    def should_suggest(self) -> Optional[str]:
+        """
+        检查是否应该注入脚本建议。
+
+        Returns:
+            建议文本（str），或 None（不需要建议）
+        """
+        if self._suggestion_injected:
+            return None
+        if len(self._recent_calls) < self._threshold:
+            return None
+
+        recent = self._recent_calls[-self._threshold:]
+
+        names = [n for n, _ in recent]
+        successes = [s for _, s in recent]
+
+        if all(not s for s in successes):
+            # 全部失败
+            if len(set(names)) == 1:
+                # 条件1: 连续 N 次同一工具 + 全部失败
+                self._suggestion_injected = True
+                return self.SUGGESTION_TEMPLATE.format(
+                    count=self._threshold,
+                    tool_name=names[0],
+                )
+
+            # 条件2: 连续 shell 类工具失败（命令不同但都是 shell）
+            categories = [self.TOOL_CATEGORIES.get(n, "") for n in names]
+            if all(c == "shell" for c in categories):
+                self._suggestion_injected = True
+                return self.SUGGESTION_TEMPLATE.format(
+                    count=self._threshold,
+                    tool_name="shell_run",
+                )
+
+        return None
+
+    def reset(self) -> None:
+        """重置状态（新 run 开始时调用）"""
+        self._recent_calls.clear()
+        self._suggestion_injected = False
+
+
+================================================================================
+# FILE: core\token_estimator.py
+================================================================================
+"""
+Token 估算器 — 支持中文/英文/代码/JSON 的分类型估算
+
+相比旧版 _estimate_message_tokens 的改进:
+  - 按内容类型区分系数（代码/JSON 比英文贵）
+  - 统计 tool_calls 格式开销
+  - 区分 message 角色的 base overhead
+"""
+
+from __future__ import annotations
+from typing import Dict, Optional, Any
+from ..core.types import Message, Role
+
+
+class TokenEstimator:
+    """
+    Token 估算器
+
+    基于统计数据的系数:
+      - 中文: 0.7 token/字 (UTF-8 3字节 → 0.7 round)
+      - 英文/西文: 0.25 token/字符
+      - 代码: 0.3 token/字符 (更紧凑但特殊符号多)
+      - JSON: 0.35 token/字符 (大量括号/引号)
+    """
+
+    # 每字符 token 系数
+    RATIOS = {
+        "chinese": 0.65,     # 中文（1字≈0.65 token，GPT/DeepSeek实测）
+        "english": 0.25,      # 英文/数字/符号（4字符≈1 token）
+        "code": 0.3,          # 代码
+        "json": 0.35,         # JSON 结构
+    }
+
+    # 消息角色基础开销
+    OVERHEADS = {
+        Role.USER: 8,
+        Role.ASSISTANT: 8,
+        Role.SYSTEM: 8,
+        Role.TOOL: 12,
+    }
+
+    # tool_calls 每项额外开销
+    TOOL_CALL_OVERHEAD = 15
+
+    # 中文 Unicode 范围
+    _CJK_RANGES = [
+        (0x4E00, 0x9FFF),   # CJK 统一表意文字
+        (0x3000, 0x303F),   # CJK 符号和标点
+        (0xFF00, 0xFFEF),   # 全角 ASCII 和标点
+        (0x2E80, 0x2EFF),   # CJK 部首补充
+    ]
+
+    def estimate(self, message: Message) -> int:
+        """
+        估算一条消息的 token 数
+
+        Args:
+            message: Message 对象
+
+        Returns:
+            估算的 token 数（整数）
+        """
+        tokens = self.OVERHEADS.get(message.role, 8)
+
+        # 内容估算
+        if message.content:
+            tokens += self._estimate_text(message.content)
+
+        # tool_calls 格式开销
+        if message.tool_calls:
+            tokens += self.TOOL_CALL_OVERHEAD * len(message.tool_calls)
+            for tc in message.tool_calls:
+                if hasattr(tc, 'function') and tc.function:
+                    fn = tc.function
+                    if hasattr(fn, 'arguments') and fn.arguments:
+                        args = fn.arguments
+                        if isinstance(args, dict):
+                            tokens += self._estimate_text(str(args), "json")
+                        elif isinstance(args, str):
+                            tokens += self._estimate_text(args, "json")
+                    if hasattr(fn, 'name') and fn.name:
+                        tokens += len(fn.name) // 4
+
+        if message.name:
+            tokens += len(message.name) // 4
+
+        return tokens
+
+    def estimate_dict(self, msg_dict: Dict[str, Any]) -> int:
+        """从 dict 格式消息估算（兼容旧格式）"""
+        role_str = msg_dict.get("role", "user")
+        tokens = 8
+        content = msg_dict.get("content", "")
+        if content:
+            tokens += self._estimate_text(content)
+        tool_calls = msg_dict.get("tool_calls")
+        if tool_calls:
+            tokens += self.TOOL_CALL_OVERHEAD * len(tool_calls)
+            for tc in tool_calls:
+                args = tc.get("function", {}).get("arguments", "{}")
+                if isinstance(args, str):
+                    tokens += self._estimate_text(args, "json")
+        return tokens
+
+    def _estimate_text(self, text: str, content_type: str = "auto") -> int:
+        """
+        估算一段文本的 token 数
+
+        Args:
+            text: 文本
+            content_type: auto/chinese/english/code/json，auto 自动检测
+
+        Returns:
+            token 数
+        """
+        if not text:
+            return 0
+
+        if content_type == "auto":
+            content_type = self._detect_type(text)
+
+        cjk_chars = self._count_cjk(text)
+        other_chars = len(text) - cjk_chars
+
+        ratio = self.RATIOS.get(content_type, 0.3)
+
+        # 中文部分和英文部分分开算
+        if content_type == "chinese":
+            return int(cjk_chars * self.RATIOS["chinese"] + other_chars * self.RATIOS["english"])
+        elif content_type in ("code", "json"):
+            # 代码/JSON：中文按 1.5，其他按指定系数
+            return int(cjk_chars * self.RATIOS["chinese"] + other_chars * ratio)
+        else:
+            return int(cjk_chars * self.RATIOS["chinese"] + other_chars * self.RATIOS["english"])
+
+    def _detect_type(self, text: str) -> str:
+        """自动检测文本类型"""
+        if not text:
+            return "english"
+
+        # 检测 JSON
+        text_stripped = text.strip()
+        if text_stripped.startswith(("{", "[")) and (text_stripped.endswith("}") or text_stripped.endswith("]")):
+            try:
+                # 快速判断：以 [{ 开头且结构紧凑
+                if "{" in text_stripped[:10] or "[" in text_stripped[:10]:
+                    return "json"
+            except Exception:
+                pass
+
+        # 检测代码（含换行符 + 缩进 + 关键词）
+        code_indicators = ["def ", "class ", "import ", "return ", "if __", "    ", "\t"]
+        if any(indicator in text for indicator in code_indicators):
+            # 但也要看中文比例——中文多就不算代码
+            cjk_ratio = self._count_cjk(text) / max(len(text), 1)
+            if cjk_ratio < 0.3:
+                return "code"
+
+        # 检测中文为主
+        cjk_ratio = self._count_cjk(text) / max(len(text), 1)
+        if cjk_ratio > 0.3:
+            return "chinese"
+
+        return "english"
+
+    def _count_cjk(self, text: str) -> int:
+        """统计 CJK 字符数"""
+        count = 0
+        for ch in text:
+            cp = ord(ch)
+            for lo, hi in self._CJK_RANGES:
+                if lo <= cp <= hi:
+                    count += 1
+                    break
+        return count
+
+
+# 全局单例
+_estimator = TokenEstimator()
+
+
+def estimate_message_tokens(message: Message) -> int:
+    """快捷接口"""
+    return _estimator.estimate(message)
+
+
+def estimate_message_dict(msg_dict: Dict[str, Any]) -> int:
+    """快捷接口（dict 格式）"""
+    return _estimator.estimate_dict(msg_dict)
+
+
+================================================================================
+# FILE: core\types.py
+================================================================================
+"""
+core/types.py — 核心类型定义
+
+v3.0: ToolResult 简化，支持新的原子工具架构
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional, Union
+from uuid import uuid4
+
+
+class Role(str, Enum):
+    """消息角色"""
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+
+
+@dataclass
+class ToolCall:
+    """工具调用定义"""
+    id: str
+    name: str
+    arguments: Dict[str, Any]
+
+    @classmethod
+    def create(cls, name: str, arguments: Dict[str, Any]) -> "ToolCall":
+        return cls(id=f"call_{uuid4().hex[:8]}", name=name, arguments=arguments)
+
+    def to_openai_format(self) -> Dict:
+        """转换为 OpenAI 格式"""
+        import json
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": json.dumps(self.arguments),
+            }
+        }
+
+    @classmethod
+    def from_openai_format(cls, data: Dict) -> "ToolCall":
+        """从 OpenAI 格式解析"""
+        import json
+        function = data.get("function", {})
+        raw_args = function.get("arguments", "{}")
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                args = {}
+        else:
+            args = raw_args
+        return cls(
+            id=data.get("id", ""),
+            name=function.get("name", ""),
+            arguments=args,
+        )
+
+
+@dataclass
+class ToolResult:
+    """工具执行结果
+
+    v3.0 简化版: success → bool, error → Optional[str]
+    保持向后兼容（is_success/is_error 属性）
+    """
+    call_id: str
+    tool_name: str
+    success: bool
+    content: Any = None
+    error: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def ok(cls, call_id: str, tool_name: str, content: Any, **metadata) -> "ToolResult":
+        """创建成功结果"""
+        return cls(
+            call_id=call_id,
+            tool_name=tool_name,
+            success=True,
+            content=content,
+            metadata=metadata,
+        )
+
+    @classmethod
+    def fail(cls, call_id: str, tool_name: str, error: str, **metadata) -> "ToolResult":
+        """创建失败结果"""
+        return cls(
+            call_id=call_id,
+            tool_name=tool_name,
+            success=False,
+            error=error,
+            metadata=metadata,
+        )
+
+    # ── 向后兼容 ──
+    @property
+    def is_success(self) -> bool:
+        return self.success
+
+    @property
+    def is_error(self) -> bool:
+        return not self.success
+
+    @property
+    def error_message(self) -> Optional[str]:
+        return self.error
+
+    # ── 别名（向后兼容旧代码中的 ToolResult.error / ToolResult.success 调用）──
+    @classmethod
+    def error(cls, call_id: str, tool_name: str, error: str, **metadata) -> "ToolResult":
+        """fail() 的别名，向后兼容"""
+        return cls.fail(call_id, tool_name, error, **metadata)
+
+    @classmethod
+    def success(cls, call_id: str, tool_name: str, content: Any, **metadata) -> "ToolResult":
+        """ok() 的别名，向后兼容"""
+        return cls.ok(call_id, tool_name, content, **metadata)
+
+
+@dataclass
+class Message:
+    """消息实体"""
+    role: Role
+    content: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+
+    def to_dict(self) -> Dict:
+        """转换为字典（OpenAI 兼容格式）"""
+        result = {"role": self.role.value}
+        if self.content is not None:
+            result["content"] = self.content
+        if self.reasoning_content:
+            result["reasoning_content"] = self.reasoning_content
+        if self.tool_calls:
+            result["tool_calls"] = [
+                tc.to_openai_format() if hasattr(tc, 'to_openai_format')
+                else tc
+                for tc in self.tool_calls
+            ]
+        if self.tool_call_id:
+            result["tool_call_id"] = self.tool_call_id
+        if self.name:
+            result["name"] = self.name
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "Message":
+        """从字典创建"""
+        tool_calls = None
+        if "tool_calls" in data and data["tool_calls"]:
+            tool_calls = [ToolCall.from_openai_format(tc) for tc in data["tool_calls"]]
+        return cls(
+            role=Role(data.get("role", "user")),
+            content=data.get("content"),
+            reasoning_content=data.get("reasoning_content"),
+            tool_calls=tool_calls,
+            tool_call_id=data.get("tool_call_id"),
+            name=data.get("name"),
+        )
+
+    @classmethod
+    def user(cls, content: str) -> "Message":
+        return cls(role=Role.USER, content=content)
+
+    @classmethod
+    def assistant(cls, content: str, tool_calls: Optional[List] = None, reasoning_content: Optional[str] = None) -> "Message":
+        """创建助手消息，自动将原始 dict 转换为 ToolCall 对象"""
+        if tool_calls:
+            converted = []
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    converted.append(ToolCall.from_openai_format(tc))
+                else:
+                    converted.append(tc)
+            tool_calls = converted
+        return cls(role=Role.ASSISTANT, content=content, tool_calls=tool_calls, reasoning_content=reasoning_content)
+
+    @classmethod
+    def tool(cls, call_id: str, content: str) -> "Message":
+        return cls(role=Role.TOOL, tool_call_id=call_id, content=content)
+
+    @classmethod
+    def system(cls, content: str) -> "Message":
+        return cls(role=Role.SYSTEM, content=content)
+
+
+@dataclass
+class ToolCallRecord:
+    """
+    统一工具调用记录 — Claude Code 风格
+
+    替代 tool_calls_log 中的松散 dict。
+    支持格式化为人类可读的单行日志。
+    """
+    tool: str
+    args: Dict[str, Any]
+    round: int
+    call_id: str = ""
+    error: Optional[str] = None
+    result: Optional[str] = None
+    duration_ms: float = 0.0
+    started_at: float = 0.0
+    backup_path: Optional[str] = None
+    approved: bool = True
+    auto_approved: bool = True
+
+    def format_oneline(self) -> str:
+        """
+        Claude Code 风格的单行格式化输出。
+
+        示例:
+          [R3] ✅ code_write(path="app.py") 0.8s
+          [R3] ❌ shell_run(command="npm test") Error: timeout 2.1s
+        """
+        status = "✅" if not self.error else "❌"
+        args_parts = []
+        for k, v in self.args.items():
+            val_str = str(v)[:40]
+            args_parts.append(f'{k}="{val_str}"')
+        args_str = ", ".join(args_parts)
+        time_str = f" {self.duration_ms/1000:.1f}s" if self.duration_ms else ""
+        err_str = f" Error: {self.error[:60]}" if self.error else ""
+        return f"[R{self.round}] {status} {self.tool}({args_str}){time_str}{err_str}"
+
+    def to_dict(self) -> Dict:
+        """转为可序列化的 dict（用于 checkpoint 保存）"""
+        d = {
+            "tool": self.tool,
+            "args": self.args,
+            "round": self.round,
+            "call_id": self.call_id,
+            "error": self.error,
+            "result": self.result[:200] if self.result else None,
+            "duration_ms": self.duration_ms,
+        }
+        if self.backup_path:
+            d["backup_path"] = self.backup_path
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "ToolCallRecord":
+        """从 dict 恢复"""
+        return cls(
+            tool=data.get("tool", ""),
+            args=data.get("args", {}),
+            round=data.get("round", 0),
+            call_id=data.get("call_id", ""),
+            error=data.get("error"),
+            result=data.get("result"),
+            duration_ms=data.get("duration_ms", 0.0),
+            backup_path=data.get("backup_path"),
+        )
+
+
+================================================================================
+# FILE: debug\__init__.py
+================================================================================
+
+
+================================================================================
+# FILE: debug\save_context.py
+================================================================================
+"""
+engine/debug/save_context.py — 失败现场保存
+
+每次 Agent 执行失败时，自动保存完整的会话上下文到磁盘，
+包括 session_id、用户输入、错误信息、消息历史、执行追踪。
+
+用法：
+    from engine.debug.save_context import save_failure_context
+    save_failure_context(session_id, user_input, error, messages)
+"""
+
+import json
+import logging
+import os
+import traceback
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+DEBUG_DIR = Path(os.environ.get("JARVIS_DEBUG_DIR", "./debug_sessions"))
+# 最大保留文件数
+MAX_KEEP = 50
+
+
+def ensure_dir():
+    """确保调试目录存在"""
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_failure_context(
+    session_id: str,
+    user_input: str,
+    error: Exception,
+    messages: Optional[List] = None,
+    extra: Optional[Dict] = None,
+) -> str:
+    """
+    失败时自动保存完整上下文。
+
+    Args:
+        session_id: 会话 ID
+        user_input: 用户输入
+        error: 异常对象
+        messages: 最近的消息列表（可选）
+        extra: 额外上下文（可选）
+
+    Returns:
+        保存的文件路径
+    """
+    ensure_dir()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    short_id = session_id[:8] if session_id else "unknown"
+    filename = f"failure_{timestamp}_{short_id}.json"
+    filepath = DEBUG_DIR / filename
+
+    # 将消息转为可序列化格式
+    serialized_messages = []
+    if messages:
+        for m in (messages[-30:] if len(messages) > 30 else messages):
+            try:
+                serialized_messages.append({
+                    "role": getattr(m, "role", "?"),
+                    "content": str(getattr(m, "content", ""))[:500],
+                    "round_id": getattr(m, "_round_id", -1),
+                })
+            except Exception:
+                serialized_messages.append({"role": "?", "content": str(m)[:500]})
+
+    data = {
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "user_input": user_input,
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "traceback": traceback.format_exc(),
+        "messages": serialized_messages,
+    }
+
+    if extra:
+        data["extra"] = extra
+
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info(f"💾 失败上下文已保存: {filepath}")
+        _cleanup_old()
+        return str(filepath)
+    except Exception as e:
+        logger.warning(f"保存失败上下文出错: {e}")
+        return ""
+
+
+def save_execution_record(
+    session_id: str,
+    user_input: str,
+    success: bool,
+    skill_name: str = "",
+    duration_ms: float = 0,
+    extra: Optional[Dict] = None,
+) -> str:
+    """
+    记录执行记录（无论成功还是失败）。
+
+    成功时保存摘要，失败时保存完整上下文。
+    """
+    ensure_dir()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    short_id = session_id[:8] if session_id else "unknown"
+    status = "success" if success else "failure"
+    filename = f"{status}_{timestamp}_{short_id}.json"
+    filepath = DEBUG_DIR / filename
+
+    data = {
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "user_input": user_input,
+        "success": success,
+        "skill_name": skill_name,
+        "duration_ms": round(duration_ms, 1),
+    }
+
+    if extra:
+        data["extra"] = extra
+
+    if not success:
+        # 失败时加入系统环境信息
+        import platform
+        data["system"] = {
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+            "cwd": os.getcwd(),
+        }
+
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        _cleanup_old()
+        return str(filepath)
+    except Exception:
+        return ""
+
+
+def get_latest_failure() -> Optional[Dict]:
+    """获取最近一次失败的完整上下文"""
+    ensure_dir()
+    failures = sorted(DEBUG_DIR.glob("failure_*.json"), reverse=True)
+    if not failures:
+        return None
+    try:
+        with open(failures[0], "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def list_records(limit: int = 20) -> List[Dict]:
+    """列出最近的执行记录"""
+    ensure_dir()
+    records = sorted(DEBUG_DIR.glob("*.json"), reverse=True)[:limit]
+    results = []
+    for r in records:
+        try:
+            with open(r, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            results.append({
+                "file": r.name,
+                "timestamp": data.get("timestamp", ""),
+                "success": data.get("success", data.get("error_type") is None),
+                "user_input": data.get("user_input", "")[:80],
+                "error_type": data.get("error_type", ""),
+            })
+        except Exception:
+            pass
+    return results
+
+
+def _cleanup_old():
+    """清理旧文件"""
+    ensure_dir()
+    files = sorted(DEBUG_DIR.glob("*.json"), reverse=True)
+    if len(files) > MAX_KEEP:
+        for f in files[MAX_KEEP:]:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+
+================================================================================
+# FILE: lint\__init__.py
+================================================================================
+"""
+engine/lint/__init__.py
+"""
+from .runner import LintRunner, format_lint_feedback
+
+__all__ = ["LintRunner", "format_lint_feedback"]
+
+

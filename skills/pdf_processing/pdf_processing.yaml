@@ -1,0 +1,8 @@
+name: pdf_processing
+display_name: PDF 处理
+icon: 📄
+description: 读取、提取、处理 PDF 文件
+when_to_use: 用户要处理 PDF 文件时
+tools: [office, image, file]
+fallback: null
+tags: [PDF, 提取, 文档]

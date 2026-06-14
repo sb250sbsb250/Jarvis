@@ -1,0 +1,14 @@
+name: test-driven-development
+display_name: 测试驱动开发
+icon: 🔴
+description: 实现任何功能或修复bug时，在写实现代码之前
+when_to_use: 实现任何功能或修复bug时，在写实现代码之前
+tools:
+- code
+- file
+tags:
+- TDD
+- 测试驱动
+- 单元测试
+- 测试
+- test

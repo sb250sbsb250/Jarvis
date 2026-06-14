@@ -51,12 +51,13 @@ const API = {
   },
 
   // ── 聊天 SSE ──
-  createChatStream(message, sessionId, model) {
+  createChatStream(message, sessionId, model, searchEnabled) {
     const controller = new AbortController();
     const body = JSON.stringify({
       message,
       session_id: sessionId || null,
       model: model || null,
+      search_enabled: searchEnabled || false,
     });
 
     const stream = fetch('/api/chat/stream', {

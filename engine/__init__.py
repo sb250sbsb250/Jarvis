@@ -1,3 +1,4 @@
+# engine/__init__.py
 """
 Jarvis V3 Engine — 自主 Agent 引擎
 
@@ -7,25 +8,18 @@ Jarvis V3 Engine — 自主 Agent 引擎
   Tool — 统一的工具注册和执行系统
 """
 
-# ── 核心 ──
 from .agent_loop import AgentLoop
 from .llm_client import LLMClient
-
-# ── 会话 ──
 from .session.session import Session
-
-# ── 工具 ──
 from .tool.registry import ToolRegistry
-from .tool.base import BaseTool, ToolSchema, ToolParameter
+from .tool.base import BaseTool, ToolParameter
+from .tool.base import ToolDefinition as ToolSchema  # 向后兼容
 from .tool.executor import ToolExecutor
 from .tool.policy import ToolPolicy, AccessLevel
 
 __all__ = [
-    # 核心
     "AgentLoop", "LLMClient",
-    # 会话
     "Session",
-    # 工具
     "ToolRegistry", "BaseTool", "ToolSchema", "ToolParameter",
     "ToolExecutor", "ToolPolicy", "AccessLevel",
 ]

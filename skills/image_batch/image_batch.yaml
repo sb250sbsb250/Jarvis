@@ -1,0 +1,8 @@
+name: image_batch
+display_name: 图片批处理
+icon: 🖼️
+description: 批量处理图片（转换/压缩/识别）
+when_to_use: 用户要批量处理图片时
+tools: [image, file, shell]
+fallback: null
+tags: [图片, 批量, 转换]

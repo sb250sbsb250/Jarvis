@@ -1,0 +1,8 @@
+name: log_analysis
+display_name: 日志分析
+icon: 📋
+description: 分析日志文件找出问题和规律
+when_to_use: 用户要分析日志时
+tools: [file, shell, code]
+fallback: data_explore
+tags: [日志, 分析, 排查]

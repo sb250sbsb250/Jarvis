@@ -1,0 +1,13 @@
+{
+  "session_id": "sess_b3500f0fd1f8",
+  "messages": [
+    {
+      "role": "user",
+      "content": "\"C:\\Users\\xinzh\\Downloads\\\"文件夹 文件以20265180701开头的 jpg文件，按照_拆分，所有拆分结果左边第一个为一样的图片，合并为一个pdf"
+    },
+    {
+      "role": "assistant",
+      "content": "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"shell_execute\">\n<｜｜DSML｜｜parameter name=\"command\" string=\"true\">chcp 65001 >nul && python \"C:\\Users\\xinzh\\Downloads\\_merge_pdf.py\" 2>&1</｜｜DSML｜｜parameter>\n<｜｜DSML｜｜parameter name=\"timeout\" string=\"false\">120</｜｜DSML｜｜parameter>\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>"
+    }
+  ]
+}

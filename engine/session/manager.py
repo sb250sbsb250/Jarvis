@@ -57,9 +57,19 @@ class JsonFileStore:
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                # 自动从首条用户消息提取标题
+                title = data.get("title", "")
+                if not title:
+                    for m in data.get("messages", []):
+                        if m.get("role") == "user" and m.get("content"):
+                            title_text = m["content"].strip().replace("\n", " ")[:40]
+                            if len(m["content"]) > 40:
+                                title_text += "..."
+                            title = title_text
+                            break
                 summaries.append({
                     "session_id": data.get("session_id", p.stem),
-                    "title": data.get("title", ""),
+                    "title": title,
                     "messages": len(data.get("messages", [])),
                     "created_at": data.get("created_at", ""),
                     "updated_at": data.get("updated_at", ""),

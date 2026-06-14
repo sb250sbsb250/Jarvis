@@ -1,0 +1,13 @@
+name: writing-skills
+display_name: 编写 Skills
+icon: 📚
+description: 创建新skill、编辑现有skill或验证skill工作时
+when_to_use: 创建新skill、编辑现有skill或验证skill工作时
+tools:
+- task
+- file
+tags:
+- skill
+- 技能编写
+- 工作流
+- 自动化

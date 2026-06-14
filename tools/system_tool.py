@@ -1,7 +1,10 @@
 """
-tools/system_tool.py — 系统工具（合并版）
+tools/system_tool.py — 系统工具（原子工具版）
 
-合并 system_info + get_time
+原子工具:
+  system_info  — 系统信息
+  system_time  — 当前时间
+  system_cwd   — 当前目录
 """
 
 import os
@@ -9,46 +12,92 @@ import platform
 import datetime
 from typing import List
 
-from engine.tool.base import BaseTool, ToolParameter, ToolResult
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_SYSTEM,
+)
 
 
 class SystemTool(BaseTool):
-    """系统工具 — info + time"""
+    """系统工具集"""
+
+    def __init__(self):
+        self._handlers = {
+            "system_info": self._handle_info,
+            "system_time": self._handle_time,
+            "system_cwd": self._handle_cwd,
+        }
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
 
     @property
     def name(self) -> str:
         return "system"
 
     @property
-    def description(self) -> str:
-        return (
-            "系统操作。action: info(系统信息)/time(当前时间)/cwd(当前目录)\n"
-            "- info: 返回 OS、CPU、内存、磁盘\n"
-            "- time: 返回当前日期时间\n"
-            "- cwd: 返回当前工作目录"
-        )
+    def category(self) -> str:
+        return CATEGORY_SYSTEM
 
     @property
-    def parameters(self) -> List[ToolParameter]:
+    def tools(self) -> List[ToolDefinition]:
         return [
-            ToolParameter("action", "string", "info/time/cwd", required=True,
-                          enum=["info", "time", "cwd"]),
-            ToolParameter("format", "string", "时间格式(time用)，默认 %Y-%m-%d %H:%M:%S", required=False),
+            ToolDefinition(
+                name="system_info",
+                description="""获取系统信息：操作系统类型和版本、CPU 核心数、内存大小和使用率、
+磁盘空间和使用率、Python 版本、当前工作目录。
+需要安装 psutil 获取更详细的硬件信息。
+
+使用场景：
+- 了解当前运行环境
+- 确认可用资源（内存/磁盘）""",
+                parameters=[],
+                is_read=True,
+                examples=["system_info()"],
+                constraints=[
+                    "硬件信息（CPU/内存/磁盘）需要安装 psutil：pip install psutil",
+                    "没有 psutil 时只返回操作系统和 Python 版本",
+                ],
+            ),
+            ToolDefinition(
+                name="system_time",
+                description="""获取当前系统的日期和时间。
+
+使用场景：
+- 记录操作时间
+- 生成带时间戳的文件名""",
+                parameters=[
+                    ToolParameter("format", "string", "时间格式字符串，默认 '%Y-%m-%d %H:%M:%S'。参考 Python strftime 格式", required=False),
+                ],
+                is_read=True,
+                examples=[
+                    'system_time()',
+                    'system_time(format="%Y年%m月%d日 %H时%M分")',
+                    'system_time(format="%Y%m%d_%H%M%S")  # 用于文件名的时间戳',
+                ],
+            ),
+            ToolDefinition(
+                name="system_cwd",
+                description="""获取当前工作目录的绝对路径。
+
+使用场景：
+- 确认当前文件操作的基础路径
+- 需要构建绝对路径时参考""",
+                parameters=[],
+                is_read=True,
+                examples=["system_cwd()"],
+            ),
         ]
 
-    async def execute(self, call_id: str, **kwargs) -> ToolResult:
-        action = kwargs.get("action", "info")
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
 
-        if action == "info":
-            return await self._info(call_id)
-        elif action == "time":
-            return await self._time(call_id, kwargs)
-        elif action == "cwd":
-            return await self._cwd(call_id)
-        else:
-            return ToolResult.error(call_id, self.name, f"未知操作: {action}")
-
-    async def _info(self, call_id):
+    async def _handle_info(self, call_id: str) -> ToolResult:
         info = {
             "os": platform.system(),
             "os_version": platform.version(),
@@ -66,30 +115,20 @@ class SystemTool(BaseTool):
             info["disk_total_gb"] = round(disk.total / (1024**3), 1)
             info["disk_used_percent"] = disk.percent
         except ImportError:
-            info["psutil"] = "未安装 (pip install psutil 获取详细硬件信息)"
+            pass
         except Exception:
             pass
 
-        return ToolResult.success(call_id, self.name, {
-            **info,
-            "_hint": f"当前在 {info['os']}，工作目录 {info['cwd']}",
-        })
+        return ToolResult.ok(call_id, "system_info", info)
 
-    async def _time(self, call_id, args):
-        fmt = args.get("format", "%Y-%m-%d %H:%M:%S")
+    async def _handle_time(self, call_id: str, format: str = "%Y-%m-%d %H:%M:%S") -> ToolResult:
         now = datetime.datetime.now()
-        return ToolResult.success(call_id, self.name, {
-            "datetime": now.strftime(fmt),
+        return ToolResult.ok(call_id, "system_time", {
+            "now": now.strftime(format),
             "timestamp": now.timestamp(),
-            "weekday": now.strftime("%A"),
-            "iso": now.isoformat(),
         })
 
-    async def _cwd(self, call_id):
-        cwd = os.getcwd()
-        items = os.listdir(cwd)[:20]
-        return ToolResult.success(call_id, self.name, {
-            "cwd": cwd,
-            "items": items,
-            "count": len(os.listdir(cwd)),
+    async def _handle_cwd(self, call_id: str) -> ToolResult:
+        return ToolResult.ok(call_id, "system_cwd", {
+            "cwd": os.getcwd(),
         })

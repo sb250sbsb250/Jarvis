@@ -1,0 +1,13 @@
+name: brainstorming
+display_name: 头脑风暴设计
+icon: 💡
+description: 开始任何创意工作前，需要探索需求、设计方案时
+when_to_use: 开始任何创意工作前，需要探索需求、设计方案时
+tools:
+- skill
+tags:
+- 头脑风暴
+- 设计
+- 需求分析
+- brainstorming
+- 设计文档

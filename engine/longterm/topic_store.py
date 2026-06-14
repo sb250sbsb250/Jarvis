@@ -184,7 +184,7 @@ class EmbeddingProvider:
     def is_available(self) -> bool:
         return self._real_embedder is not None
 
-    async def embed(self, text: str) -> Optional[List[float]]:
+    def embed(self, text: str) -> Optional[List[float]]:
         """生成嵌入，失败返回 None"""
         if not self._real_embedder:
             return None
@@ -551,9 +551,8 @@ class TopicStore:
     def _search_vector(self, query: str, topics: List[Dict],
                        top_k: int) -> List[Tuple[Dict, float]]:
         """向量检索（需要嵌入）"""
-        import asyncio
         try:
-            query_vec = asyncio.run(self._embedder.embed(query))
+            query_vec = self._embedder.embed(query)
             if query_vec is None:
                 return []
 

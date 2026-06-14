@@ -37,6 +37,9 @@ class Session:
     def __len__(self) -> int:
         return len(self.messages)
 
+    def __bool__(self) -> bool:
+        return True
+
     def touch(self) -> None:
         self.updated_at = datetime.now()
 

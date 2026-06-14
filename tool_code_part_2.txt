@@ -1,0 +1,700 @@
+================================================================================
+# FILE: system_tool.py
+================================================================================
+"""
+tools/system_tool.py — 系统工具（原子工具版）
+
+原子工具:
+  system_info  — 系统信息
+  system_time  — 当前时间
+  system_cwd   — 当前目录
+"""
+
+import os
+import platform
+import datetime
+from typing import List
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_SYSTEM,
+)
+
+
+class SystemTool(BaseTool):
+    """系统工具集"""
+
+    def __init__(self):
+        self._handlers = {
+            "system_info": self._handle_info,
+            "system_time": self._handle_time,
+            "system_cwd": self._handle_cwd,
+        }
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "system"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_SYSTEM
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="system_info",
+                description="获取系统信息：操作系统、CPU、内存、磁盘、Python 版本等。",
+                parameters=[],
+                is_read=True,
+                examples=["system_info()"],
+            ),
+            ToolDefinition(
+                name="system_time",
+                description="获取当前日期和时间。",
+                parameters=[
+                    ToolParameter("format", "string", "时间格式，默认 '%Y-%m-%d %H:%M:%S'", required=False),
+                ],
+                is_read=True,
+                examples=['system_time()', 'system_time(format="%Y年%m月%d日")'],
+            ),
+            ToolDefinition(
+                name="system_cwd",
+                description="获取当前工作目录路径。",
+                parameters=[],
+                is_read=True,
+                examples=["system_cwd()"],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    async def _handle_info(self, call_id: str) -> ToolResult:
+        info = {
+            "os": platform.system(),
+            "os_version": platform.version(),
+            "hostname": platform.node(),
+            "python": platform.python_version(),
+            "cwd": os.getcwd(),
+        }
+        try:
+            import psutil
+            info["cpu_count"] = psutil.cpu_count()
+            mem = psutil.virtual_memory()
+            info["memory_total_gb"] = round(mem.total / (1024**3), 1)
+            info["memory_used_percent"] = mem.percent
+            disk = psutil.disk_usage(os.getcwd())
+            info["disk_total_gb"] = round(disk.total / (1024**3), 1)
+            info["disk_used_percent"] = disk.percent
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        return ToolResult.ok(call_id, "system_info", info)
+
+    async def _handle_time(self, call_id: str, format: str = "%Y-%m-%d %H:%M:%S") -> ToolResult:
+        now = datetime.datetime.now()
+        return ToolResult.ok(call_id, "system_time", {
+            "now": now.strftime(format),
+            "timestamp": now.timestamp(),
+        })
+
+    async def _handle_cwd(self, call_id: str) -> ToolResult:
+        return ToolResult.ok(call_id, "system_cwd", {
+            "cwd": os.getcwd(),
+        })
+
+
+================================================================================
+# FILE: todo_tool.py
+================================================================================
+"""
+任务追踪工具（原子工具版）— Claude Code 风格
+
+原子工具:
+  todo_write  — LLM 写入/更新任务列表
+  todo_list   — 查询当前任务状态
+
+用法:
+  LLM 在复杂任务中调用 todo_write 维护进度，
+  前端通过 SSE 接收 todo_update 事件实时展示。
+"""
+
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_SYSTEM,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════
+#  全局 Todo 状态管理器（模块级单例）
+# ═══════════════════════════════════════
+
+@dataclass
+class TodoItem:
+    """单个待办项"""
+    id: str
+    content: str
+    status: str = "pending"    # pending | in_progress | completed | cancelled
+    priority: str = "medium"   # low | medium | high
+    notes: str = ""
+
+    def to_dict(self) -> Dict:
+        return {
+            "id": self.id,
+            "content": self.content,
+            "status": self.status,
+            "priority": self.priority,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "TodoItem":
+        return cls(
+            id=data.get("id", ""),
+            content=data.get("content", ""),
+            status=data.get("status", "pending"),
+            priority=data.get("priority", "medium"),
+            notes=data.get("notes", ""),
+        )
+
+
+class TodoManager:
+    """
+    全局 Todo 状态管理器
+
+    生命周期与一次 agent_loop.run() 对齐。
+    """
+
+    _STATUS_ICONS = {
+        "completed": "✅",
+        "in_progress": "🔄",
+        "pending": "⬜",
+        "cancelled": "❌",
+    }
+
+    def __init__(self):
+        self._items: List[TodoItem] = []
+        self._next_id: int = 1
+
+    def write(self, todos: List[Dict]) -> List[TodoItem]:
+        """
+        覆盖式写入任务列表。
+
+        LLM 每次调用 todo_write 传入完整的任务列表。
+        已有项通过 id 匹配更新，新项分配新 id。
+        """
+        # 构建已有项索引
+        existing_by_id = {item.id: item for item in self._items}
+        new_items = []
+
+        for todo_data in todos:
+            item_id = todo_data.get("id", "")
+
+            if item_id and item_id in existing_by_id:
+                # 更新已有项
+                existing = existing_by_id[item_id]
+                existing.content = todo_data.get("content", existing.content)
+                existing.status = todo_data.get("status", existing.status)
+                existing.priority = todo_data.get("priority", existing.priority)
+                existing.notes = todo_data.get("notes", existing.notes)
+                new_items.append(existing)
+            else:
+                # 新建项
+                new_id = item_id or f"t{self._next_id}"
+                self._next_id = max(self._next_id, self._parse_id_num(new_id) + 1)
+                item = TodoItem(
+                    id=new_id,
+                    content=todo_data.get("content", ""),
+                    status=todo_data.get("status", "pending"),
+                    priority=todo_data.get("priority", "medium"),
+                    notes=todo_data.get("notes", ""),
+                )
+                new_items.append(item)
+
+        self._items = new_items
+        logger.info(f"📋 Todo: 更新 {len(self._items)} 项任务")
+        return self._items
+
+    def list_all(self) -> List[TodoItem]:
+        """返回当前所有任务"""
+        return list(self._items)
+
+    def get_stats(self) -> Dict:
+        """统计信息"""
+        total = len(self._items)
+        completed = sum(1 for i in self._items if i.status == "completed")
+        in_progress = sum(1 for i in self._items if i.status == "in_progress")
+        pending = sum(1 for i in self._items if i.status == "pending")
+        cancelled = sum(1 for i in self._items if i.status == "cancelled")
+        return {
+            "total": total,
+            "completed": completed,
+            "in_progress": in_progress,
+            "pending": pending,
+            "cancelled": cancelled,
+        }
+
+    def format_display(self) -> str:
+        """
+        Claude Code 风格的格式化输出。
+
+        示例:
+          ## Tasks [2/5]
+          ✅ 读取源文件
+          🔄 分析依赖关系
+          ⬜ 修改配置文件
+          ⬜ 运行测试
+          ⬜ 提交代码
+        """
+        if not self._items:
+            return "（无任务）"
+
+        stats = self.get_stats()
+        lines = [f"## Tasks [{stats['completed']}/{stats['total']}]"]
+
+        for item in self._items:
+            icon = self._STATUS_ICONS.get(item.status, "⬜")
+            lines.append(f"{icon} {item.content}")
+
+        return "\n".join(lines)
+
+    def to_dict_list(self) -> List[Dict]:
+        """导出为 dict 列表（用于 SSE 推送）"""
+        return [item.to_dict() for item in self._items]
+
+    def reset(self) -> None:
+        """重置（新 run 开始时调用）"""
+        self._items.clear()
+        self._next_id = 1
+
+    @staticmethod
+    def _parse_id_num(item_id: str) -> int:
+        """从 id 字符串中提取数字部分"""
+        import re
+        match = re.search(r'(\d+)', item_id)
+        return int(match.group(1)) if match else 0
+
+
+# ── 全局单例 ──
+_global_todo_manager = TodoManager()
+
+
+def get_todo_manager() -> TodoManager:
+    """获取全局 TodoManager 实例"""
+    return _global_todo_manager
+
+
+# ═══════════════════════════════════════
+#  TodoTool — BaseTool 子类
+# ═══════════════════════════════════════
+
+class TodoTool(BaseTool):
+    """任务追踪工具集"""
+
+    def __init__(self):
+        self._manager = get_todo_manager()
+        self._handlers = {
+            "todo_write": self._handle_write,
+            "todo_list": self._handle_list,
+        }
+
+    @property
+    def name(self) -> str:
+        return "todo"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_SYSTEM
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="todo_write",
+                description=(
+                    "写入或更新完整的任务列表。每次调用时传入所有任务的完整状态。"
+                    "用于追踪多步骤任务的进度，让用户和系统都能看到当前进展。"
+                ),
+                parameters=[
+                    ToolParameter(
+                        "todos", "array",
+                        "任务列表，每项包含: content(任务描述), status(pending/in_progress/completed/cancelled), priority(low/medium/high)",
+                        required=True,
+                    ),
+                ],
+                examples=[
+                    'todo_write(todos=[{"content":"读取文件","status":"completed","priority":"high"},{"content":"修改配置","status":"in_progress","priority":"medium"}])',
+                ],
+                constraints=[
+                    "每次调用传入完整列表，不是增量更新",
+                    "status 只能是 pending/in_progress/completed/cancelled",
+                ],
+            ),
+            ToolDefinition(
+                name="todo_list",
+                description="查询当前任务追踪列表的状态。返回所有任务及其完成进度。",
+                parameters=[],
+                is_read=True,
+                examples=["todo_list()"],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    async def _handle_write(self, call_id: str, todos: List[Dict] = None, **kwargs) -> ToolResult:
+        if todos is None:
+            todos = kwargs.get("todos", [])
+
+        if not isinstance(todos, list):
+            return ToolResult.fail(call_id, "todo_write", "todos 参数必须是数组")
+
+        items = self._manager.write(todos)
+        display = self._manager.format_display()
+
+        # metadata 中携带 todo_update 数据，由 agent_loop 触发 SSE
+        return ToolResult.ok(call_id, "todo_write", {
+            "status": "updated",
+            "total": len(items),
+            "stats": self._manager.get_stats(),
+            "display": display,
+        }, todo_update=self._manager.to_dict_list())
+
+    async def _handle_list(self, call_id: str, **kwargs) -> ToolResult:
+        items = self._manager.list_all()
+        display = self._manager.format_display()
+        return ToolResult.ok(call_id, "todo_list", {
+            "total": len(items),
+            "stats": self._manager.get_stats(),
+            "display": display,
+        })
+
+
+================================================================================
+# FILE: web_tool.py
+================================================================================
+"""
+网络工具（原子工具版）
+
+原子工具:
+  web_fetch    — 抓取网页内容
+  web_search   — 搜索信息
+  kimi_search  — Kimi AI 智能搜索（需要 MOONSHOT_API_KEY）
+"""
+
+import os
+import re
+import logging
+from typing import List
+from urllib.parse import quote
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_NETWORK,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class WebTool(BaseTool):
+    """网络工具集"""
+
+    def __init__(self):
+        self._handlers = {
+            "web_fetch": self._handle_fetch,
+            "web_search": self._handle_search,
+            "kimi_search": self._handle_kimi_search,
+        }
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "web"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_NETWORK
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="web_fetch",
+                description="抓取网页内容并提取纯文本。先用 web_search 找到 URL 再用此工具获取详情。",
+                parameters=[
+                    ToolParameter("url", "string", "网页 URL", required=True),
+                    ToolParameter("max_chars", "number", "最大字符数，默认 5000", required=False),
+                ],
+                is_read=True,
+                examples=['web_fetch(url="https://example.com")'],
+            ),
+            ToolDefinition(
+                name="web_search",
+                description="搜索网络信息，返回结果标题和链接。再用 web_fetch 获取详细内容。",
+                parameters=[
+                    ToolParameter("query", "string", "搜索关键词", required=True),
+                    ToolParameter("count", "number", "结果数量，默认 5", required=False),
+                ],
+                is_read=True,
+                examples=['web_search(query="Python 异步编程")'],
+            ),
+            ToolDefinition(
+                name="kimi_search",
+                description="使用 Kimi AI 智能搜索（更快更准），直接返回搜索总结和参考资料。需要配置 MOONSHOT_API_KEY。",
+                parameters=[
+                    ToolParameter("query", "string", "搜索关键词", required=True),
+                ],
+                is_read=True,
+                examples=['kimi_search(query="2024年AI发展趋势")'],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    async def _handle_fetch(self, call_id: str, url: str, max_chars: int = 5000) -> ToolResult:
+        if not url:
+            return ToolResult.fail(call_id, "web_fetch", "需要 url 参数")
+
+        try:
+            import httpx
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            }
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+                resp.encoding = resp.charset or "utf-8"
+                text = resp.text
+
+            # 提取纯文本
+            text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<[^>]+>', '', text)
+            text = re.sub(r'\s+', ' ', text).strip()
+
+            if len(text) > max_chars:
+                text = text[:max_chars] + f"\n... (共 {len(text)} 字符，已截断)"
+
+            return ToolResult.ok(call_id, "web_fetch", {
+                "url": url,
+                "content": text,
+                "size": len(text),
+            })
+
+        except ImportError:
+            return ToolResult.fail(call_id, "web_fetch", "需要 httpx: pip install httpx")
+        except Exception as e:
+            return ToolResult.fail(call_id, "web_fetch", str(e))
+
+    async def _handle_search(self, call_id: str, query: str, count: int = 5) -> ToolResult:
+        if not query:
+            return ToolResult.fail(call_id, "web_search", "需要 query 参数")
+
+        try:
+            import httpx
+            encoded = quote(query)
+            url = f"https://www.bing.com/search?q={encoded}&count={count}"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+            }
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+                resp.encoding = "utf-8"
+
+            results = []
+            for m in re.finditer(
+                r'<h2><a[^>]*href="([^"]+)"[^>]*>(.*?)</a></h2>',
+                resp.text, re.DOTALL
+            ):
+                link = m.group(1)
+                title = re.sub(r'<[^>]+>', '', m.group(2)).strip()
+                if link and title and not link.startswith("https://www.bing.com/"):
+                    results.append({"title": title, "url": link})
+                    if len(results) >= count:
+                        break
+
+            return ToolResult.ok(call_id, "web_search", {
+                "query": query,
+                "count": len(results),
+                "results": results,
+            })
+
+        except ImportError:
+            return ToolResult.fail(call_id, "web_search", "需要 httpx: pip install httpx")
+        except Exception as e:
+            return ToolResult.fail(call_id, "web_search", str(e))
+
+    async def _handle_kimi_search(self, call_id: str, query: str) -> ToolResult:
+        """使用 Kimi (Moonshot) API 进行智能搜索"""
+        if not query:
+            return ToolResult.fail(call_id, "kimi_search", "需要 query 参数")
+
+        api_key = os.environ.get("MOONSHOT_API_KEY", "")
+        if not api_key or "在这里填" in api_key:
+            return ToolResult.fail(call_id, "kimi_search", "未配置 MOONSHOT_API_KEY")
+
+        try:
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=api_key, base_url="https://api.moonshot.cn/v1")
+            resp = await client.chat.completions.create(
+                model="moonshot-v1-128k",
+                messages=[{"role": "user", "content": query}],
+                tools=[{"type": "builtin_function", "function": {"name": "$web_search"}}],
+                temperature=0.3,
+                max_tokens=4096,
+            )
+            content = resp.choices[0].message.content or ""
+            return ToolResult.ok(call_id, "kimi_search", {
+                "query": query,
+                "content": content,
+            })
+        except ImportError:
+            return ToolResult.fail(call_id, "kimi_search", "需要 openai 库: pip install openai")
+        except Exception as e:
+            return ToolResult.fail(call_id, "kimi_search", str(e))
+
+
+================================================================================
+# FILE: word_tool.py
+================================================================================
+"""
+Word 工具（原子工具版）
+
+原子工具:
+  word_read   — 读取 Word 文档
+  word_write  — 写入 Word 文档
+"""
+
+import os
+import logging
+from typing import List
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_DATA,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class WordTool(BaseTool):
+    """Word 文档工具集"""
+
+    def __init__(self):
+        self._handlers = {
+            "word_read": self._handle_read,
+            "word_write": self._handle_write,
+        }
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "word"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_DATA
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="word_read",
+                description="读取 Word 文档（.docx）的文本内容。",
+                parameters=[
+                    ToolParameter("path", "string", "文件路径", required=True),
+                ],
+                is_read=True,
+                examples=['word_read(path="report.docx")'],
+            ),
+            ToolDefinition(
+                name="word_write",
+                description="写入 Word 文档。将文本写入新的 .docx 文件。",
+                parameters=[
+                    ToolParameter("path", "string", "文件路径", required=True),
+                    ToolParameter("text", "string", "文档内容（多行文本用 \\n 分隔）", required=True),
+                ],
+                examples=['word_write(path="output.docx", text="标题\\n\\n正文内容")'],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            path = kwargs.get("path", "")
+            if tool_name == "word_read" and (not path or not os.path.exists(path)):
+                return ToolResult.fail(call_id, tool_name, f"文件不存在: {path}")
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    async def _handle_read(self, call_id: str, path: str) -> ToolResult:
+        try:
+            from docx import Document
+            doc = Document(path)
+            text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            return ToolResult.ok(call_id, "word_read", {
+                "path": path,
+                "content": text[:15000],
+                "total_paragraphs": len(doc.paragraphs),
+            })
+        except ImportError:
+            return ToolResult.fail(call_id, "word_read", "需要 python-docx: pip install python-docx")
+        except Exception as e:
+            return ToolResult.fail(call_id, "word_read", str(e))
+
+    async def _handle_write(self, call_id: str, path: str, text: str) -> ToolResult:
+        try:
+            from docx import Document
+            doc = Document()
+            for paragraph in text.split("\n"):
+                doc.add_paragraph(paragraph)
+            doc.save(path)
+            return ToolResult.ok(call_id, "word_write", {
+                "path": path,
+                "size": len(text),
+                "status": "已写入",
+            })
+        except ImportError:
+            return ToolResult.fail(call_id, "word_write", "需要 python-docx: pip install python-docx")
+        except Exception as e:
+            return ToolResult.fail(call_id, "word_write", str(e))
+
+

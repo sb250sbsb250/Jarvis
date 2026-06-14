@@ -1,0 +1,8 @@
+name: excel_merge
+display_name: Excel 智能合并
+icon: 🔗
+description: 合并多个 Excel 文件或 Sheet
+when_to_use: 用户要合并多个表格或 Sheet 时
+tools: [excel, shell]
+fallback: excel_analysis
+tags: [excel, 合并, 多文件]

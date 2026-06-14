@@ -1,0 +1,8 @@
+name: excel_migration
+display_name: Excel 数据迁移
+icon: 📊
+description: 跨文件提取和迁移 Excel 数据
+when_to_use: 用户要把数据从一个 Excel 迁移到另一个时
+tools: [excel, shell]
+fallback: excel_fill
+tags: [excel, 迁移, 跨文件]

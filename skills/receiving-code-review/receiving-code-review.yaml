@@ -1,0 +1,12 @@
+name: receiving-code-review
+display_name: 接收代码审查
+icon: 👂
+description: 收到代码审查反馈后，需要评估和实施修改建议时
+when_to_use: 收到代码审查反馈后，需要评估和实施修改建议时
+tools:
+- file
+tags:
+- 代码审查
+- code review
+- 反馈处理
+- 审查意见

@@ -6,7 +6,7 @@ engine/checkpoint.py — Agent 检查点系统
 用法：
     cp = Checkpoint(task_id)
     # 每轮结束后
-    cp.save(round_idx, messages, tool_calls_log, working_memory)
+    cp.save(round_idx, messages, tool_calls_log)
     # 启动时
     if cp.exists():
         state = cp.load()
@@ -62,9 +62,8 @@ class Checkpoint:
         self,
         round_idx: int,
         messages: List[Dict],
-        tool_calls_log: List[Dict],
+        tool_calls_log: List,
         findings: List[str],
-        working_memory: Any = None,
         edited_files: Optional[List[str]] = None,
     ) -> None:
         """
@@ -75,7 +74,6 @@ class Checkpoint:
             messages: 消息列表（序列化用）
             tool_calls_log: 工具调用日志
             findings: 发现列表
-            working_memory: WorkingMemory 实例（可选）
         """
         # 序列化 messages（移除不可 JSON 序列化的内容）
         safe_messages = []
@@ -94,12 +92,13 @@ class Checkpoint:
             "round": round_idx,
             "tool_calls_count": len(tool_calls_log),
             "messages": safe_messages,
-            "tool_calls_log": tool_calls_log,
+            "tool_calls_log": [
+                r.to_dict() if hasattr(r, "to_dict") else r
+                for r in tool_calls_log
+            ],
             "findings": findings,
         }
 
-        if working_memory is not None and hasattr(working_memory, "to_dict"):
-            data["working_memory"] = working_memory.to_dict()
 
         if edited_files is not None:
             data["edited_files"] = edited_files

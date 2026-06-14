@@ -1,61 +1,320 @@
 """
-PDF 工具 — 读取 PDF 内容（支持文本提取、表格提取、扫描件检测、智能截断）
+PDF 工具（原子工具版）
+
+原子工具:
+  pdf_read    — 读取 PDF 文件内容
+  pdf_split   — 拆分 PDF 文件
+  pdf_concat  — 合并多个 PDF 文件
+
+v3.1: 新增 pdf_split / pdf_concat；PyPDF2 → pypdf 迁移
 """
 
-import logging
 import os
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any, Dict, List, Tuple
 
-from engine.tool.base import BaseTool, ToolParameter
-from engine.core.types import ToolResult
+from engine.tool.base import BaseTool, ToolDefinition, ToolParameter, ToolResult
+
+# PyPDF2 已停止维护，迁移到 pypdf（API 完全兼容）
+try:
+    import pypdf as PyPDF2
+except ImportError:
+    import PyPDF2
 
 logger = logging.getLogger("jarvis.tools.pdf")
 
 
-class PdfReadTool(BaseTool):
-    """PDF 文件读取工具（带表格提取 + 扫描件检测 + 关键词优先截断）"""
+class PdfTool(BaseTool):
+    """PDF 文档工具集"""
 
-    def __init__(self, **kwargs):
-        pass
+    def __init__(self):
+        self._handlers = {
+            "pdf_read": self._handle_read,
+            "pdf_split": self._handle_split,
+            "pdf_concat": self._handle_concat,
+        }
 
     @property
     def name(self) -> str:
         return "pdf"
 
     @property
-    def description(self) -> str:
-        return (
-            "读取 PDF 文件内容（支持银行询证函等表格类 PDF）\n"
-            "可检测扫描件，支持多引擎降级（pdfplumber → PyPDF2）\n"
-            "自动提取表格结构，按关键词优先截断保留重要信息\n"
-            "\n"
-            "📖 使用示例：\n"
-            "  # 读全部:\n"
-            "  pdf(path='report.pdf')\n"
-            "  # 指定页码范围:\n"
-            "  pdf(path='report.pdf', start_page=1, max_pages=3)\n"
-            "  💡 返回每页文本+表格结构。自动检测扫描件（图片类PDF）。\n"
-        )
+    def category(self) -> str:
+        return "data"
 
     @property
-    def parameters(self) -> List[ToolParameter]:
+    def tools(self) -> List[ToolDefinition]:
         return [
-            ToolParameter(name="path", type="string", description="PDF 文件路径", required=True),
-            ToolParameter(name="max_pages", type="number", description="最大读取页数", required=False, default=10),
-            ToolParameter(name="extract_tables", type="boolean", description="是否提取表格（银行询证函建议开启）", required=False, default=False),
-            ToolParameter(name="keywords", type="string", description="逗号分隔的关键词，优先保留含这些词的页面", required=False),
+            ToolDefinition(
+                name="pdf_read",
+                description="""读取 PDF 文件内容，支持文本提取、表格提取、扫描件检测。
+
+自动降级：优先使用 pdfplumber（高质量），回退到 pypdf（基础提取）。
+
+使用场景：
+- 读取 PDF 文档的文本内容
+- 提取 PDF 中的表格数据（银行询证函、财务报表等建议开启 extract_tables）
+- 按关键词过滤页面（如只读取含 "总计" 的页面）
+
+不适用场景：
+- 扫描件 PDF（图片类 PDF）→ 检测到扫描件会自动提示""",
+                parameters=[
+                    ToolParameter("path", "string", "PDF 文件路径", required=True),
+                    ToolParameter("max_pages", "number", "最大读取页数，默认 10。长文档可适当增加", required=False),
+                    ToolParameter("extract_tables", "boolean", "是否提取表格数据（含表格的 PDF 建议开启），默认 false", required=False),
+                    ToolParameter("keywords", "string", "逗号分隔的关键词列表，只保留含这些词的页面（如 '总计,合计,金额'）", required=False),
+                ],
+                is_read=True,
+                examples=[
+                    'pdf_read(path="report.pdf")',
+                    'pdf_read(path="invoice.pdf", max_pages=5, extract_tables=True)  # 读取前5页并提取表格',
+                    'pdf_read(path="report.pdf", keywords="总计,结论", max_pages=20)  # 只读含关键词的页面',
+                ],
+                constraints=[
+                    "扫描件 PDF 无法提取文字，会返回提示信息",
+                    "表格提取仅当 extract_tables=True 时生效",
+                    "大文件（100+页）建议限制 max_pages",
+                    "需要安装 pdfplumber 和 pypdf：pip install pdfplumber pypdf",
+                ],
+            ),
+            ToolDefinition(
+                name="pdf_split",
+                description="""拆分 PDF 文件为多个子文件。
+
+两种拆分方式：
+1. 指定页码范围：ranges="1-3,5,8-10"（提取指定页面）
+2. 按固定页数拆分：split_size=10（每 10 页一个文件）
+
+支持两种方式混用。""",
+                parameters=[
+                    ToolParameter("path", "string", "源 PDF 文件路径", required=True),
+                    ToolParameter("output_dir", "string", "输出目录路径（自动创建）", required=True),
+                    ToolParameter("ranges", "string", "页码范围，如 '1-3,5,8-10'。不填则按 split_size 拆分", required=False),
+                    ToolParameter("split_size", "number", "无 ranges 时，按此页数拆分（每 N 页一个文件），默认 10", required=False),
+                ],
+                examples=[
+                    'pdf_split(path="report.pdf", output_dir="./parts", ranges="1-5,8-10")',
+                    'pdf_split(path="report.pdf", output_dir="./parts", split_size=20)  # 每20页一个文件',
+                ],
+                constraints=[
+                    "会产生临时文件，使用后注意清理",
+                    "页码从 1 开始计数",
+                ],
+            ),
+            ToolDefinition(
+                name="pdf_concat",
+                description="""合并多个 PDF 文件为一个新文件。
+按 paths 列表顺序合并页面。
+
+使用场景：
+- 合并多个 PDF 报告为一个文件
+- 将拆分后的文件重新合并""",
+                parameters=[
+                    ToolParameter("paths", "array", "要合并的 PDF 文件路径列表（按顺序合并）", required=True),
+                    ToolParameter("output_path", "string", "合并后的输出文件路径", required=True),
+                ],
+                examples=[
+                    'pdf_concat(paths=["part1.pdf", "part2.pdf"], output_path="merged.pdf")',
+                ],
+                constraints=[
+                    "所有输入文件必须存在，否则合并失败",
+                    "按 paths 列表顺序合并，不是按文件名排序",
+                ],
+            ),
         ]
 
-    # ── 元数据提取 ──
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return handler(call_id, **kwargs)
+        except Exception as e:
+            logger.exception(f"PDF 工具 {tool_name} 异常")
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    # ==================== pdf_read ====================
+
+    def _handle_read(self, call_id: str, path: str, max_pages: int = 10,
+                     extract_tables: bool = False, keywords: str = "") -> ToolResult:
+        if not path or not os.path.exists(path):
+            return ToolResult.fail(call_id, "pdf_read", f"文件不存在: {path}")
+
+        meta = self._extract_metadata(path)
+        is_scanned = self._is_likely_scanned(path)
+
+        result = {
+            "path": path,
+            **meta,
+            "is_scanned": is_scanned,
+            "pages": [],
+            "tables": [],
+        }
+
+        if is_scanned:
+            result["_hint"] = "检测为扫描件（图片类PDF），文本提取可能为空。建议使用 OCR 工具。"
+            return ToolResult.ok(call_id, "pdf_read", result)
+
+        try:
+            import pdfplumber
+            with pdfplumber.open(path) as pdf:
+                total = len(pdf.pages)
+                result["page_count"] = total
+                pages_to_read = min(max_pages, total)
+
+                for i in range(pages_to_read):
+                    page = pdf.pages[i]
+                    text = page.extract_text() or ""
+                    tables = page.extract_tables() if extract_tables else []
+
+                    page_data = {
+                        "page_num": i + 1,
+                        "text": text[:3000] if text else "",
+                        "chars": len(text),
+                    }
+                    if tables:
+                        page_data["tables"] = [self._table_to_text(t) for t in tables]
+                        result["tables"].extend(page_data["tables"])
+                    result["pages"].append(page_data)
+
+                return ToolResult.ok(call_id, "pdf_read", result)
+
+        except ImportError:
+            logger.warning("pdfplumber 未安装，降级到 pypdf")
+            return self._read_with_pypdf2(call_id, path, max_pages)
+        except Exception as e:
+            return ToolResult.fail(call_id, "pdf_read", str(e))
+
+    def _read_with_pypdf2(self, call_id: str, path: str, max_pages: int) -> ToolResult:
+        try:
+            with open(path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                total = len(reader.pages)
+                result = {"path": path, "page_count": total, "engine": "pypdf (降级)", "pages": []}
+                pages_to_read = min(max_pages, total)
+
+                for i in range(pages_to_read):
+                    page = reader.pages[i]
+                    text = page.extract_text() or ""
+                    page_data = {"page_num": i + 1, "text": text[:3000], "chars": len(text)}
+                    result["pages"].append(page_data)
+
+                return ToolResult.ok(call_id, "pdf_read", result)
+
+        except ImportError:
+            return ToolResult.fail(call_id, "pdf_read", "需要 pdfplumber 或 pypdf: pip install pdfplumber pypdf")
+        except Exception as e:
+            return ToolResult.fail(call_id, "pdf_read", str(e))
+
+    # ==================== pdf_split ====================
+
+    def _handle_split(self, call_id: str, path: str, output_dir: str,
+                      ranges: str = "", split_size: int = 10) -> ToolResult:
+        if not os.path.exists(path):
+            return ToolResult.fail(call_id, "pdf_split", f"文件不存在: {path}")
+
+        try:
+            reader = PyPDF2.PdfReader(path)
+            total_pages = len(reader.pages)
+
+            # 解析拆分范围
+            if ranges:
+                split_ranges = self._parse_page_ranges(ranges, total_pages)
+            else:
+                split_ranges = [
+                    (i, min(i + split_size - 1, total_pages - 1))
+                    for i in range(0, total_pages, split_size)
+                ]
+
+            if not split_ranges:
+                return ToolResult.fail(call_id, "pdf_split", "未能解析出有效的页码范围")
+
+            os.makedirs(output_dir, exist_ok=True)
+            base_name = os.path.splitext(os.path.basename(path))[0]
+            generated_files = []
+
+            for idx, (start, end) in enumerate(split_ranges):
+                writer = PyPDF2.PdfWriter()
+                for page_num in range(start, end + 1):
+                    writer.add_page(reader.pages[page_num])
+
+                out_name = f"{base_name}_part{idx + 1}_p{start + 1}-{end + 1}.pdf"
+                out_path = os.path.join(output_dir, out_name)
+
+                with open(out_path, "wb") as f:
+                    writer.write(f)
+                generated_files.append(out_path)
+
+            return ToolResult.ok(call_id, "pdf_split", {
+                "source": path,
+                "output_dir": output_dir,
+                "generated_files": generated_files,
+                "total_parts": len(generated_files),
+            })
+
+        except Exception as e:
+            return ToolResult.fail(call_id, "pdf_split", f"拆分失败: {e}")
+
+    # ==================== pdf_concat ====================
+
+    def _handle_concat(self, call_id: str, paths: List[str], output_path: str) -> ToolResult:
+        if not paths:
+            return ToolResult.fail(call_id, "pdf_concat", "文件列表不能为空")
+
+        writer = PyPDF2.PdfWriter()
+        merged_files = []
+
+        for p in paths:
+            if not os.path.exists(p):
+                return ToolResult.fail(call_id, "pdf_concat", f"文件不存在: {p}")
+            try:
+                reader = PyPDF2.PdfReader(p)
+                for page in reader.pages:
+                    writer.add_page(page)
+                merged_files.append(p)
+            except Exception as e:
+                return ToolResult.fail(call_id, "pdf_concat", f"读取 {p} 失败: {e}")
+
+        try:
+            out_dir = os.path.dirname(os.path.abspath(output_path))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(output_path, "wb") as f:
+                writer.write(f)
+        except Exception as e:
+            return ToolResult.fail(call_id, "pdf_concat", f"写入文件失败: {e}")
+
+        return ToolResult.ok(call_id, "pdf_concat", {
+            "output_path": output_path,
+            "merged_files": merged_files,
+            "total_pages": len(writer.pages),
+        })
+
+    # ==================== 辅助方法 ====================
+
+    @staticmethod
+    def _parse_page_ranges(ranges_str: str, total_pages: int) -> List[Tuple[int, int]]:
+        """解析页码范围（如 '1-3,5,8-10'），返回 0-indexed 的 (start, end)"""
+        ranges = []
+        for part in ranges_str.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                start_str, end_str = part.split("-", 1)
+                start = max(1, int(start_str.strip()))
+                end = min(total_pages, int(end_str.strip()))
+                if start <= end:
+                    ranges.append((start - 1, end - 1))
+            else:
+                idx = int(part.strip())
+                if 1 <= idx <= total_pages:
+                    ranges.append((idx - 1, idx - 1))
+        return ranges
 
     def _extract_metadata(self, path: str) -> Dict[str, Any]:
-        """提取 PDF 文件元数据"""
-        meta: Dict[str, Any] = {
-            "file_name": os.path.basename(path),
-            "file_size": os.path.getsize(path),
-        }
+        meta = {"file_name": os.path.basename(path), "file_size": os.path.getsize(path)}
         try:
-            import PyPDF2
             with open(path, "rb") as f:
                 reader = PyPDF2.PdfReader(f)
                 meta["page_count"] = len(reader.pages)
@@ -69,8 +328,8 @@ class PdfReadTool(BaseTool):
             pass
         return meta
 
-    def _is_likely_scanned(self, path: str) -> bool:
-        """通过文件头快速判断是否为扫描件"""
+    @staticmethod
+    def _is_likely_scanned(path: str) -> bool:
         try:
             with open(path, "rb") as f:
                 head = f.read(2048)
@@ -79,174 +338,9 @@ class PdfReadTool(BaseTool):
         except Exception:
             return False
 
-    # ── 文本提取（多引擎降级） ──
-
-    async def _extract_text(self, path: str, max_pages: int) -> Dict[str, Any]:
-        """提取文本 + 表格，优先 pdfplumber（中文支持好）"""
-
-        result: Dict[str, Any] = {
-            "content": "",
-            "pages_read": 0,
-            "total_pages": 0,
-            "method": "",
-            "tables": [],
-        }
-
-        # 引擎 1：pdfplumber（最佳中文 + 表格支持）
-        try:
-            import pdfplumber  # type: ignore
-
-            with pdfplumber.open(path) as pdf:
-                result["total_pages"] = len(pdf.pages)
-                text_parts: List[str] = []
-                for i, page in enumerate(pdf.pages[:max_pages]):
-                    page_text = page.extract_text() or ""
-                    if page_text.strip():
-                        text_parts.append(f"\n--- Page {i + 1} ---\n{page_text}")
-                        result["pages_read"] += 1
-                    # 表格提取
-                    if page.find_tables():
-                        for tbl in page.extract_tables():
-                            if tbl and any(any(cell for cell in row) for row in tbl):
-                                result["tables"].append({
-                                    "page": i + 1,
-                                    "headers": [str(c or "") for c in tbl[0]],
-                                    "rows": [[str(c or "") for c in row] for row in tbl[1:]],
-                                })
-                result["content"] = "".join(text_parts)
-                result["method"] = "pdfplumber"
-                return result
-        except ImportError:
-            pass
-
-        # 引擎 2：PyPDF2（基础兼容）
-        try:
-            import PyPDF2  # type: ignore
-
-            with open(path, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
-                result["total_pages"] = len(reader.pages)
-                text_parts = []
-                for i in range(min(len(reader.pages), max_pages)):
-                    page_text = reader.pages[i].extract_text() or ""
-                    if page_text.strip():
-                        text_parts.append(f"\n--- Page {i + 1} ---\n{page_text}")
-                        result["pages_read"] += 1
-                result["content"] = "".join(text_parts)
-                result["method"] = "PyPDF2"
-                return result
-        except ImportError:
-            pass
-
-        raise ImportError("需要安装 pdfplumber 或 PyPDF2: pip install pdfplumber")
-
-    # ── 智能截断（关键词优先） ──
-
-    def _smart_truncate(self, content: str, max_chars: int = 15000, keywords: Optional[List[str]] = None) -> str:
-        """按关键词优先截断，保留含关键词的页面"""
-        if len(content) <= max_chars:
-            return content
-
-        pages = content.split("--- Page ")
-        if not pages:
-            return content[:max_chars]
-
-        keywords = [kw.strip().lower() for kw in keywords] if keywords else []
-
-        important: List[str] = []
-        others: List[str] = []
-
-        for page in pages:
-            if not page.strip():
-                continue
-            page_lower = page.lower()
-            if keywords and any(kw in page_lower for kw in keywords):
-                important.append(page)
-            else:
-                others.append(page)
-
-        # 优先组装重要页面
-        result = ""
-        for page in important:
-            chunk = f"--- Page {page}"
-            if len(result) + len(chunk) > max_chars - 200:
-                result += chunk[:(max_chars - len(result) - 200)]
-                result += "\n...[重要内容截断]"
-                break
-            result += chunk
-
-        # 用其他页面填充剩余
-        remaining = max_chars - len(result) - 50
-        for page in others:
-            if remaining <= 0:
-                break
-            chunk = f"\n--- Page {page}"
-            if len(chunk) <= remaining:
-                result += chunk
-                remaining -= len(chunk)
-            else:
-                result += chunk[:remaining]
-                break
-
-        if len(content) > len(result):
-            result += "\n...[内容过多已截断]"
-
-        return result
-
-    # ── 主入口 ──
-
-    async def execute(self, call_id: str, **kwargs) -> ToolResult:
-        path = kwargs.get("path", "")
-        max_pages = kwargs.get("max_pages", 10)
-        extract_tables = kwargs.get("extract_tables", False)
-        keywords_str = kwargs.get("keywords", "")
-
-        if not path:
-            return ToolResult.error(call_id, self.name, "请提供 PDF 文件路径")
-        if not os.path.exists(path):
-            return ToolResult.error(call_id, self.name, f"文件不存在: {path}")
-
-        try:
-            # 1. 元数据
-            metadata = self._extract_metadata(path)
-            metadata["likely_scanned"] = self._is_likely_scanned(path)
-
-            # 2. 文本提取
-            result_data = await self._extract_text(path, max_pages)
-
-            # 3. 表格（仅当 pdfplumber 已使用时才有效）
-            if extract_tables and result_data.get("tables"):
-                tbl_summary = []
-                for tbl in result_data["tables"]:
-                    tbl_summary.append({
-                        "page": tbl["page"],
-                        "headers": tbl["headers"],
-                        "rows": len(tbl["rows"]),
-                    })
-                result_data["table_count"] = len(tbl_summary)
-                result_data["table_summary"] = tbl_summary
-
-            # 4. 关键词智能截断（仅当有内容且有关键词时）
-            content = result_data.get("content", "")
-            if content and keywords_str:
-                kw_list = [k.strip() for k in keywords_str.split(",") if k.strip()]
-                content = self._smart_truncate(content, max_chars=15000, keywords=kw_list)
-
-            # 5. 合并结果
-            return ToolResult.success(call_id, self.name, {
-                "path": path,
-                "pages_read": result_data["pages_read"],
-                "total_pages": result_data["total_pages"],
-                "content": content[:15000],
-                "method": result_data["method"],
-                "metadata": metadata,
-                "table_count": result_data.get("table_count", 0),
-                "table_summary": result_data.get("table_summary", []),
-                "tables": result_data.get("tables", []) if extract_tables else [],
-            })
-
-        except ImportError as e:
-            return ToolResult.error(call_id, self.name, str(e))
-        except Exception as e:
-            logger.exception(f"PDF 读取失败: {path}")
-            return ToolResult.error(call_id, self.name, str(e))
+    @staticmethod
+    def _table_to_text(table) -> str:
+        rows = []
+        for row in table:
+            rows.append(" | ".join(str(cell or "") for cell in row))
+        return "\n".join(rows)

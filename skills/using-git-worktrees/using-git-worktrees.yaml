@@ -1,0 +1,13 @@
+name: using-git-worktrees
+display_name: 使用 Git Worktree
+icon: 🌳
+description: 开始需要隔离工作区的功能开发时，或执行实现计划之前
+when_to_use: 开始需要隔离工作区的功能开发时，或执行实现计划之前
+tools:
+- git
+- file
+tags:
+- git
+- worktree
+- 工作区隔离
+- 分支管理

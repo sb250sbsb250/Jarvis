@@ -4,8 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Jarvis V3 - 智能助手</title>
-    <link rel="stylesheet" href="/static/style.css?v=1779765141">
-    <script src="/static/vue.global.js?v=1779765141"></script>
+    <link rel="stylesheet" href="/static/style.css?v=1779765152">
+    <script src="/static/vue.global.js?v=1779765152"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script>
         window.__vClickOutside = {
             mounted(el, binding) {
@@ -43,7 +44,7 @@
                 </div>
             </div>
             <div class="sidebar-bottom-nav">
-                <div class="nav-item" @click="showSettings = !showSettings"><span>⚙️</span><span>设置</span></div>
+                <div class="nav-item" @click.stop="showSettings = !showSettings"><span>⚙️</span><span>设置</span></div>
             </div>
         </aside>
 
@@ -56,11 +57,7 @@
                         <p>基于四层状态机架构的智能助手</p>
                     </div>
                     <div class="chat-header-right">
-                        <label class="toggle-switch model-toggle-top" title="切换模型">
-                            <input type="checkbox" v-model="isProModel" @change="toggleModel">
-                            <span class="toggle-slider"></span>
-                        </label>
-                        <span class="model-badge" :class="modelName === 'deepseek-v4-pro' ? 'pro' : 'flash'">{{ modelName === 'deepseek-v4-pro' ? 'Pro' : 'Flash' }}</span>
+                        <span class="model-badge" :class="modelName === 'deepseek-v4-pro' ? 'pro' : 'flash'">{{ modelName === 'deepseek-v4-pro' ? 'DeepSeek Pro' : 'DeepSeek Flash' }}</span>
                     </div>
                 </div>
 
@@ -86,6 +83,38 @@
 
                 <div class="status-bar" :class="statusClass">{{ statusText }}</div>
 
+                <!-- Claude Code: 待审批弹窗 -->
+                <div v-if="pendingApprovals.length > 0" class="approval-overlay">
+                    <div v-for="ap in pendingApprovals" :key="ap.call_id" class="approval-card">
+                        <div class="approval-header">
+                            <span class="approval-icon">{{ ap.risk_level === 'high' ? '🔴' : '🟡' }}</span>
+                            <span class="approval-title">需要审批: {{ ap.tool }}</span>
+                        </div>
+                        <div class="approval-message">{{ ap.message }}</div>
+                        <div v-if="ap.args_preview" class="approval-args">{{ ap.args_preview }}</div>
+                        <div class="approval-actions">
+                            <button class="approval-btn approve" @click="respondApproval(ap.call_id, true)">✅ 批准</button>
+                            <button class="approval-btn deny" @click="respondApproval(ap.call_id, false)">❌ 拒绝</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Claude Code: Todo 进度面板 -->
+                <div v-if="todoItems.length > 0" class="todo-panel">
+                    <div class="todo-header">
+                        <span>📋 任务追踪</span>
+                        <span class="todo-stats">{{ todoStats.completed || 0 }}/{{ todoStats.total || todoItems.length }} 完成</span>
+                    </div>
+                    <div class="todo-list">
+                        <div v-for="item in todoItems" :key="item.id" class="todo-item" :class="item.status">
+                            <span class="todo-status-icon">
+                                {{ item.status === 'completed' ? '✅' : item.status === 'in_progress' ? '🔄' : item.status === 'cancelled' ? '⛔' : '⬜' }}
+                            </span>
+                            <span class="todo-content">{{ item.content }}</span>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="chat-input-container">
                     <div class="input-wrapper">
                         <textarea ref="inputEl"
@@ -100,6 +129,19 @@
                         </div>
                     </div>
                     <div class="input-tip">按 Enter 发送 · Shift+Enter 换行</div>
+                    <div class="input-bottom-bar">
+                        <div class="search-toggle">
+                            <label class="toggle-switch toggle-sm">
+                                <input type="checkbox" v-model="searchEnabled" :disabled="sending">
+                                <span class="toggle-slider"></span>
+                            </label>
+                            <span class="search-label">智能搜索</span>
+                        </div>
+                        <select class="model-dropdown" v-model="modelName" :disabled="sending">
+                            <option value="deepseek-v4-pro">DeepSeek Pro</option>
+                            <option value="deepseek-v4-flash">DeepSeek Flash</option>
+                        </select>
+                    </div>
                 </div>
             </div>
         </main>
@@ -122,7 +164,7 @@
         </div>
     </div>
 
-    <script src="/static/api.js?v=1779765141"></script>
-    <script src="/static/app.js?v=1779765141"></script>
+    <script src="/static/api.js?v=1779765152"></script>
+    <script src="/static/app.js?v=1779765152"></script>
 </body>
 </html>

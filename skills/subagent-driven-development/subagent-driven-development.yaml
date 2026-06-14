@@ -1,0 +1,15 @@
+name: subagent-driven-development
+display_name: 子代理驱动开发
+icon: 🤖
+description: 执行有独立任务的实现计划时，需要每个任务使用独立代理
+when_to_use: 执行有独立任务的实现计划时，需要每个任务使用独立代理
+tools:
+- task
+- file
+- git
+tags:
+- 子代理
+- subagent
+- 任务分解
+- TDD
+- 开发流程

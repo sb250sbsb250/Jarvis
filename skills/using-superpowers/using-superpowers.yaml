@@ -1,0 +1,12 @@
+name: using-superpowers
+display_name: 使用 Superpowers Skills
+icon: ⚡
+description: 开始任何对话时，建立技能查找和使用流程
+when_to_use: 开始任何对话时，建立技能查找和使用流程
+tools:
+- skill
+tags:
+- superpowers
+- skills
+- 技能系统
+- 工作流程

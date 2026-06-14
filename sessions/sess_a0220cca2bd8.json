@@ -1,0 +1,13 @@
+{
+  "session_id": "sess_a0220cca2bd8",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hi"
+    },
+    {
+      "role": "assistant",
+      "content": "老大，早。\n\n当前状态：`master` 分支有未提交的改动，涉及 engine 核心模块（llm_client、message、skill、tool）和 frontend。\n\n有什么需要搞的？"
+    }
+  ]
+}

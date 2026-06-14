@@ -1,0 +1,13 @@
+{
+  "session_id": "sess_7ebc169a09b6",
+  "messages": [
+    {
+      "role": "user",
+      "content": "\"C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\202651807011100YHCJ08_回函扫描件_01.pdf\" \"C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\202651807011100YHCJ10_回函扫描件_01.pdf\" \"C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\202651807011100YHCJ11_回函扫描件_01.pdf\" \"C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\202651807011100YHCJ12_回函扫描件_01.pdf\" \"C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\202651807011100YHCJ13_回函扫描件_01.pdf\" \"C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\202651807011300YHCJ02_回函扫描件_01.pdf\" \"C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\202651807011500YHCJ01_回函扫描件_01.pdf\" \"C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\202651807011000YHCJ02_回函扫描件_01.pdf\" \"C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\202651807011100YHCJ02_回函扫描件_01.pdf\" \"C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\202651807011100YHCJ03_回函扫描件_01.pdf\" \"C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\202651807011100YHCJ04_回函扫描件_01.pdf\" \"C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\202651807011100YHCJ06_回函扫描件_01.pdf\" 这些pdf，读取一下借款信息，整理成一个excel表格存到C:\\Users\\xinzh\\Downloads\\新建文件夹 (2)\\"
+    },
+    {
+      "role": "assistant",
+      "content": "执行达到最大轮次，无法获取总结。"
+    }
+  ]
+}

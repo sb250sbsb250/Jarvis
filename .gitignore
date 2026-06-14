@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# 环境变量
+.env
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 项目缓存/临时文件
+借款信息汇总.xlsx
+_archive/
+data/
+
+# 日志/调试/转储文件
+tools_dump.txt
+engine_dump.txt
+engine_dump_1.txt
+engine_dump_2.txt
+project_dump.txt
+
+# 测试/演示脚本
+demo.py
+dump_source.py

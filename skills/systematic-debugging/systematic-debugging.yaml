@@ -1,0 +1,15 @@
+name: systematic-debugging
+display_name: 系统化调试
+icon: 🐛
+description: 遇到任何bug、测试失败或意外行为时，在提出修复方案之前
+when_to_use: 遇到任何bug、测试失败或意外行为时，在提出修复方案之前
+tools:
+- code
+- file
+- git
+tags:
+- 调试
+- debug
+- bug修复
+- 问题排查
+- 根因分析

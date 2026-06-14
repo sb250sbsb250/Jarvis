@@ -1,0 +1,13 @@
+{
+  "session_id": "sess_88c77a8b210d",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hi"
+    },
+    {
+      "role": "assistant",
+      "content": "👋 老大，在呢。\n\n当前状态：\n- **OpenClaw 框架** — 有 8 个文件已修改未提交（engine 核心模块 + frontend）\n- 工作目录干净，没有意外文件产生\n\n有什么需要搞的？"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+name: system_maintenance
+display_name: 系统维护
+icon: 🛠️
+description: 系统诊断、清理、优化
+when_to_use: 用户要检查或维护系统时
+tools: [system, shell, file]
+fallback: null
+tags: [系统, 维护, 诊断]

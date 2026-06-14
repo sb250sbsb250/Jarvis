@@ -7,7 +7,6 @@ skill/registry.py — Skill 注册中心
  3. 维护 Skill 统计信息
 """
 
-import difflib
 import logging
 from typing import Dict, List, Optional, Tuple, Set, Callable, Type, Any
 

@@ -1,7 +1,7 @@
 """
 core/types.py — 核心类型定义
 
-被所有模块依赖的基础类型。
+v3.0: ToolResult 简化，支持新的原子工具架构
 """
 
 from __future__ import annotations
@@ -63,63 +63,56 @@ class ToolCall:
         )
 
 
-class ToolResultStatus(str, Enum):
-    """工具执行结果状态"""
-    SUCCESS = "success"
-    ERROR = "error"
-    RETRY = "retry"
-
-
 @dataclass
 class ToolResult:
-    """工具执行结果"""
+    """工具执行结果
+
+    v3.0 简化版: success → bool, error → Optional[str]
+    保持向后兼容（is_success/is_error 属性）
+    """
     call_id: str
     tool_name: str
-    status: ToolResultStatus
-    content: Any
-    error_message: Optional[str] = None
+    success: bool
+    content: Any = None
+    error: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def success(cls, call_id: str, tool_name: str, content: Any, **metadata) -> "ToolResult":
+    def ok(cls, call_id: str, tool_name: str, content: Any, **metadata) -> "ToolResult":
+        """创建成功结果"""
         return cls(
             call_id=call_id,
             tool_name=tool_name,
-            status=ToolResultStatus.SUCCESS,
+            success=True,
             content=content,
             metadata=metadata,
         )
 
     @classmethod
-    def error(cls, call_id: str, tool_name: str, error_message: str, **metadata) -> "ToolResult":
+    def fail(cls, call_id: str, tool_name: str, error: str, **metadata) -> "ToolResult":
+        """创建失败结果"""
         return cls(
             call_id=call_id,
             tool_name=tool_name,
-            status=ToolResultStatus.ERROR,
-            content=None,
-            error_message=error_message,
+            success=False,
+            error=error,
             metadata=metadata,
         )
 
-    @classmethod
-    def retry(cls, call_id: str, tool_name: str, error_message: str, **metadata) -> "ToolResult":
-        return cls(
-            call_id=call_id,
-            tool_name=tool_name,
-            status=ToolResultStatus.RETRY,
-            content=None,
-            error_message=error_message,
-            metadata=metadata,
-        )
-
+    # ── 向后兼容 ──
+    @property
     def is_success(self) -> bool:
-        return self.status == ToolResultStatus.SUCCESS
+        return self.success
 
+    @property
     def is_error(self) -> bool:
-        return self.status == ToolResultStatus.ERROR
+        return not self.success
 
-    def is_retry(self) -> bool:
-        return self.status == ToolResultStatus.RETRY
+    @property
+    def error_message(self) -> Optional[str]:
+        return self.error
+
+
 
 
 @dataclass
@@ -142,7 +135,7 @@ class Message:
         if self.tool_calls:
             result["tool_calls"] = [
                 tc.to_openai_format() if hasattr(tc, 'to_openai_format')
-                else tc  # 兼容原始 dict（从序列化恢复或外部传入）
+                else tc
                 for tc in self.tool_calls
             ]
         if self.tool_call_id:
@@ -190,3 +183,71 @@ class Message:
     @classmethod
     def system(cls, content: str) -> "Message":
         return cls(role=Role.SYSTEM, content=content)
+
+
+@dataclass
+class ToolCallRecord:
+    """
+    统一工具调用记录 — Claude Code 风格
+
+    替代 tool_calls_log 中的松散 dict。
+    支持格式化为人类可读的单行日志。
+    """
+    tool: str
+    args: Dict[str, Any]
+    round: int
+    call_id: str = ""
+    error: Optional[str] = None
+    result: Optional[str] = None
+    duration_ms: float = 0.0
+    started_at: float = 0.0
+    backup_path: Optional[str] = None
+    approved: bool = True
+    auto_approved: bool = True
+
+    def format_oneline(self) -> str:
+        """
+        Claude Code 风格的单行格式化输出。
+
+        示例:
+          [R3] ✅ code_write(path="app.py") 0.8s
+          [R3] ❌ shell_run(command="npm test") Error: timeout 2.1s
+        """
+        status = "✅" if not self.error else "❌"
+        args_parts = []
+        for k, v in self.args.items():
+            val_str = str(v)[:40]
+            args_parts.append(f'{k}="{val_str}"')
+        args_str = ", ".join(args_parts)
+        time_str = f" {self.duration_ms/1000:.1f}s" if self.duration_ms else ""
+        err_str = f" Error: {self.error[:60]}" if self.error else ""
+        return f"[R{self.round}] {status} {self.tool}({args_str}){time_str}{err_str}"
+
+    def to_dict(self) -> Dict:
+        """转为可序列化的 dict（用于 checkpoint 保存）"""
+        d = {
+            "tool": self.tool,
+            "args": self.args,
+            "round": self.round,
+            "call_id": self.call_id,
+            "error": self.error,
+            "result": self.result[:200] if self.result else None,
+            "duration_ms": self.duration_ms,
+        }
+        if self.backup_path:
+            d["backup_path"] = self.backup_path
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "ToolCallRecord":
+        """从 dict 恢复"""
+        return cls(
+            tool=data.get("tool", ""),
+            args=data.get("args", {}),
+            round=data.get("round", 0),
+            call_id=data.get("call_id", ""),
+            error=data.get("error"),
+            result=data.get("result"),
+            duration_ms=data.get("duration_ms", 0.0),
+            backup_path=data.get("backup_path"),
+        )

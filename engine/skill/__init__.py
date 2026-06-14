@@ -12,8 +12,10 @@ Skill 是经过验证的 DAG 执行经验，固化为可复用的模块。
 from .base import Skill, SkillMeta, SkillLevel, SkillResult
 from .registry import SkillRegistry
 from .router import SkillRouter
+from .matcher import match_skill, get_filtered_tools
 
 __all__ = [
     "Skill", "SkillMeta", "SkillLevel", "SkillResult",
     "SkillRegistry", "SkillRouter",
+    "match_skill", "get_filtered_tools",
 ]

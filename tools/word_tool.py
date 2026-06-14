@@ -1,104 +1,137 @@
 """
-tools/word_tool.py — Word 文档工具
+Word 工具（原子工具版）
 
-独立 Word 操作，从 office_tool 拆分。
+原子工具:
+  word_read   — 读取 Word 文档
+  word_write  — 写入 Word 文档
 """
 
 import os
 import logging
 from typing import List
 
-from engine.tool.base import BaseTool, ToolParameter, ToolResult
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_DATA,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class WordTool(BaseTool):
-    """Word 文档 — 独立工具"""
+    """Word 文档工具集"""
+
+    def __init__(self):
+        self._handlers = {
+            "word_read": self._handle_read,
+            "word_write": self._handle_write,
+        }
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
 
     @property
     def name(self) -> str:
         return "word"
 
     @property
-    def description(self) -> str:
-        return (
-            "Word 文档操作。action: read_docx / write_docx\n"
-            "- read_docx: path='a.docx'\n"
-            "- write_docx: path='a.docx', text='内容'"
-        )
+    def category(self) -> str:
+        return CATEGORY_DATA
 
     @property
-    def parameters(self) -> List[ToolParameter]:
+    def tools(self) -> List[ToolDefinition]:
         return [
-            ToolParameter("action", "string", "read_docx/write_docx", required=True,
-                          enum=["read_docx", "write_docx"]),
-            ToolParameter("path", "string", "文件路径", required=True),
-            ToolParameter("text", "string", "写入内容(write_docx用)", required=False),
+            ToolDefinition(
+                name="word_read",
+                description="""读取 Word 文档（.docx）的文本内容。
+自动提取所有段落的文本，忽略格式信息。
+
+使用场景：
+- 读取 .docx 报告的文本内容
+- 从 Word 文档中提取信息
+
+不适用场景：
+- 读取 .doc 格式（旧版 Word）→ 建议先转换为 .docx
+- 读取 PDF → 用 pdf_read""",
+                parameters=[
+                    ToolParameter("path", "string", "Word 文件路径（仅支持 .docx 格式）", required=True),
+                ],
+                is_read=True,
+                examples=[
+                    'word_read(path="report.docx")',
+                ],
+                constraints=[
+                    "仅支持 .docx 格式，不支持 .doc（旧版 Word）",
+                    "只提取纯文本内容，不包含图片/表格/样式",
+                    "需要安装 python-docx：pip install python-docx",
+                ],
+            ),
+            ToolDefinition(
+                name="word_write",
+                description="""写入新的 Word 文档（.docx）。
+将文本内容写入一个新的 Word 文档，每行文本生成一个段落。
+
+使用场景：
+- 生成 Word 格式的报告
+- 创建简单的 .docx 文档
+
+不适用场景：
+- 修改已有 Word 文档 → 用 word_read + 修改后 word_write 覆盖""",
+                parameters=[
+                    ToolParameter("path", "string", "输出文件路径（必须 .docx 结尾）", required=True),
+                    ToolParameter("text", "string", "文档内容，换行符 \\n 表示段落分隔", required=True),
+                ],
+                examples=[
+                    'word_write(path="output.docx", text="标题\\n\\n正文内容\\n\\n结尾")',
+                ],
+                constraints=[
+                    "每行文本（被 \\n 分隔）会生成一个独立段落",
+                    "不支持图片/表格/复杂格式，纯文本输出",
+                    "如果文件已存在会覆盖",
+                    "需要安装 python-docx：pip install python-docx",
+                ],
+            ),
         ]
 
-    async def execute(self, call_id: str, **kwargs) -> ToolResult:
-        action = kwargs.get("action", "read_docx")
-        path = kwargs.get("path", "")
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            path = kwargs.get("path", "")
+            if tool_name == "word_read" and (not path or not os.path.exists(path)):
+                return ToolResult.fail(call_id, tool_name, f"文件不存在: {path}")
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
 
-        if not path or not os.path.exists(path):
-            return ToolResult.error(call_id, self.name, f"文件不存在: {path}")
-
-        if action == "read_docx":
-            return await self._read_docx(call_id, path)
-        elif action == "write_docx":
-            return await self._write_docx(call_id, path, kwargs.get("text", ""))
-        else:
-            return ToolResult.error(call_id, self.name, f"未知操作: {action}")
-
-    async def _read_docx(self, call_id, path):
+    async def _handle_read(self, call_id: str, path: str) -> ToolResult:
         try:
             from docx import Document
             doc = Document(path)
             text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-            return ToolResult.success(call_id, self.name, {
+            return ToolResult.ok(call_id, "word_read", {
                 "path": path,
                 "content": text[:15000],
-                "paragraphs": len(doc.paragraphs),
+                "total_paragraphs": len(doc.paragraphs),
             })
         except ImportError:
-            pass
-
-        # fallback: zip+xml 解析
-        try:
-            from zipfile import ZipFile
-            from xml.etree.ElementTree import parse
-            with ZipFile(path) as z:
-                with z.open("word/document.xml") as xml_file:
-                    tree = parse(xml_file)
-                    text = "".join(
-                        node.text or ""
-                        for node in tree.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")
-                    )
-                    return ToolResult.success(call_id, self.name, {
-                        "path": path,
-                        "content": text[:15000],
-                        "_hint": "pip install python-docx 获得更好的格式支持",
-                    })
+            return ToolResult.fail(call_id, "word_read", "需要 python-docx: pip install python-docx")
         except Exception as e:
-            return ToolResult.error(call_id, self.name, f"读取失败: {e}")
+            return ToolResult.fail(call_id, "word_read", str(e))
 
-    async def _write_docx(self, call_id, path, text):
-        if not text:
-            return ToolResult.error(call_id, self.name, "write_docx 需要 text")
-
+    async def _handle_write(self, call_id: str, path: str, text: str) -> ToolResult:
         try:
             from docx import Document
             doc = Document()
-            for line in text.split("\n"):
-                if line.strip():
-                    doc.add_paragraph(line)
+            for paragraph in text.split("\n"):
+                doc.add_paragraph(paragraph)
             doc.save(path)
-            return ToolResult.success(call_id, self.name, {
+            return ToolResult.ok(call_id, "word_write", {
                 "path": path,
-                "status": "已创建",
-                "size": os.path.getsize(path),
-                "_hint": f"文件已保存到 {path}",
+                "size": len(text),
+                "status": "已写入",
             })
         except ImportError:
-            return ToolResult.error(call_id, self.name, "需要 python-docx: pip install python-docx")
+            return ToolResult.fail(call_id, "word_write", "需要 python-docx: pip install python-docx")
+        except Exception as e:
+            return ToolResult.fail(call_id, "word_write", str(e))
