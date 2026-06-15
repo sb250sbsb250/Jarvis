@@ -274,13 +274,13 @@ class MCPToolAdapter(BaseTool):
         tool_args = kwargs.get("args", {})
 
         if not tool_name:
-            return ToolResult.error(call_id, self._name, "缺少 tool 参数")
+            return ToolResult.fail(call_id, self._name, "缺少 tool 参数")
 
         # 确保已初始化
         if not self._initialized:
             ok = await self.initialize()
             if not ok:
-                return ToolResult.error(call_id, self._name, "MCP 初始化失败")
+                return ToolResult.fail(call_id, self._name, "MCP 初始化失败")
 
         # 检查工具是否存在
         discovered = {t.get("name", "") for t in self._tools}
@@ -298,10 +298,10 @@ class MCPToolAdapter(BaseTool):
         })
 
         if result is None:
-            return ToolResult.error(call_id, self._name, "MCP 调用无响应")
+            return ToolResult.fail(call_id, self._name, "MCP 调用无响应")
 
         if "error" in result:
-            return ToolResult.error(call_id, self._name, str(result["error"]))
+            return ToolResult.fail(call_id, self._name, str(result["error"]))
 
         content = result.get("content", [])
         # MCP 返回的 content 是 content item 列表，提取文本
@@ -484,7 +484,7 @@ class MCPSubTool(BaseTool):
         if not self._parent._initialized:
             ok = await self._parent.initialize()
             if not ok:
-                return ToolResult.error(call_id, self.name, "MCP 初始化失败")
+                return ToolResult.fail(call_id, self.name, "MCP 初始化失败")
 
         result = await self._parent._send_request("tools/call", {
             "name": self._sub_name,
@@ -492,10 +492,10 @@ class MCPSubTool(BaseTool):
         })
 
         if result is None:
-            return ToolResult.error(call_id, self.name, "MCP 调用无响应")
+            return ToolResult.fail(call_id, self.name, "MCP 调用无响应")
 
         if "error" in result:
-            return ToolResult.error(call_id, self.name, str(result["error"]))
+            return ToolResult.fail(call_id, self.name, str(result["error"]))
 
         content = result.get("content", [])
         texts = []

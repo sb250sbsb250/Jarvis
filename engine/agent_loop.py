@@ -478,6 +478,15 @@ class AgentLoop:
                                 continue
 
                         # ── 执行工具 ──
+                        if self._current_on_event:
+                            try:
+                                await self._current_on_event("tool_call", {
+                                    "tool": tool_name,
+                                    "args": tool_args,
+                                    "call_id": call_id,
+                                })
+                            except Exception:
+                                pass
                         try:
                             result = await self._execute_tool(
                                 tool_name, tool_args, call_id,
@@ -497,6 +506,26 @@ class AgentLoop:
 
                         if not is_success and not error_str and not result_str:
                             error_str = "工具执行返回空"
+
+                        # ── 发射 tool_result / tool_error 事件 ──
+                        if self._current_on_event:
+                            try:
+                                if error_str:
+                                    await self._current_on_event("tool_error", {
+                                        "tool": tool_name,
+                                        "args": tool_args,
+                                        "call_id": call_id,
+                                        "error": error_str,
+                                    })
+                                else:
+                                    await self._current_on_event("tool_result", {
+                                        "tool": tool_name,
+                                        "args": tool_args,
+                                        "call_id": call_id,
+                                        "result": result_str,
+                                    })
+                            except Exception:
+                                pass
 
                         if error_str:
                             logger.warning(f"❌ [{tool_name}] 错误: {error_str[:200]}")

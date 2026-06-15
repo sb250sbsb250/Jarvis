@@ -241,13 +241,13 @@ async def event_generator(
                 sse_data["name"] = data.get("tool", "")
                 sse_data["status"] = "done"
                 sse_data["args"] = data.get("args", {})
-                sse_data["result"] = str(data.get("result", ""))[:300]
+                sse_data["result"] = str(data.get("result", ""))[:3000]
                 logger.debug(f"✅ 工具完成: {data.get('tool', '?')}")
             elif event_type == "tool_error":
                 sse_data["name"] = data.get("tool", "")
                 sse_data["status"] = "error"
                 sse_data["args"] = data.get("args", {})
-                sse_data["result"] = str(data.get("error", ""))[:300]
+                sse_data["result"] = str(data.get("error", ""))[:3000]
                 logger.warning(f"❌ 工具失败: {data.get('tool', '?')}: {data.get('error', '')[:100]}")
             elif event_type == "round_start":
                 sse_data["content"] = f"第 {data.get('round', '?')} 轮执行中..."

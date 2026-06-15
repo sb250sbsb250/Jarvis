@@ -46,11 +46,11 @@ class ToolExecutor:
 
         tool = self.registry.get(call.name)
         if not tool:
-            return ToolResult.error(call.id, call.name, f"工具 '{call.name}' 未注册")
+            return ToolResult.fail(call.id, call.name, f"工具 '{call.name}' 未注册")
 
         is_valid, error_msg = tool.validate_args(call.name, call.arguments)
         if not is_valid:
-            return ToolResult.error(call.id, call.name, error_msg or "参数无效")
+            return ToolResult.fail(call.id, call.name, error_msg or "参数无效")
 
         # 使用工具级重试配置
         tool_retry_errors = getattr(tool, 'retryable_exceptions', (ConnectionError, TimeoutError, OSError))
@@ -86,22 +86,22 @@ class ToolExecutor:
                 logger.warning(f"工具 '{call.name}' 返回错误: {result.error_message}, 准备重试")
 
             except asyncio.TimeoutError:
-                last_error = ToolResult.error(call.id, call.name, f"工具执行超时 ({timeout_val}s)")
+                last_error = ToolResult.fail(call.id, call.name, f"工具执行超时 ({timeout_val}s)")
                 if attempt >= tool_max_retries:
                     return last_error
                 logger.warning(f"工具 '{call.name}' 超时，准备重试 (attempt {attempt + 1})")
 
             except retryable_errors as e:
-                last_error = ToolResult.error(call.id, call.name, str(e))
+                last_error = ToolResult.fail(call.id, call.name, str(e))
                 if attempt >= tool_max_retries:
                     return last_error
                 logger.warning(f"工具 '{call.name}' 可重试异常: {e}, 准备重试")
 
             except Exception as e:
                 logger.exception(f"工具 {call.name} 异常: {e}")
-                return ToolResult.error(call.id, call.name, str(e))
+                return ToolResult.fail(call.id, call.name, str(e))
 
-        return last_error or ToolResult.error(call.id, call.name, "执行失败: 未知错误")
+        return last_error or ToolResult.fail(call.id, call.name, "执行失败: 未知错误")
 
     async def execute_parallel(
         self,
@@ -127,7 +127,7 @@ class ToolExecutor:
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 final_results.append(
-                    ToolResult.error(calls[i].id, calls[i].name, str(result))
+                    ToolResult.fail(calls[i].id, calls[i].name, str(result))
                 )
             else:
                 final_results.append(result)

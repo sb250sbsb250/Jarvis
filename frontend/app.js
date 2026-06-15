@@ -95,7 +95,7 @@ const app = createApp({
             ${step.args && Object.keys(step.args).length
               ? `<div class="step-args">${escapeHtml(JSON.stringify(step.args, null, 2))}</div>` : ''}
             ${step.result
-              ? `<div class="step-result">${escapeHtml(String(step.result).slice(0, 200))}</div>`
+              ? `<div class="step-result">${escapeHtml(String(step.result).slice(0, 3000))}</div>`
               : ''}
           </div>`;
         }
@@ -456,7 +456,7 @@ const app = createApp({
                 icon: '✅',
                 state: 'done',
                 args: m.args || {},
-                result: (m.content || '').slice(0, 200)
+                result: (m.content || '').slice(0, 3000)
               });
 
             } else {
