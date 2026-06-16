@@ -208,6 +208,12 @@ class LLMClient:
             params["tool_choice"] = "auto"
 
         # ⭐ LLM 请求日志
+        # 消息概览：汇总各角色数量和最后一条消息预览
+        role_counts: Dict[str, int] = {}
+        for m in messages:
+            role = m.get("role", "?") if isinstance(m, dict) else "?"
+            role_counts[role] = role_counts.get(role, 0) + 1
+        role_summary = " | ".join(f"{r}:{c}" for r, c in sorted(role_counts.items()))
         last_msg = messages[-1] if messages else {}
         last_content = str(last_msg.get("content", ""))[:200] if isinstance(last_msg, dict) else str(last_msg)[:200]
         logger.info("─" * 50)
@@ -222,7 +228,11 @@ class LLMClient:
             logger.info(f"📨 消息: {len(messages)} 条 (~{total_est} tok) | 🔧 工具: {len(tools) if tools else 0} 个")
         except Exception:
             logger.info(f"📨 消息: {len(messages)} 条 | 🔧 工具: {len(tools) if tools else 0} 个")
+        logger.info(f"📋 角色分布: {role_summary}")
         logger.info(f"📝 最后一条: [{last_msg.get('role', '?')}] {last_content.replace(chr(10), ' ')[:120]}")
+        if tools:
+            tool_names = [t.get("function", {}).get("name", "?") for t in tools]
+            logger.info(f"🔧 可用工具: {', '.join(tool_names)}")
 
         _llm_start = time.time()
         try:
@@ -238,39 +248,14 @@ class LLMClient:
                     result_dict = self._to_dict(non_stream_resp)
                 else:
                     result_dict = result if isinstance(result, dict) else {"choices": []}
-
-                _llm_elapsed = (time.time() - _llm_start) * 1000
-                choice = result_dict.get("choices", [{}])[0] if result_dict.get("choices") else {}
-                msg = choice.get("message", {}) if isinstance(choice, dict) else {}
-                resp_content = (msg.get("content", "") or "")[:200] if isinstance(msg, dict) else ""
-                tc = msg.get("tool_calls", []) if isinstance(msg, dict) else []
-                usage = result_dict.get("usage", {})
-                logger.info(
-                    f"✅ LLM ← ({_llm_elapsed:.0f}ms | "
-                    f"↑{usage.get('prompt_tokens', '?')} ↓{usage.get('completion_tokens', '?')} "
-                    f"Σ{usage.get('total_tokens', '?')})"
-                )
-                if tc:
-                    for t in tc:
-                        fn = t.get("function", {}) if isinstance(t, dict) else {}
-                        name = fn.get("name", "?") if isinstance(fn, dict) else "?"
-                        args_raw = fn.get("arguments", "") if isinstance(fn, dict) else ""
-                        if len(str(args_raw)) > 120:
-                            args_raw = str(args_raw)[:120] + "..."
-                        logger.info(f"  🛠️  工具调用: {name}({args_raw})")
-                if resp_content:
-                    logger.info(f"  💬 回复: {resp_content.replace(chr(10), ' ')[:150]}")
-                logger.info("─" * 50)
-
-                return result if not isinstance(result, dict) else result_dict
-
-            result_dict = self._to_dict(response)
+            else:
+                result_dict = self._to_dict(response)
             _llm_elapsed = (time.time() - _llm_start) * 1000
 
-            # ⭐ LLM 响应日志
+            # ⭐ LLM 响应日志（统一流式/非流式）
             choice = result_dict.get("choices", [{}])[0] if result_dict.get("choices") else {}
             msg = choice.get("message", {}) if isinstance(choice, dict) else {}
-            resp_content = (msg.get("content", "") or "")[:200] if isinstance(msg, dict) else ""
+            resp_content = (msg.get("content", "") or "") if isinstance(msg, dict) else ""
             tc = msg.get("tool_calls", []) if isinstance(msg, dict) else []
             usage = result_dict.get("usage", {})
             logger.info(
@@ -283,13 +268,20 @@ class LLMClient:
                     fn = t.get("function", {}) if isinstance(t, dict) else {}
                     name = fn.get("name", "?") if isinstance(fn, dict) else "?"
                     args_raw = fn.get("arguments", "") if isinstance(fn, dict) else ""
-                    if len(str(args_raw)) > 120:
-                        args_raw = str(args_raw)[:120] + "..."
-                    logger.info(f"  🛠️  工具调用: {name}({args_raw})")
+                    try:
+                        args_pretty = json.dumps(json.loads(args_raw), ensure_ascii=False, indent=2)
+                        logger.info(f"  🛠️  工具调用: {name}\n{args_pretty}")
+                    except Exception:
+                        args_trim = str(args_raw)[:500]
+                        logger.info(f"  🛠️  工具调用: {name}({args_trim})")
             if resp_content:
-                logger.info(f"  💬 回复: {resp_content.replace(chr(10), ' ')[:150]}")
+                # 显示完整内容（截断到 2000 字符防止日志爆炸）
+                logger.info(f"  💬 回复:\n{resp_content[:2000].rstrip()}")
             logger.info("─" * 50)
 
+            # 统一返回：流式路径可能有 result，非流式直接返回 result_dict
+            if stream:
+                return result if not isinstance(result, dict) else result_dict
             return result_dict
 
         except Exception as e:

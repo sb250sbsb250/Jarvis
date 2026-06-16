@@ -70,7 +70,8 @@ def build_injection_block(
     query: str,
     top_k: int = 5,
     max_tokens: int = 800,
-) -> str:
+    return_results: bool = False,
+):
     """
     构建注入到 LLM 上下文的记忆块
 
@@ -89,11 +90,12 @@ def build_injection_block(
 
     Returns:
         格式化的记忆注入文本（空字符串 = 无相关记忆）
+        当 return_results=True 时返回 (文本, results列表)
     """
     results = search_topics(store, query, top_k=top_k, min_confidence=0.15)
 
     if not results:
-        return ""
+        return ("", []) if return_results else ""
 
     lines = ["[Relevant Memories]"]
     used_chars = len(lines[0])
@@ -132,9 +134,10 @@ def build_injection_block(
         store.record_access(topic["id"])
 
     if len(lines) <= 1:
-        return ""
+        return ("", []) if return_results else ""
 
-    return "\n".join(lines)
+    block = "\n".join(lines)
+    return (block, results) if return_results else block
 
 
 def search_simple(

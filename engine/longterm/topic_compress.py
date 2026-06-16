@@ -79,7 +79,7 @@ async def compress_dialogue(
     if not dialogue_text.strip():
         return []
 
-    prompt = f"""Analyze the following dialogue and extract important knowledge points as structured topics.
+    prompt = f"""Analyze the following dialogue and extract important knowledge points as structured topics. Output in the same language as the dialogue content.
 
 Return ONLY a JSON array (no markdown, no explanation):
 [
@@ -97,6 +97,7 @@ Guidelines:
 - Only extract if importance >= {min_importance}
 - Max 5 topics per call
 - Prefer extracting facts over general conversation
+- Output title/one_liner/summary in the SAME LANGUAGE as the dialogue content
 
 Dialogue:
 {dialogue_text}

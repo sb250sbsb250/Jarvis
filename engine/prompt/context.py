@@ -81,36 +81,91 @@ def _unwrap_task_message(content: str) -> str:
 
 
 def sanitize_tool_messages(messages: List[Dict]) -> List[Dict]:
-    """清洗 tool 消息：移除孤立/无主 tool 消息，防止污染上下文"""
-    seen_call_ids: Set[str] = set()
+    """清洗 tool 消息：移除孤立/无主 tool 消息，并清理缺失响应的 assistant tool_calls"""
+    # ── 第一步：收集所有存在的 tool 响应 call_id ──
+    responded_call_ids: Set[str] = set()
+    for m in messages:
+        if m.get("role") == "tool":
+            cid = m.get("tool_call_id", "")
+            if cid:
+                responded_call_ids.add(cid)
+
+    # ── 第二步：收集 assistant 中所有声明的 call_id ──
+    declared_call_ids: Set[str] = set()
     for m in messages:
         if m.get("role") == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 cid = tc.get("id", "")
                 if cid:
-                    seen_call_ids.add(cid)
+                    declared_call_ids.add(cid)
+
+    # ── 第三步：清洗 ──
     cleaned = []
-    dropped = 0
+    dropped_tool = 0
+    stripped_assistant = 0
     for m in messages:
-        if m.get("role") == "tool":
+        role = m.get("role")
+
+        if role == "tool":
+            # 移除无主 tool 消息（没有对应 assistant.tool_calls）
             call_id = m.get("tool_call_id", "")
-            if call_id and call_id in seen_call_ids:
+            if call_id and call_id in declared_call_ids:
                 cleaned.append(m)
             else:
-                dropped += 1
-                if dropped <= 3:
-                    if not call_id:
-                        reason = "空 call_id"
-                    else:
-                        reason = f"孤立 call_id={call_id!r}"
+                dropped_tool += 1
+                if dropped_tool <= 3:
+                    reason = "空 call_id" if not call_id else f"孤立 call_id={call_id!r}"
                     logger.warning(
                         f"丢弃 {reason} tool 消息: "
                         f"content={str(m.get('content', ''))[:80]}"
                     )
+
+        elif role == "assistant" and m.get("tool_calls"):
+            # 过滤掉没有对应 tool 响应的 tool_calls
+            valid_tcs = [
+                tc for tc in m["tool_calls"]
+                if tc.get("id", "") in responded_call_ids
+            ]
+            missing_count = len(m["tool_calls"]) - len(valid_tcs)
+
+            if missing_count > 0:
+                if not valid_tcs:
+                    # 所有 tool_calls 都没有响应
+                    content = m.get("content", "") or ""
+                    if content.strip():
+                        # 有内容：保留为普通 assistant 消息，去掉 tool_calls
+                        stripped_msg = {k: v for k, v in m.items() if k != "tool_calls"}
+                        cleaned.append(stripped_msg)
+                        stripped_assistant += 1
+                        logger.warning(
+                            f"assistant 消息 {missing_count} 个 tool_calls 无响应，"
+                            f"已剥离 tool_calls（保留 content）"
+                        )
+                    else:
+                        # 无内容：完全丢弃
+                        stripped_assistant += 1
+                        logger.warning(
+                            f"assistant 消息 {missing_count} 个 tool_calls 无响应且无 content，已丢弃"
+                        )
+                else:
+                    # 部分 tool_calls 缺失响应，保留有效的
+                    stripped_msg = dict(m)
+                    stripped_msg["tool_calls"] = valid_tcs
+                    cleaned.append(stripped_msg)
+                    stripped_assistant += 1
+                    logger.warning(
+                        f"assistant 消息有 {missing_count} 个 tool_calls 无响应，"
+                        f"已过滤（保留 {len(valid_tcs)} 个）"
+                    )
+            else:
+                cleaned.append(m)
         else:
             cleaned.append(m)
-    if dropped:
-        logger.warning(f"清洗 tool 消息: 移除了 {dropped} 条孤立消息")
+
+    if dropped_tool:
+        logger.warning(f"清洗 tool 消息: 移除了 {dropped_tool} 条孤立消息")
+    if stripped_assistant:
+        logger.warning(f"清洗 assistant 消息: 处理了 {stripped_assistant} 条残留 tool_calls")
     return cleaned
 
 

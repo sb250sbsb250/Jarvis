@@ -614,6 +614,7 @@ class TopicStore:
         """增量同步 BM25 索引（新增文本时增量添加，否则标记全量重建）"""
         if self._bm25_loaded and new_text:
             self._bm25.add_document(new_text)
+            self._bm25._finalize()  # 立即更新统计，保持与全量路径一致
         else:
             self._bm25_loaded = False
 

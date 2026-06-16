@@ -320,6 +320,10 @@ class AgentLoop:
                 if self._effective_model:
                     kwargs["model"] = self._effective_model
 
+                # 诊断输出：LLM 输入（消息概览 + 工具）
+                if DIAG_PRINT_LLM_INPUT:
+                    self._diag_print_llm_input(messages, tools, round_display)
+
                 response = await self.llm_client.chat_completion(
                     messages=messages,
                     tools=tools if tools else None,
@@ -542,12 +546,12 @@ class AgentLoop:
                         # ── 发射 tool_result / tool_error 事件 ──
                         if self._current_on_event:
                             try:
-                                if error_str:
+                                if not is_success:
                                     await self._current_on_event("tool_error", {
                                         "tool": tool_name,
                                         "args": tool_args,
                                         "call_id": call_id,
-                                        "error": error_str,
+                                        "error": error_str or "工具执行失败",
                                     })
                                 else:
                                     await self._current_on_event("tool_result", {
@@ -559,8 +563,15 @@ class AgentLoop:
                             except Exception:
                                 pass
 
-                        if error_str:
-                            logger.warning(f"❌ [{tool_name}] 错误: {error_str[:200]}")
+                        # 诊断输出：工具执行结果
+                        _diag_print(
+                            f"  {'✅' if is_success else '❌'} [{tool_name}] "
+                            f"{'成功' if is_success else '失败'} | "
+                            f"结果: {(result_str or error_str or '').replace(chr(10), ' ')[:300]}"
+                        )
+
+                        if not is_success:
+                            logger.warning(f"❌ [{tool_name}] 错误: {(error_str or '工具执行失败')[:200]}")
                             tool_errors += 1
 
                         # ── 格式化结果 ──
@@ -765,6 +776,16 @@ class AgentLoop:
                 if content_str:
                     self._guard_state.result_cache[cache_key] = content_str
 
+            # 归一化：确保返回 ToolResult
+            if not isinstance(result, ToolResult):
+                logger.warning(f"⚠️ [{tool_name}] 返回了非 ToolResult 类型: {type(result).__name__}，已自动包装")
+                if isinstance(result, str):
+                    return ToolResult.ok(call_id, tool_name, result)
+                elif isinstance(result, dict):
+                    return ToolResult.ok(call_id, tool_name, result)
+                else:
+                    return ToolResult.ok(call_id, tool_name, str(result) if result is not None else "")
+
             return result
 
         # 向后兼容
@@ -785,6 +806,16 @@ class AgentLoop:
             content_str = str(result.content)[:5000] if result.content else ""
             if content_str:
                 self._guard_state.result_cache[cache_key] = content_str
+
+        # 归一化：确保返回 ToolResult
+        if not isinstance(result, ToolResult):
+            logger.warning(f"⚠️ [{tool_name}] 返回了非 ToolResult 类型: {type(result).__name__}，已自动包装")
+            if isinstance(result, str):
+                return ToolResult.ok(call_id, tool_name, result)
+            elif isinstance(result, dict):
+                return ToolResult.ok(call_id, tool_name, result)
+            else:
+                return ToolResult.ok(call_id, tool_name, str(result) if result is not None else "")
 
         return result
 
@@ -833,13 +864,13 @@ class AgentLoop:
             if not os.path.isfile(file_path):
                 continue
             try:
-                passes = await self.lint_runner.run(file_path)
-                if passes:
+                result = await self.lint_runner.run(file_path)
+                if result.get("passed"):
                     if on_event:
                         await on_event("lint_pass", {"file": file_path})
                 else:
                     # 将 lint 结果注入到 LLM 上下文，让 LLM 知道代码有问题
-                    feedback = self.lint_runner.format_feedback(passes, file_path)
+                    feedback = self.lint_runner.format_feedback(result, file_path)
                     if feedback and messages is not None:
                         safe_inject_system(messages, feedback)
                     msg = f"⚠️ Lint 提醒: {file_path} 有代码风格问题"
@@ -869,6 +900,40 @@ class AgentLoop:
 
         _diag_print(f"{'=' * 80}")
 
+    def _diag_print_llm_input(self, messages: List[Dict], tools: List[Dict], round_num: int) -> None:
+        """诊断输出：打印发送给 LLM 的消息概览和工具列表"""
+        if not DIAG_ENABLED:
+            return
+        _diag_print(f"  {'─' * 50}")
+        _diag_print(f"  📤 R{round_num} LLM 输入 ({len(messages)} 条消息)")
+        # 打印各条消息的概览
+        for i, m in enumerate(messages):
+            role = m.get("role", "?")
+            content = m.get("content", "") or ""
+            tcs = m.get("tool_calls")
+            tc_id = m.get("tool_call_id", "")
+            label = f"[{i}] {role}"
+            if role == "tool":
+                # tool 结果：只显示前 200 字符
+                preview = content[:200].replace(chr(10), " ")
+                _diag_print(f"    {label} ({tc_id[:20]}): {preview}")
+            elif role == "assistant" and tcs:
+                names = [tc.get("function", {}).get("name", "?") for tc in tcs]
+                _diag_print(f"    {label}: tool_calls → {', '.join(names)}")
+            elif role == "system":
+                if DIAG_PRINT_FULL_SYSTEM:
+                    _diag_print(f"    {label}: {content[:500].replace(chr(10), ' ')}")
+                else:
+                    _diag_print(f"    {label}: (~{len(content)} chars)")
+            else:
+                preview = content[:300].replace(chr(10), " ")
+                _diag_print(f"    {label}: {preview}")
+        # 打印工具列表概览
+        if tools:
+            tool_names = [t.get("function", {}).get("name", "?") for t in tools]
+            _diag_print(f"    🔧 工具: {', '.join(tool_names)}")
+        _diag_print(f"  {'─' * 50}")
+
     def _diag_print_llm_response(self, response: Dict, round_num: int) -> None:
         if not DIAG_ENABLED:
             return
@@ -878,14 +943,29 @@ class AgentLoop:
         content = message.get("content", "") or ""
         tcs = message.get("tool_calls", None)
 
+        _diag_print(f"  {'─' * 50}")
         if tcs:
-            names = [tc.get("function", {}).get("name", "?") for tc in tcs]
-            _diag_print(f"  🤖 R{round_num} → {', '.join(names)} ({finish_reason})")
+            _diag_print(f"  🤖 R{round_num} LLM 工具调用 ({finish_reason}):")
+            for tc in tcs:
+                fn = tc.get("function", {})
+                name = fn.get("name", "?")
+                args = fn.get("arguments", "")
+                try:
+                    args_pretty = json.dumps(json.loads(args), ensure_ascii=False, indent=2)
+                except Exception:
+                    args_pretty = str(args)[:500]
+                _diag_print(f"    🛠️  {name}")
+                for line in args_pretty.split(chr(10)):
+                    _diag_print(f"      {line}")
         else:
-            _diag_print(
-                f"  🤖 R{round_num} → 回答 ({finish_reason}) "
-                f"content={content[:120]}"
-            )
+            _diag_print(f"  🤖 R{round_num} LLM 回答 ({finish_reason}):")
+            # 显示完整内容（或截断到 DIAG_MAX_MESSAGE_CHARS）
+            max_chars = DIAG_MAX_MESSAGE_CHARS if DIAG_MAX_MESSAGE_CHARS > 0 else len(content)
+            if content:
+                _diag_print(f"{content[:max_chars]}")
+            else:
+                _diag_print(f"    (空回复)")
+        _diag_print(f"  {'─' * 50}")
 
 
 # ═══════════════════════════════════════════════════════════════

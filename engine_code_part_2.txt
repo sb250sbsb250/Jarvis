@@ -850,9 +850,6 @@ class LLMClient:
         response = await client.chat_completion(messages, tools)
     """
 
-    # ── Fallback 加载标记（防止重复日志）
-    _fallbacks_initialized: bool = False
-
     # ── 模型路由表：ResponseMode → 推荐模型 ──
     MODEL_ROUTING = {
         "direct":   "deepseek-chat",
@@ -897,6 +894,7 @@ class LLMClient:
 
         # ── 加载备用提供商（Fallback） ──
         self._fallbacks: List[tuple[str, AsyncOpenAI, str]] = []
+        self._fallbacks_initialized = False  # 实例级别，支持运行时配置更新
         self._load_fallback_providers()
 
     def _load_fallback_providers(self):
@@ -914,13 +912,13 @@ class LLMClient:
                     AsyncOpenAI(api_key=key, base_url=base_url, timeout=self.config.timeout_seconds),
                     model,
                 ))
-                if not LLMClient._fallbacks_initialized:
+                if not self._fallbacks_initialized:
                     logger.info(f"🔁 Fallback 提供商已加载: {name} ({model})")
 
-        if self._fallbacks and not LLMClient._fallbacks_initialized:
+        if self._fallbacks and not self._fallbacks_initialized:
             names = [fb[0] for fb in self._fallbacks]
             logger.info(f"🔁 共 {len(self._fallbacks)} 个 Fallback 提供商: {', '.join(names)}")
-            LLMClient._fallbacks_initialized = True
+            self._fallbacks_initialized = True
 
     @staticmethod
     def get_supported_models() -> List[str]:
@@ -1581,7 +1579,12 @@ class Injector:
             top_k=5,
             max_tokens=self.max_injection_tokens,
         )
-        self._last_injected = self._extract_topic_ids(block)
+        # 通过搜索获取实际注入的 topic IDs（避免从文本解析的复杂性）
+        try:
+            results = search_topics(self.store, user_input, top_k=5, min_confidence=0.15)
+            self._last_injected = [r["topic"]["id"] for r in results]
+        except Exception:
+            self._last_injected = []
         return block
 
     @staticmethod
@@ -2200,7 +2203,8 @@ class TopicStore:
             conn.close()
 
         # 同步到 BM25 索引
-        self._sync_to_bm25()
+        new_text = f"{title} {one_liner} {summary}"
+        self._sync_to_bm25(new_text)
 
         logger.info(f"Created topic: {topic_id} — {title[:40]}")
         return topic_id
@@ -2487,9 +2491,12 @@ class TopicStore:
         self._bm25.rebuild(texts)
         self._bm25_loaded = True
 
-    def _sync_to_bm25(self):
-        """重新同步 BM25 索引（增量添加后标记需要刷新）"""
-        self._bm25_loaded = False
+    def _sync_to_bm25(self, new_text: str = ""):
+        """增量同步 BM25 索引（新增文本时增量添加，否则标记全量重建）"""
+        if self._bm25_loaded and new_text:
+            self._bm25.add_document(new_text)
+        else:
+            self._bm25_loaded = False
 
     # ── 维护 ──
 
@@ -2746,7 +2753,7 @@ class ComplexityRouter:
 - 先理解问题，再给出方案"""
 
     @classmethod
-    def get_max_tokens(mode: str, input_length: int = 0) -> int:
+    def get_max_tokens(cls, mode: str, input_length: int = 0) -> int:
         base = {
             "simple": 100000,
             "standard": 100000,

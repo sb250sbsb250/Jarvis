@@ -231,6 +231,7 @@ class AgentLoop:
                 start_round = state.get("round", 0)
                 findings = state.get("findings", [])
                 self._context_builder.compressed_summary = state.get("compressed_summary", "")
+                self._context_builder.compressed_until = state.get("compressed_until", 0)
                 self._total_tokens_used = state.get("total_tokens_used", 0)
                 logger.info(
                     f"⏮️ 恢复检查点 (round={start_round}, "
@@ -640,7 +641,7 @@ class AgentLoop:
 
                     # ── 轮次内 lint 检查 ──
                     if self.auto_lint and round_idx > 0 and round_idx % 5 == 0:
-                        await self._auto_lint_check(findings, round_idx, on_event)
+                        await self._auto_lint_check(findings, round_idx, on_event, messages=messages)
 
                     # ── 循环检测 ──
                     if detect_loop(tool_calls_log):
@@ -657,10 +658,11 @@ class AgentLoop:
                             self._checkpoint.save(
                                 messages=messages,
                                 tool_calls_log=tool_calls_log,
-                                round=round_display,
+                                round_idx=round_display,
                                 findings=findings,
                                 compressed_summary=self._context_builder.compressed_summary,
                                 total_tokens_used=self._total_tokens_used,
+                                compressed_until=self._context_builder.compressed_until,
                             )
                             logger.info(f"💾 检查点保存 (round={round_display})")
 
@@ -857,6 +859,7 @@ class AgentLoop:
     async def _auto_lint_check(
         self, findings: List[str], round_idx: int,
         on_event: Optional[Callable] = None,
+        messages: Optional[List[Dict]] = None,
     ) -> None:
         for file_path in list(self.edited_files):
             if not os.path.isfile(file_path):
@@ -867,6 +870,10 @@ class AgentLoop:
                     if on_event:
                         await on_event("lint_pass", {"file": file_path})
                 else:
+                    # 将 lint 结果注入到 LLM 上下文，让 LLM 知道代码有问题
+                    feedback = self.lint_runner.format_feedback(passes, file_path)
+                    if feedback and messages is not None:
+                        safe_inject_system(messages, feedback)
                     msg = f"⚠️ Lint 提醒: {file_path} 有代码风格问题"
                     findings.append(msg)
                     if on_event:
@@ -1000,6 +1007,9 @@ class Checkpoint:
         tool_calls_log: List,
         findings: List[str],
         edited_files: Optional[List[str]] = None,
+        compressed_summary: str = "",
+        total_tokens_used: int = 0,
+        compressed_until: int = 0,
     ) -> None:
         """
         保存检查点。
@@ -1032,6 +1042,9 @@ class Checkpoint:
                 for r in tool_calls_log
             ],
             "findings": findings,
+            "compressed_summary": compressed_summary,
+            "total_tokens_used": total_tokens_used,
+            "compressed_until": compressed_until,
         }
 
 
@@ -1404,6 +1417,8 @@ class ApprovalGate:
         self._pending: Dict[str, asyncio.Event] = {}
         # call_id -> bool (审批结果)
         self._results: Dict[str, bool] = {}
+        # 已超时或显式拒绝的 call_id（防止 approve() 穿透到 policy）
+        self._denied: set = set()
 
     def set_auto_approve(self, enabled: bool) -> None:
         """切换自动审批模式"""
@@ -1482,6 +1497,7 @@ class ApprovalGate:
         except asyncio.TimeoutError:
             logger.warning(f"⏰ 审批超时: {tool_name} (call_id={call_id[:12]})")
             self._pending.pop(call_id, None)
+            self._denied.add(call_id)  # 标记为已拒绝，防止 approve() 穿透
             return False
 
         result = self._results.pop(call_id, False)
@@ -1496,6 +1512,8 @@ class ApprovalGate:
 
     def approve(self, call_id: str) -> bool:
         """批准一个待审批的调用"""
+        if call_id in self._denied:
+            return False  # 已超时/拒绝，不再穿透到 policy
         if call_id in self._pending:
             self._results[call_id] = True
             self._pending[call_id].set()
@@ -1508,6 +1526,7 @@ class ApprovalGate:
         if call_id in self._pending:
             self._results[call_id] = False
             self._pending[call_id].set()
+            self._denied.add(call_id)
             return True
         return self._policy.deny(call_id)
 
@@ -1822,10 +1841,11 @@ def safe_inject_system(messages: List[Dict], content: str) -> None:
     """安全地在 messages 末尾追加 system 消息（避开 tool_calls 块）。"""
     if (messages and messages[-1].get("role") == "assistant"
             and messages[-1].get("tool_calls")):
-        insert_at = len(messages) - 1
-        messages.insert(insert_at, {"role": "system", "content": content})
-    else:
-        messages.append({"role": "system", "content": content})
+        # assistant+tool_calls 后必须紧跟 tool 消息，不可插入 system
+        # 为避免破坏消息序列，跳过本次注入
+        logger.debug("safe_inject_system: 跳过（末尾为 tool_calls 块）")
+        return
+    messages.append({"role": "system", "content": content})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1878,6 +1898,9 @@ def check_stuck_hard(state: GuardState, tool_name: str, tool_args: Dict) -> Opti
         sig = f"{tool_name}:{str(tool_args)}"
 
     state.exact_call_signatures.append(sig)
+    # 只保留最近 10 条，防止长会话无限增长
+    if len(state.exact_call_signatures) > 10:
+        state.exact_call_signatures = state.exact_call_signatures[-10:]
 
     if (len(state.exact_call_signatures) >= 3
             and len(set(state.exact_call_signatures[-3:])) == 1):

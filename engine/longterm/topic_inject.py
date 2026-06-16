@@ -68,18 +68,14 @@ class Injector:
         Returns:
             注入文本（空字符串 = 无相关记忆）
         """
-        block = build_injection_block(
+        block, results = build_injection_block(
             store=self.store,
             query=user_input,
             top_k=5,
             max_tokens=self.max_injection_tokens,
+            return_results=True,
         )
-        # 通过搜索获取实际注入的 topic IDs（避免从文本解析的复杂性）
-        try:
-            results = search_topics(self.store, user_input, top_k=5, min_confidence=0.15)
-            self._last_injected = [r["topic"]["id"] for r in results]
-        except Exception:
-            self._last_injected = []
+        self._last_injected = [r["topic"]["id"] for r in results] if results else []
         return block
 
     @staticmethod
