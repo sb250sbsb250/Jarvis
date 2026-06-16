@@ -1,8 +1,8 @@
 name: code_review
 display_name: 代码审查
 icon: 🔍
-description: 审查代码质量和潜在问题
-when_to_use: 用户要检查代码、找 bug 时
-tools: [code, file]
+description: 审查代码质量，按优先级逐项修复并验证
+when_to_use: 用户要求检查代码、审查变更、找bug、修复问题
+tools: [code, file, shell]
 fallback: debug
-tags: [代码审查, code review, 审查代码, 代码质量]
+tags: [代码审查, code review, 迭代修复, lint检查, bug修复, 质量检查]
