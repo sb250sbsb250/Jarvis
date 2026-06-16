@@ -51,13 +51,14 @@ const API = {
   },
 
   // ── 聊天 SSE ──
-  createChatStream(message, sessionId, model, searchEnabled) {
+  createChatStream(message, sessionId, model, searchEnabled, mode) {
     const controller = new AbortController();
     const body = JSON.stringify({
       message,
       session_id: sessionId || null,
       model: model || null,
       search_enabled: searchEnabled || false,
+      mode: mode || 'coding',
     });
 
     const stream = fetch('/api/chat/stream', {
@@ -93,5 +94,8 @@ const API = {
   async interrupt() { return this.post('/api/chat/interrupt'); },
 
   // ── 状态 ──
-  async checkStatus() { return this.get('/api/status'); }
+  async checkStatus() { return this.get('/api/status'); },
+
+  // ── 工作模式 ──
+  async getModes() { return this.get('/api/config/modes'); }
 };

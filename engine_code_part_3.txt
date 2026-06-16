@@ -1,4 +1,1025 @@
 ================================================================================
+# FILE: prompt\context.py
+================================================================================
+"""
+engine/prompt/context.py — 消息上下文构建 + 历史压缩
+
+从 agent_loop.py 提取的 ContextBuilder 类和辅助函数。
+职责：构建初始消息列表、压缩历史、环境信息采集。
+"""
+
+import json
+import logging
+import os
+import re
+import subprocess
+from typing import Any, Dict, List, Optional, Set
+
+from .template import render_template
+
+logger = logging.getLogger(__name__)
+
+# ── 常量 ──
+KEEP_RECENT_TURNS = 3
+COMPRESS_ROUNDS = 2
+MAX_CONTEXT_TOKENS = 128_000
+TOKEN_SAFETY_MARGIN = 0.80
+MAX_TOOL_RESULT_CHARS = 80000
+
+_OLD_INSTRUCTION_PATTERNS = [
+    "分析当前情况，决定下一步行动",
+    "如果需要更多信息，调用工具获取",
+    "如果任务完成或无法继续，直接输出最终答案",
+]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  模块级辅助函数
+# ═══════════════════════════════════════════════════════════════
+
+def _trim_history_messages(messages: List[Dict], max_tool_chars: int = 40000) -> List[Dict]:
+    """截短历史消息中的 tool 结果，智能保留结构。"""
+    trimmed = []
+    for m in messages:
+        m = dict(m)
+        if m.get("role") == "tool":
+            content = str(m.get("content", ""))
+            if len(content) > max_tool_chars:
+                try:
+                    if content.strip().startswith(("{", "[")):
+                        obj = json.loads(content)
+                        if isinstance(obj, dict):
+                            keys = list(obj.keys())[:5]
+                            summary = {k: str(obj[k])[:200] for k in keys}
+                            m["content"] = json.dumps(summary, ensure_ascii=False) + "\n... [历史结果已精简]"
+                        else:
+                            m["content"] = content[:max_tool_chars] + "\n... [历史结果已截短]"
+                    else:
+                        lines = content.split("\n")
+                        keep = 0
+                        total = 0
+                        for line in lines:
+                            total += len(line) + 1
+                            if total > max_tool_chars:
+                                break
+                            keep += 1
+                        m["content"] = "\n".join(lines[:keep])
+                        if keep < len(lines):
+                            m["content"] += f"\n... [已截短, 省略 {len(lines)-keep} 行]"
+                except Exception:
+                    m["content"] = content[:max_tool_chars] + "\n... [历史结果已截短]"
+        trimmed.append(m)
+    return trimmed
+
+
+def _unwrap_task_message(content: str) -> str:
+    """将旧版 '任务: xxx\\n\\n指令...' 格式还原为原始用户输入"""
+    if not content.startswith("任务: "):
+        return content
+    inner = content[len("任务: "):]
+    for pattern in _OLD_INSTRUCTION_PATTERNS:
+        inner = re.sub(r'\s*' + re.escape(pattern) + r'[。，]?\s*', '', inner)
+    inner = inner.strip()
+    return inner if inner else content
+
+
+def sanitize_tool_messages(messages: List[Dict]) -> List[Dict]:
+    """清洗 tool 消息：移除孤立/无主 tool 消息，防止污染上下文"""
+    seen_call_ids: Set[str] = set()
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                cid = tc.get("id", "")
+                if cid:
+                    seen_call_ids.add(cid)
+    cleaned = []
+    dropped = 0
+    for m in messages:
+        if m.get("role") == "tool":
+            call_id = m.get("tool_call_id", "")
+            if call_id and call_id in seen_call_ids:
+                cleaned.append(m)
+            else:
+                dropped += 1
+                if dropped <= 3:
+                    if not call_id:
+                        reason = "空 call_id"
+                    else:
+                        reason = f"孤立 call_id={call_id!r}"
+                    logger.warning(
+                        f"丢弃 {reason} tool 消息: "
+                        f"content={str(m.get('content', ''))[:80]}"
+                    )
+        else:
+            cleaned.append(m)
+    if dropped:
+        logger.warning(f"清洗 tool 消息: 移除了 {dropped} 条孤立消息")
+    return cleaned
+
+
+def _smart_truncate(text: str, max_chars: int) -> str:
+    """智能截断文本，优先保留结构。"""
+    if len(text) <= max_chars:
+        return text
+    if text.strip().startswith("{"):
+        try:
+            obj = json.loads(text)
+            summary = {}
+            for k, v in list(obj.items())[:10]:
+                if isinstance(v, str) and len(v) > 100:
+                    summary[k] = v[:100] + "..."
+                elif isinstance(v, list):
+                    summary[k] = v[:3]
+                    if len(v) > 3:
+                        summary[k].append(f"... (+{len(v)-3}项)")
+                else:
+                    summary[k] = v
+            result = json.dumps(summary, ensure_ascii=False, indent=2)
+            if len(result) <= max_chars:
+                return result + f"\n... [截断: 完整数据{len(text)}字符]"
+        except (json.JSONDecodeError, Exception):
+            pass
+    if text.strip().startswith("["):
+        try:
+            arr = json.loads(text)
+            if isinstance(arr, list) and len(arr) > 5:
+                snippet = json.dumps(arr[:5], ensure_ascii=False, indent=2)
+                return (
+                    snippet[:-1]
+                    + f",\n  ... (+{len(arr)-5}项)\n]\n"
+                    f"[截断: 完整数据{len(text)}字符]"
+                )
+        except (json.JSONDecodeError, Exception):
+            pass
+    if "\n" in text:
+        lines = text.split("\n")
+        head_count = max(int(len(lines) * 0.7), 1)
+        tail_count = max(int(len(lines) * 0.1), 1)
+        head = "\n".join(lines[:head_count])
+        if len(head) <= max_chars:
+            tail = "\n".join(lines[-tail_count:])
+            return (
+                f"{head}\n... [省略 {len(lines)-head_count-tail_count} 行] ...\n{tail}\n"
+                f"[截断: 完整数据 {len(lines)} 行, {len(text)} 字符]"
+            )
+        to_keep = max_chars - 200
+        for i in range(head_count - 1, 0, -1):
+            chunk = "\n".join(lines[:i])
+            if len(chunk) <= to_keep:
+                return chunk + f"\n... [截断: 完整数据 {len(lines)} 行, {len(text)} 字符]"
+    keep = max_chars - 150
+    return text[:keep] + f"\n... [截断: 完整数据 {len(text)} 字符]"
+
+
+def _estimate_tokens(messages: List[Dict]) -> int:
+    """估算当前消息列表的 token 数。"""
+    try:
+        from ..core.token_estimator import estimate_message_dict
+        return sum(estimate_message_dict(m) for m in messages if isinstance(m, dict))
+    except Exception:
+        return sum(len(str(m.get("content", ""))) // 2 for m in messages if isinstance(m, dict))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ContextBuilder 类
+# ═══════════════════════════════════════════════════════════════
+
+class ContextBuilder:
+    """消息上下文构建器 / 历史压缩器"""
+
+    def __init__(self):
+        self.compressed_until: int = 0
+        self.compressed_summary: str = ""
+
+    # ── 构建初始消息 ──
+
+    async def build_messages(
+        self,
+        task: str,
+        working_dir: str,
+        skill: Optional[Any] = None,
+        base_system: str = "",
+        history: Optional[List[Dict]] = None,
+        skip_last_user: bool = True,
+        compressed_until: int = 0,
+        compressed_summary: str = "",
+        mode: str = "coding",
+    ) -> List[Dict]:
+        """构建初始消息列表。返回 messages + 更新 compressed_* 状态。"""
+        self.compressed_until = compressed_until
+        self.compressed_summary = compressed_summary
+
+        messages: List[Dict] = []
+        variables = self._build_template_variables(task, working_dir, skill)
+
+        if self.compressed_summary:
+            variables["compressed_summary"] = f"## 📜 历史操作日志\n{self.compressed_summary}"
+
+        system_prompt = render_template(variables, base_system, mode=mode)
+        messages.append({"role": "system", "content": system_prompt})
+
+        if history:
+            user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
+            if skip_last_user:
+                user_indices = user_indices[:-1] if user_indices else []
+
+            if user_indices:
+                new_history_start = compressed_until if compressed_until else 0
+                recent_start = (
+                    user_indices[-KEEP_RECENT_TURNS]
+                    if len(user_indices) >= KEEP_RECENT_TURNS
+                    else user_indices[0]
+                )
+                old_history = history[new_history_start:recent_start]
+                recent_history = history[recent_start:]
+
+                if old_history:
+                    summary = await self._llm_summarize(
+                        old_history, llm_client=None, context="早期对话",
+                    )
+                    if summary:
+                        old_turn_count = len(user_indices) - min(len(user_indices), KEEP_RECENT_TURNS)
+                        if self.compressed_summary:
+                            self.compressed_summary = f"{self.compressed_summary}\n{summary}"
+                        else:
+                            self.compressed_summary = summary
+                        self.compressed_until = recent_start
+
+                messages.extend(_trim_history_messages(recent_history))
+
+        messages = sanitize_tool_messages(messages)
+        for m in messages:
+            if m.get("role") == "user" and isinstance(m.get("content"), str):
+                m["content"] = _unwrap_task_message(m["content"])
+
+        messages.append({"role": "user", "content": task})
+        return messages
+
+    def _build_template_variables(
+        self, task: str, working_dir: str, skill: Optional[Any],
+    ) -> Dict[str, str]:
+        variables = {
+            "task": task,
+            "working_dir": working_dir,
+            "env_info": self._gather_environment(working_dir),
+            "user_profile": self._read_user_profile(working_dir),
+            "skill_prompt": "",
+            "constraints": "",
+            "compressed_summary": "",
+            "self_knowledge": "",
+        }
+        if skill:
+            if hasattr(skill, 'get_config_value'):
+                variables["constraints"] = skill.get_config_value("constraints", "")
+            sp = skill.get_system_prompt()
+            if sp:
+                variables["skill_prompt"] = (
+                    f"## 当前任务领域：{skill.meta.display_name}\n{sp}"
+                )
+            # 自我升级技能：注入自我架构知识
+            if getattr(skill.meta, 'name', '') == 'self_upgrade':
+                try:
+                    from ..core.self_analyzer import SelfAnalyzer
+                    analyzer = SelfAnalyzer()
+                    variables["self_knowledge"] = analyzer.generate_self_description()
+                except Exception:
+                    pass
+        return variables
+
+    # ── Token 预算检查 ──
+
+    def should_compress(self, messages: List[Dict]) -> bool:
+        """判断是否需要压缩"""
+        if len(messages) < 10:
+            return False
+        return _estimate_tokens(messages) > MAX_CONTEXT_TOKENS * TOKEN_SAFETY_MARGIN
+
+    # ── 历史压缩 ──
+
+    async def compress(
+        self,
+        messages: List[Dict],
+        llm_client: Any,
+        current_round: int,
+        key_findings_text: str = "",
+    ) -> bool:
+        """压缩历史消息，注入摘要和关键发现。"""
+        if len(messages) < 6:
+            return False
+
+        system_end = 1
+        for i, m in enumerate(messages):
+            if m.get("role") == "user" and i > 0:
+                system_end = i + 1
+                break
+
+        assistant_indices = [
+            i for i in range(system_end, len(messages))
+            if messages[i].get("role") == "assistant"
+        ]
+
+        to_drop = []
+        dropped = 0
+        for idx in assistant_indices[:COMPRESS_ROUNDS * 3]:
+            if dropped >= COMPRESS_ROUNDS * 4:
+                break
+            to_drop.append(idx)
+            dropped += 1
+            for j in range(idx + 1, len(messages)):
+                if messages[j].get("role") == "tool":
+                    to_drop.append(j)
+                else:
+                    break
+
+        if not to_drop:
+            return False
+
+        dropped_msgs = [messages[idx] for idx in sorted(set(to_drop))]
+        summary = await self._llm_summarize(
+            dropped_msgs, llm_client=llm_client,
+            context=f"Token超限压缩(第{current_round}轮)",
+        )
+        if summary:
+            summary = f"## 📜 早期对话摘要（已压缩 {len(dropped_msgs)} 条消息）\n{summary}"
+
+        to_drop = sorted(set(to_drop), reverse=True)
+        for idx in to_drop:
+            if idx < len(messages):
+                messages.pop(idx)
+
+        # 清理孤立 tool 消息
+        valid_call_ids = set()
+        for m in messages:
+            for tc in m.get("tool_calls", []):
+                valid_call_ids.add(tc.get("id", ""))
+        orphan_indices = [i for i, m in enumerate(messages)
+                          if m.get("role") == "tool" and m.get("tool_call_id", "") not in valid_call_ids]
+        for idx in reversed(orphan_indices):
+            messages.pop(idx)
+
+        # 注入摘要
+        if summary and system_end < len(messages):
+            messages.insert(system_end, {"role": "system", "content": summary})
+
+        # 注入关键发现
+        if key_findings_text:
+            inject_pos = system_end + (1 if summary else 0)
+            if inject_pos < len(messages):
+                messages.insert(inject_pos, {"role": "system", "content": key_findings_text})
+
+        logger.info(
+            f"🗜️ Token 压缩: 删除了 {len(to_drop)} 条消息 (约{COMPRESS_ROUNDS}轮), "
+            f"剩余 {len(messages)} 条"
+        )
+        return True
+
+    # ── LLM 摘要 ──
+
+    async def _llm_summarize(
+        self, messages: List[Dict], llm_client: Any, context: str = "",
+    ) -> str:
+        """用 LLM 压缩消息为结构化操作日志。"""
+        if not messages or len(messages) < 3:
+            return ""
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        if len(messages) <= 5 and total_chars < 500:
+            return self._rule_summarize(messages)
+
+        dialogue_parts = []
+        for m in messages:
+            role = m.get("role", "?")
+            content = str(m.get("content", ""))[:400]
+            if m.get("tool_calls"):
+                tools = [tc.get("function", {}).get("name", "?") for tc in m.get("tool_calls", [])]
+                content += f"【调用了: {', '.join(tools)}】"
+            dialogue_parts.append(f"[{role}] {content}")
+
+        prompt = (
+            "将以下Agent对话记录压缩为**操作日志**。每条日志包含：做了什么 → 结果如何。\n\n"
+            "## 输出格式\n"
+            "每行一条记录，格式为：\n"
+            "  - R{轮次} {状态} {操作}: {做了什么} → {结果/发现}\n\n"
+            "状态图标: ✅成功 ❌失败 ⚠️部分 📖读取 ✏️写入 🔍搜索 ⚡执行 💭思考\n\n"
+            "## 压缩要求\n"
+            "1. 每条记录一句话，保留关键信息（文件路径、数据量、错误原因）\n"
+            "2. 丢弃冗余过程（重试细节、调试信息、重复的相同操作）\n"
+            "3. 保留用户意图和Agent的决策转折点\n"
+            "4. 保留所有具体的发现（\"发现循环依赖\"比\"分析了代码\"更有用）\n"
+            "5. 用中文，控制在150-300字\n\n"
+            f"## 对话记录（{context}）\n"
+            + "\n".join(dialogue_parts)
+            + "\n\n## 操作日志:"
+        )
+
+        if llm_client and hasattr(llm_client, 'chat_completion'):
+            try:
+                resp = await llm_client.chat_completion(
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=500,
+                    temperature=0.2,
+                )
+                result = resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                if result and len(result) > 10:
+                    logger.info(f"🤖 LLM 压缩完成: {len(messages)}条 → {len(result)}字操作日志")
+                    return result
+            except Exception as e:
+                logger.warning(f"LLM 压缩失败，fallback 规则摘要: {e}")
+        else:
+            logger.info("无 LLM 客户端，使用规则摘要")
+
+        return self._rule_summarize(messages)
+
+    def _rule_summarize(self, history: List[Dict]) -> str:
+        """规则摘要 — LLM 压缩失败时的 fallback。"""
+        if not history:
+            return ""
+
+        turns: List[List[Dict]] = []
+        current_turn: List[Dict] = []
+        for m in history:
+            if m.get("role") == "user" and current_turn:
+                turns.append(current_turn)
+                current_turn = []
+            current_turn.append(m)
+        if current_turn:
+            turns.append(current_turn)
+
+        if not turns:
+            return ""
+
+        lines = []
+        for ti, turn in enumerate(turns, 1):
+            user_text = ""
+            assistant_text = ""
+            tool_names = []
+            tool_highlights: List[str] = []
+
+            for m in turn:
+                role = m.get("role", "")
+                if role == "user":
+                    user_text = str(m.get("content", ""))[:150].replace("\n", " ")
+                elif role == "assistant":
+                    content = str(m.get("content", ""))
+                    if content:
+                        assistant_text = content[:200].replace("\n", " ")
+                    tcs = m.get("tool_calls", [])
+                    for tc in tcs:
+                        fn = tc.get("function", {})
+                        tool_names.append(fn.get("name", "?"))
+                elif role == "tool":
+                    tool_highlights.extend(self._extract_highlights(str(m.get("content", ""))))
+
+            indicator = ""
+            if tool_names:
+                names_str = " | ".join(tool_names[:3])
+                if len(tool_names) > 3:
+                    names_str += f" +{len(tool_names)-3}"
+                indicator = f"[{names_str}]"
+            else:
+                indicator = "[直接回答]"
+
+            line = f"R{ti} {indicator} Q: {user_text or '(系统消息)'}"
+            if assistant_text:
+                line += f" A: {assistant_text}"
+            if tool_highlights:
+                line += f" 数据: {'; '.join(tool_highlights[:5])}"
+            lines.append(line)
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_highlights(text: str) -> List[str]:
+        """从 tool 结果中提取关键数值。"""
+        highlights = []
+        if not text:
+            return highlights
+        text = text[:2000]
+        patterns = [
+            (r'"count"\s*:\s*(\d+)', "count"),
+            (r'"total_lines"\s*:\s*(\d+)', "lines"),
+            (r'"matches"\s*:\s*(\d+)', "matches"),
+            (r'"score"\s*:\s*(\d+)', "score"),
+            (r'"files"\s*:\s*(\d+)', "files"),
+            (r'"status"\s*:\s*"([^"]+)"', "status"),
+            (r'"passed"\s*:\s*(true|false)', "passed"),
+            (r'"keyword"\s*:\s*"([^"]+)"', "keyword"),
+        ]
+        seen = set()
+        for pattern, label in patterns:
+            for m in re.findall(pattern, text, re.IGNORECASE)[:2]:
+                h = f"{label}={m}"
+                if h not in seen:
+                    seen.add(h)
+                    highlights.append(h)
+        if not highlights and len(text) > 20:
+            clean = text.strip("{} \n\r\t")
+            first = clean.split("\n")[0].strip()[:100]
+            if first:
+                highlights.append(first)
+        return highlights[:5]
+
+    # ── 环境信息 ──
+
+    @staticmethod
+    def _read_user_profile(working_dir: str) -> str:
+        """读取用户档案文件（USER.md, SOUL.md）"""
+        profile_specs = [
+            ("USER.md", "## 用户档案"),
+            ("SOUL.md", "## 行为风格"),
+        ]
+        parts = []
+        for fname, label in profile_specs:
+            path = os.path.join(working_dir, fname)
+            if os.path.isfile(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                    if content:
+                        parts.append(f"{label}（{fname}）\n{content[:1500]}")
+                except Exception:
+                    pass
+        return "\n\n".join(parts) if parts else ""
+
+    @staticmethod
+    def _gather_environment(working_dir: str) -> str:
+        """收集工作环境信息。"""
+        parts = []
+        try:
+            files = os.listdir(working_dir)[:50]
+            parts.append(f"- 工作目录: {working_dir}")
+            parts.append(f"- 目录文件: {', '.join(files[:30])}")
+        except Exception:
+            parts.append(f"- 工作目录: {working_dir}")
+
+        project_info = ContextBuilder._detect_project_context(working_dir)
+        if project_info:
+            parts.append(f"- 项目类型: {project_info.get('type', '?')}")
+            deps = project_info.get('dependencies', [])
+            if deps:
+                parts.append(f"- 依赖: {', '.join(deps[:15])}")
+            if project_info.get('framework'):
+                parts.append(f"- 框架: {project_info['framework']}")
+            if project_info.get('python_version'):
+                parts.append(f"- Python: {project_info['python_version']}")
+
+        try:
+            key_dirs = []
+            for d in ['src', 'tests', 'lib', 'app', 'utils', 'scripts', 'config']:
+                if os.path.isdir(os.path.join(working_dir, d)):
+                    key_dirs.append(d)
+            if key_dirs:
+                parts.append(f"- 关键目录: {', '.join(key_dirs)}")
+        except Exception:
+            pass
+
+        for rule_file in [".jarvis-rules.md", ".jarvis-rules.yaml", ".jarvis-rules.yml", "JARVIS_RULES.md"]:
+            rule_path = os.path.join(working_dir, rule_file)
+            if os.path.isfile(rule_path):
+                try:
+                    with open(rule_path, "r", encoding="utf-8") as f:
+                        rules_content = f.read().strip()
+                    if len(rules_content) > 10:
+                        parts.append(f"\n### 项目规则（{rule_file}）\n{rules_content[:2000]}")
+                    break
+                except Exception:
+                    pass
+
+        try:
+            r = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=working_dir, capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                parts.append(f"- Git 分支: {r.stdout.strip()}")
+            r2 = subprocess.run(
+                ["git", "status", "--short"],
+                cwd=working_dir, capture_output=True, text=True, timeout=5,
+            )
+            if r2.returncode == 0 and r2.stdout.strip():
+                lines = r2.stdout.strip().split("\n")[:10]
+                parts.append(f"- Git 变更: {', '.join(l.strip() for l in lines)}")
+        except Exception:
+            pass
+
+        return "## 工作环境\n" + "\n".join(parts)
+
+    @staticmethod
+    def _detect_project_context(working_dir: str) -> dict:
+        """检测项目上下文（类型、依赖、框架）。"""
+        info = {}
+        for req_file in ['requirements.txt', 'requirements-dev.txt']:
+            req_path = os.path.join(working_dir, req_file)
+            if os.path.isfile(req_path):
+                try:
+                    with open(req_path, 'r') as f:
+                        deps = [l.strip() for l in f if l.strip() and not l.startswith('#') and not l.startswith('-')]
+                    if deps:
+                        info['type'] = 'Python'
+                        info['dependencies'] = [d.split('==')[0].split('>=')[0].split('<')[0].strip() for d in deps[:20]]
+                    break
+                except Exception:
+                    pass
+        pp_path = os.path.join(working_dir, 'pyproject.toml')
+        if os.path.isfile(pp_path):
+            info['type'] = 'Python'
+            try:
+                import tomllib
+                with open(pp_path, 'rb') as f:
+                    pp = tomllib.load(f)
+                deps = []
+                for section in ['dependencies', 'optional-dependencies']:
+                    if section in pp.get('project', {}):
+                        raw = pp['project'][section]
+                        if isinstance(raw, list):
+                            deps.extend([d.split('>=')[0].split('==')[0].split('!=')[0].strip() for d in raw if isinstance(d, str)])
+                if deps:
+                    info['dependencies'] = deps[:15]
+                req_py = pp.get('project', {}).get('requires-python', '')
+                if req_py:
+                    info['python_version'] = req_py
+                if deps:
+                    frameworks = ['flask', 'django', 'fastapi', 'pandas', 'numpy', 'requests', 'sqlalchemy', 'click', 'typer', 'httpx', 'scrapy']
+                    found = [f for f in frameworks if any(f in d.lower() for d in deps)]
+                    if found:
+                        info['framework'] = found[0]
+            except Exception:
+                pass
+        pkg_path = os.path.join(working_dir, 'package.json')
+        if os.path.isfile(pkg_path):
+            info['type'] = 'Node.js'
+            try:
+                with open(pkg_path, 'r') as f:
+                    pkg = json.load(f)
+                all_deps = {}
+                for key in ['dependencies', 'devDependencies']:
+                    all_deps.update(pkg.get(key, {}))
+                if all_deps:
+                    info['dependencies'] = list(all_deps.keys())[:15]
+            except Exception:
+                pass
+        return info
+
+
+================================================================================
+# FILE: prompt\modes.py
+================================================================================
+"""
+engine/prompt/modes.py — 模式配置中心
+
+定义三种工作模式，每种模式有独立的系统提示模板、工具集和 LLM 参数。
+- coding:    编程模式（默认，沿用原有模板）
+- workbuddy: WorkBuddy 工作助手模式
+- video:     视频脚本创作模式
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+
+# ─────────────────────────────────────────────────────────────────
+#  WorkBuddy 系统提示模板
+# ─────────────────────────────────────────────────────────────────
+
+_WORKBUDDY_TEMPLATE = """你是 Jarvis WorkBuddy，一个高效的工作助手，专注于文档处理、信息整理、数据分析和日程管理。
+
+{{ skill_prompt }}
+
+## 工作环境
+{{ env_info }}
+
+{{ compressed_summary }}
+
+## 当前任务
+{{ task }}
+
+{{ user_profile }}
+
+## 约束条件
+{{ constraints }}
+
+{{ self_knowledge }}
+
+# ═══════════════════════════════════════════════════════════════
+#  工作方法论
+# ═══════════════════════════════════════════════════════════════
+
+## 核心流程
+每个任务遵循：
+1. **理解需求** — 确认用户想要什么输出（整理报告？填写表格？提取信息？）
+2. **收集资料** — 读取相关文件，了解数据现状
+3. **规划步骤** — 确定操作顺序，多步骤任务用 todo_write 记录
+4. **执行操作** — 按计划处理，每步验证结果
+5. **交付成果** — 输出清晰的结论和文件
+
+## 核心原则
+1. **结果导向** — 直接输出可用的成果，减少废话
+2. **数据准确** — 处理数据时仔细核对，不虚构数据
+3. **格式规范** — 输出内容格式整洁，善用表格和列表
+4. **批量高效** — 处理大量文件时采用中间汇总文件模式，避免上下文溢出
+5. **操作必执行** — 文件修改/创建/重命名等操作必须调用工具，不能只说结论
+
+# ═══════════════════════════════════════════════════════════════
+#  文档处理指南
+# ═══════════════════════════════════════════════════════════════
+
+## Excel 操作
+1. `excel_open` 打开文件，获得 ref
+2. `excel_list_sheets` / `excel_read_sheet` 查看数据
+3. `excel_write_cell` / `excel_write_by_header` 修改数据
+4. `excel_save` 保存 → `excel_close` 释放
+→ 操作完毕必须 `excel_close`！
+→ 批量写入优先用 `excel_write_by_header`（按列名匹配）
+
+## PDF 处理
+- `pdf_read` 读取 PDF 文本（自动降级 pdfplumber → pypdf）
+- 支持表格提取和关键词过滤
+- 合并/拆分 PDF 用 `pdf_concat` / `pdf_split`
+
+## Word 处理
+- `word_read` 读取 Word 文档
+- `word_write` 创建/覆盖 Word 文档
+
+## 文件操作
+- `file_read` 读取文本/配置文件
+- `file_write` 覆盖写入（不可回滚！先备份）
+- `file_append` 追加内容
+- `file_rename` 重命名
+- `file_glob` 批量查找文件
+
+# ═══════════════════════════════════════════════════════════════
+#  信息搜索与整理
+# ═══════════════════════════════════════════════════════════════
+
+- `web_search` 搜索网络信息
+- `web_fetch` 抓取指定网页内容
+- 整理信息时，用结构化格式（表格/列表/分级标题）输出
+- 多来源信息要标注出处
+
+# ═══════════════════════════════════════════════════════════════
+#  大数据处理规则
+# ═══════════════════════════════════════════════════════════════
+
+处理大量文件或长文本时严格遵守：
+- **绝对禁止**在上下文中累积超过 3 个文件的完整原始数据
+- 超过 3 个文件时，采用"读取 → 提取关键信息 → 追加到汇总文件"模式
+- 汇总文件用 JSONL 格式（每行一条 JSON）
+- 处理完成后删除中间汇总文件
+
+# ═══════════════════════════════════════════════════════════════
+#  输出要求
+# ═══════════════════════════════════════════════════════════════
+
+- 用中文回答用户
+- 完成时给出核心结论 + 关键成果摘要
+- 表格数据用 Markdown 表格展示
+- 文件操作完成后告知文件路径"""
+
+
+# ─────────────────────────────────────────────────────────────────
+#  视频脚本系统提示模板
+# ─────────────────────────────────────────────────────────────────
+
+_VIDEO_TEMPLATE = """你是 Jarvis Creative，一个专业的视频内容创作助手，擅长脚本编写、分镜设计、字幕生成和视频处理命令。
+
+{{ skill_prompt }}
+
+## 工作环境
+{{ env_info }}
+
+{{ compressed_summary }}
+
+## 当前任务
+{{ task }}
+
+{{ user_profile }}
+
+## 约束条件
+{{ constraints }}
+
+{{ self_knowledge }}
+
+# ═══════════════════════════════════════════════════════════════
+#  工作方法论
+# ═══════════════════════════════════════════════════════════════
+
+## 核心流程
+每个视频创作任务遵循：
+1. **理解创意** — 确认视频主题、目标受众、平台（抖音/B站/YouTube）、时长要求
+2. **构思结构** — 确定视频节奏（开头hook → 主体内容 → 结尾CTA）
+3. **编写脚本** — 按分镜格式输出完整脚本
+4. **辅助素材** — 生成字幕文件、配音文稿、FFmpeg 处理命令
+5. **交付文件** — 输出脚本文件和字幕文件
+
+## 核心原则
+1. **创意优先** — 脚本要有吸引力，开头 3 秒抓住观众
+2. **节奏把控** — 短视频（< 1min）节奏紧凑，长视频（> 5min）有起承转合
+3. **视觉化思维** — 写脚本时同步想象画面，注明镜头运动和画面构图
+4. **口语化表达** — 配音文稿用自然口语，避免书面语
+5. **操作必执行** — 文件创建/写入操作必须调用工具
+
+# ═══════════════════════════════════════════════════════════════
+#  脚本格式规范
+# ═══════════════════════════════════════════════════════════════
+
+## 分镜脚本格式
+
+| 镜号 | 时长 | 画面描述 | 台词/旁白 | 字幕 | 备注 |
+|------|------|----------|-----------|------|------|
+| 01 | 00:00-00:03 | 开场特写，镜头推进 | "你有没有想过..." | 同步台词 | 配 BGM 渐入 |
+| 02 | 00:03-00:08 | 中景，主播正面 | 正文内容... | 同步台词 | 加文字动画 |
+
+## 脚本文件输出格式
+- 脚本文件: `{title}_script.md`（Markdown 分镜表）
+- 字幕文件: `{title}.srt`（标准 SRT 格式）
+- 配音文稿: `{title}_voiceover.txt`（纯文本，无时间码）
+
+# ═══════════════════════════════════════════════════════════════
+#  SRT 字幕格式参考
+# ═══════════════════════════════════════════════════════════════
+
+```
+1
+00:00:00,000 --> 00:00:03,000
+第一句字幕文本
+
+2
+00:00:03,500 --> 00:00:07,000
+第二句字幕文本
+```
+
+## SRT 规则
+- 每条字幕最多 2 行，每行不超过 42 个字符
+- 字幕持续时间：最短 1 秒，最长 6 秒
+- 两条字幕之间至少间隔 0.1 秒
+- 字幕文本要口语化，不要书面语
+
+# ═══════════════════════════════════════════════════════════════
+#  FFmpeg 常用命令参考
+# ═══════════════════════════════════════════════════════════════
+
+## 视频剪辑
+- 截取片段: `ffmpeg -i input.mp4 -ss 00:00:10 -to 00:00:30 -c copy output.mp4`
+- 合并视频: `ffmpeg -f concat -safe 0 -i filelist.txt -c copy output.mp4`
+- 提取音频: `ffmpeg -i input.mp4 -vn -acodec libmp3lame output.mp3`
+- 添加字幕: `ffmpeg -i input.mp4 -vf subtitles=subs.srt output.mp4`
+
+## 视频转换
+- 压缩视频: `ffmpeg -i input.mp4 -crf 23 -preset medium output.mp4`
+- 转 GIF: `ffmpeg -i input.mp4 -vf "fps=15,scale=640:-1" output.gif`
+- 调整分辨率: `ffmpeg -i input.mp4 -vf scale=1920:1080 output.mp4`
+
+## 批量处理
+- 批量转码: 写 Python 脚本循环处理，用 shell_run 执行
+
+# ═══════════════════════════════════════════════════════════════
+#  平台适配建议
+# ═══════════════════════════════════════════════════════════════
+
+| 平台 | 推荐时长 | 画幅比 | 风格建议 |
+|------|----------|--------|----------|
+| 抖音/TikTok | 15-60s | 9:16 竖屏 | 节奏快，前3秒hook |
+| B站 | 3-15min | 16:9 横屏 | 内容深度，弹幕互动 |
+| YouTube | 8-20min | 16:9 横屏 | SEO标题，缩略图 |
+| 小红书 | 30-90s | 3:4 竖屏 | 干货向，封面精美 |
+| 微信视频号 | 1-3min | 1:1 或 16:9 | 情感共鸣，转发向 |
+
+# ═══════════════════════════════════════════════════════════════
+#  输出要求
+# ═══════════════════════════════════════════════════════════════
+
+- 用中文回答用户
+- 脚本输出要直接创建为文件（调用 file_write 工具）
+- 字幕文件用标准 SRT 格式
+- 完成时告知所有生成的文件路径"""
+
+
+# ─────────────────────────────────────────────────────────────────
+#  编程模式系统提示模板（沿用原始，在 template.py 中定义）
+# ─────────────────────────────────────────────────────────────────
+
+# coding 模式使用 template.py 中的 _BASE_TEMPLATE，此处仅作为引用标记
+_CODING_TEMPLATE = None  # None 表示使用 template.py 的默认模板
+
+
+# ─────────────────────────────────────────────────────────────────
+#  ModeConfig 数据类
+# ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class ModeConfig:
+    """工作模式配置"""
+    name: str                               # "coding" / "workbuddy" / "video"
+    display_name: str                       # 显示名称
+    description: str                        # 描述
+    icon: str                               # emoji 图标
+    system_template: Optional[str] = None   # 系统提示模板（None = 使用默认）
+    allowed_tools: Optional[List[str]] = None  # None=全部工具, 列表=仅这些工具
+    temperature: Optional[float] = None     # None=使用 ComplexityRouter 默认
+    max_tokens: Optional[int] = None        # None=使用 ComplexityRouter 默认
+    default_model: Optional[str] = None     # 推荐模型
+
+
+# ─────────────────────────────────────────────────────────────────
+#  工具集白名单
+# ─────────────────────────────────────────────────────────────────
+
+_WORKBUDDY_TOOLS = [
+    # 文件
+    "file_list", "file_read", "file_glob", "file_write",
+    "file_append", "file_rename", "file_diff",
+    # Excel
+    "excel_open", "excel_close", "excel_list_sheets", "excel_read_sheet",
+    "excel_get_structure", "excel_write_cell", "excel_write_by_header",
+    "excel_insert_rows", "excel_format_range", "excel_save",
+    # PDF
+    "pdf_read", "pdf_split", "pdf_concat",
+    # Word
+    "word_read", "word_write",
+    # Shell
+    "shell_run",
+    # 网络
+    "web_fetch", "web_search",
+    # 图片
+    "image_read", "image_ocr",
+    # Todo
+    "todo_write", "todo_list",
+    # 系统
+    "system_info", "system_time", "system_cwd",
+    # Git
+    "git_status", "git_commit",
+]
+
+_VIDEO_TOOLS = [
+    # 文件
+    "file_list", "file_read", "file_glob", "file_write",
+    "file_append", "file_rename",
+    # Shell（执行 FFmpeg）
+    "shell_run",
+    # 网络（素材搜索）
+    "web_fetch", "web_search",
+    # 代码读取（参考脚本）
+    "code_read",
+    # 图片（参考画面）
+    "image_read",
+    # Todo
+    "todo_write", "todo_list",
+    # 系统
+    "system_info", "system_time", "system_cwd",
+]
+
+
+# ─────────────────────────────────────────────────────────────────
+#  模式注册表
+# ─────────────────────────────────────────────────────────────────
+
+MODE_REGISTRY: Dict[str, ModeConfig] = {
+    "coding": ModeConfig(
+        name="coding",
+        display_name="编程模式",
+        description="全功能编程助手，代码读写、调试、重构",
+        icon="💻",
+        system_template=None,       # 使用 template.py 默认模板
+        allowed_tools=None,         # 全部工具
+        temperature=None,           # 使用 ComplexityRouter
+        max_tokens=None,
+        default_model=None,
+    ),
+    "workbuddy": ModeConfig(
+        name="workbuddy",
+        display_name="WorkBuddy",
+        description="工作助手，文档处理、信息整理、数据分析",
+        icon="📋",
+        system_template=_WORKBUDDY_TEMPLATE,
+        allowed_tools=_WORKBUDDY_TOOLS,
+        temperature=0.5,            # 更稳定的输出
+        max_tokens=4096,
+        default_model=None,
+    ),
+    "video": ModeConfig(
+        name="video",
+        display_name="视频脚本",
+        description="视频创作辅助，脚本、分镜、字幕、FFmpeg",
+        icon="🎬",
+        system_template=_VIDEO_TEMPLATE,
+        allowed_tools=_VIDEO_TOOLS,
+        temperature=0.9,            # 更高创造力
+        max_tokens=8192,            # 脚本通常较长
+        default_model=None,
+    ),
+}
+
+
+def get_mode_config(mode: str) -> ModeConfig:
+    """获取模式配置，未知模式返回 coding"""
+    return MODE_REGISTRY.get(mode, MODE_REGISTRY["coding"])
+
+
+def get_all_modes() -> List[ModeConfig]:
+    """获取所有可用模式"""
+    return list(MODE_REGISTRY.values())
+
+
+================================================================================
 # FILE: prompt\template.py
 ================================================================================
 """
@@ -12,7 +1033,7 @@ render_template 用于将变量注入模板。
 import re
 from typing import Dict
 
-_BASE_TEMPLATE = """你是 Jarvis，一个强大的自主智能助手。
+_BASE_TEMPLATE = """你是 Jarvis，一个强大的自主智能助手，能够使用各种工具完成任务。
 
 {{ skill_prompt }}
 
@@ -24,86 +1045,195 @@ _BASE_TEMPLATE = """你是 Jarvis，一个强大的自主智能助手。
 ## 当前任务
 {{ task }}
 
-分析当前情况，决定下一步行动。如果需要更多信息，调用工具获取。如果任务完成或无法继续，直接输出最终答案。
-
 {{ user_profile }}
 
 ## 约束条件
 {{ constraints }}
 
+{{ self_knowledge }}
+
+# ═══════════════════════════════════════════════════════════════
+#  工作方法论
+# ═══════════════════════════════════════════════════════════════
+
+## 核心流程
+每个任务遵循：
+1. **理解** — 确认任务意图、范围、输出格式要求
+2. **探索** — 收集必要信息（文件内容、项目结构、依赖关系）
+3. **规划** — 确定步骤顺序，复杂任务用 todo_write 记录计划
+4. **执行** — 按计划逐步执行，每步验证结果
+5. **交付** — 输出清晰结论和关键信息
+
 ## 核心原则
-1. 理解优先，动手在后 — 先分析意图，再行动
-2. 一次一步，步步验证 — 完成后检查结果
-3. 记忆复用，避免重复 — 牢记已获取的信息
-4. 失败不是终点 — 分析原因，换方式重试（同方式最多2次）
-5. 不需要征询用户同意即可执行搜索、读取、分析
-6. 任务完成或无法继续时，给出清晰总结
+1. **理解优先，动手在后** — 先花 1 轮思考任务本质，再行动
+2. **一次一步，步步验证** — 每个工具调用后检查结果，不要连续调用多个无关工具
+3. **记忆复用** — 已读取的信息优先使用缓存，不要重复读取相同内容
+4. **失败不是终点** — 分析错误原因，换方式重试（同方式最多 2 次，第 3 次必须换方案）
+5. **自动操作** — 搜索、读取、分析不需要询问用户，直接执行
+6. **完成即总结** — 任务完成或无法继续时，给出核心结论 + 关键步骤摘要
+7. **禁止虚构执行结果** — 如果你没有调用工具执行操作，绝对不能声称"已完成"
+8. **操作类任务必须调用工具** — 文件重命名/修改/创建/删除等操作，必须通过工具调用实际执行，不能只输出结论
 
-## 工具选择指南
-- **代码文件**（.py / .js / .ts / .java / .go 等编程语言文件）：使用 `code_*` 系列工具（带自动备份和回滚）
-- **普通文件**（日志/配置/文档/数据/文本）：使用 `file_*` 系列工具
-- **Excel**：使用 `excel_*` 系列工具
-- **网页**：使用 `web_*` 系列工具（web_fetch/web_search）
-- **Shell 命令**：使用 `shell_run`
+# ═══════════════════════════════════════════════════════════════
+#  工具使用详细指南
+# ═══════════════════════════════════════════════════════════════
 
-## 进度管理
-你需要在每次回复中自行判断和报告进度。
+## 工具选择决策树
 
-### 判断方式
-- 查看对话历史中的操作日志，确认已完成什么
-- 对比用户的原始任务，判断还差什么
-- 如果任务较大，在回复开头用一两句话概括当前进展
+### 我要读取内容：
+- 这是编程语言文件（.py/.js/.ts/.java/.go/.rs/.cpp等）？→ **code_read**
+  （自动提取类/函数/方法结构，便于快速定位）
+- 这是日志/配置/文档/数据/纯文本？→ **file_read**
+- 这是 PDF 文档？→ **pdf_read**
+  （支持自动降级：优先 pdfplumber，回退 pypdf；支持表格提取和关键词过滤）
+- 这是 Word 文档？→ **word_read**
+- 这是图片？→ **image_read**（获取尺寸/格式/base64）或 **image_ocr**（提取文字）
+- 这是网页/在线内容？→ **web_fetch**（先搜索找到 URL）
+- 我要搜索信息？→ **web_search**（网络搜索）或 **kimi_search**（AI 智能搜索）
 
-### 输出格式
+### 我要修改代码文件：
+1. **code_read** — 先读取确认目标内容（带上行号）
+2. **code_diff** — 预览修改差异，确认 old_text 能唯一匹配
+3. **code_write** — 执行修改（自动 .bak 备份，可回滚）
+4. **code_rollback** — 如果修改不对，立即回滚
+→ 不要在 code_read 之前直接 code_write
+→ 如果 code_diff 报告 "匹配0处"，说明 old_text 与文件内容不一致，重新 code_read 确认
+
+### 我要修改非代码文件：
+1. **file_read** — 先读取确认内容
+2. **file_diff**（可选）— 预览差异
+3. **file_write** — 覆盖写入（注意：此操作不可回滚！建议先手动备份）
+→ 追加内容用 **file_append**
+→ 重命名用 **file_rename**
+
+### 我要执行 Shell 命令：
+- 简单命令 → **shell_run(command='...')**
+- 多行 Python 脚本 → **shell_run(code='...')**（自动写入临时文件执行，避免 JSON 转义问题）
+- 长时间运行的任务 → 设置合适的 timeout 参数
+
+### 我要处理 Excel：
+1. **excel_open** — 打开文件，获得 ref
+2. **excel_list_sheets** — 查看有哪些工作表
+3. **excel_read_sheet/excel_get_structure** — 读取数据或结构
+4. **excel_write_cell/excel_write_by_header/excel_insert_rows** — 修改
+5. **excel_save** — 保存
+6. **excel_close** — 关闭
+→ 操作完毕后必须调用 excel_close 释放 Excel 进程！
+
+### 我要追踪任务进度：
+- 多步骤任务（3步以上）→ **todo_write** 记录任务列表
+- 查看当前进度 → **todo_list**
+- 每次 todo_write 传入完整的任务列表（不是增量更新）
+
+# ═══════════════════════════════════════════════════════════════
+#  错误处理完整指南
+# ═══════════════════════════════════════════════════════════════
+
+## Shell 命令错误分级处理
+当 shell_run 返回错误时，遵循以下步骤：
+1. 检查命令语法 — 引号是否匹配？路径中是否有空格未转义？管道/重定向是否用了正确语法？
+2. 如果是 Windows，检查是否用了 Linux 命令（ls → dir, cat → type）
+3. 如果错误包含 "command not found" 或 "not recognized"，确认命令是否已安装
+4. 如果命令涉及管道或重定向（|, >, <, &&），考虑拆分为多个简单的 shell_run 调用
+5. 连续 2 次 shell_run 失败后，将命令写入临时脚本文件再执行（shell_run(code='...')）
+6. 不要重复执行完全相同的命令 — 结果不会改变
+
+## 代码编辑错误处理
+- code_diff/code_write 报 "未找到匹配文本" → 用 code_read 重新读取文件，确认 old_text 与文件内容精确一致（包括缩进和空行）
+- 报 "匹配到 N 处" → old_text 太短，增加上下文使其唯一匹配
+- 连续 2 次 code_write 失败 → 换方案：code_read 整文件 → file_write 写完整新内容
+
+## 文件读取错误处理
+- 文件不存在 → 先 file_glob 或 file_list 确认文件名和路径
+- 编码错误 → 如果非 UTF-8 文本，尝试 file_read 仍会自动处理
+- 权限错误 → 说明需要什么权限
+
+## Web 工具错误处理
+- web_fetch 失败 → 检查 URL 是否正确，尝试去掉 URL 中的特殊字符
+- web_search 结果为空 → 换用不同的搜索词，或使用 kimi_search
+- 网络超时 → 网络可能不稳定，稍后重试
+
+## 工具返回空内容
+- 先检查参数是否正确（路径？文件名？工作表名？）
+- 换用其他工具尝试读取同一目标
+- 如果是文件读取，可能是文件格式问题，尝试用 shell_run 执行 type/cat 命令
+
+# ═══════════════════════════════════════════════════════════════
+#  进度管理与任务追踪
+# ═══════════════════════════════════════════════════════════════
+
+## 进度报告
 对于多步骤任务，回复的第一行应该是进度概述：
-
 **进度: 2/4 | 已完成:** 读取源文件、分析依赖 | **下一步:** 修改配置文件
 
-### 注意
 - 这是给你自己看的进度锚点，防止在复杂任务中迷失
 - 不需要用工具记录，直接在回复中输出即可
 - 简单任务（1-3步）不需要进度概述
 - 如果发现之前的步骤没有实际效果，诚实标注并重新规划
 
-## 信息整合规则
+## Todo 工具使用（复杂任务）
+对于 5 步以上的复杂任务，使用 todo_write 维护任务列表：
+- 任务开始时：用 todo_write 创建完整的任务清单
+- 每完成一个步骤：更新对应任务状态
+- todo_write 每次传入完整列表（不是增量更新）
+
+# ═══════════════════════════════════════════════════════════════
+#  大数据处理规则
+# ═══════════════════════════════════════════════════════════════
+
+处理大量文件或长文本时严格遵守：
+- **绝对禁止**在上下文中累积超过 3 个文件的完整原始数据
+- 处理超过 3 个文件时，采用"读取 → 提取关键信息 → 追加到中间汇总文件"模式：
+  1. 读取一个文件 → 提取关键字段 → file_append(path='_summary.jsonl', content=一行JSON)
+  2. 继续下一个文件，重复步骤1
+  3. 全部处理完毕 → file_read(path='_summary.jsonl') 一次性读回汇总数据
+  4. 基于汇总数据做最终操作
+- 汇总文件格式：每行一条 JSON 记录 {"字段1":"值1", "字段2":"值2"}
+- 处理完成后删除中间汇总文件
+- 每步上下文只保留：当前处理结果 + 已处理计数（如 "第3/10份"）
+- 如果发现上下文已经很大（超过 5000 tokens），立即停止读取新文件，先处理已有信息
+
+# ═══════════════════════════════════════════════════════════════
+#  信息整合规则
+# ═══════════════════════════════════════════════════════════════
+
 - 读取到用户背景信息（简历、档案、偏好）时，检查是否有空白身份文件（USER.md、IDENTITY.md、MEMORY.md），有则自动填充
 - 能用已有信息填的先填好，再让用户确认。禁止明知信息够用却从零开始提问
 - 一次对话中获取的新信息，结束前总结并回写到对应文件
 
-## 错误处理
-- 工具返回空：检查参数，换工具，或写入文件再读
-- 如果 shell 报告"未提供任何参数"，说明参数格式有问题
-  → 不要重试相同的 JSON 格式，改用 file_write 或 code_create 写入脚本文件
-  → 然后用 shell(command='python 脚本文件.py') 执行
-- 工具返回错误：参数错→修正；权限错→说明；超时→减量
-- 最多重试2次同方式，第3次必须换方案
-- 注意不要重复调用相同工具读取相同内容
+# ═══════════════════════════════════════════════════════════════
+#  安全准则
+# ═══════════════════════════════════════════════════════════════
 
-## 大数据处理规则（处理大量文件/长文本时严格遵守）
-- **绝对禁止**在上下文中累积超过 3 个文件的完整原始数据
-- 处理超过 3 个文件时，必须采用"读取 → 提取关键信息 → 追加到中间汇总文件"模式：
-  1. 读取一个文件 → 提取关键字段 → file_append(path='_summary.jsonl', content=JSON一行)
-  2. 继续下一个文件，重复步骤1
-  3. 全部处理完毕 → file_read(path='_summary.jsonl') 一次性读回汇总数据
-  4. 基于汇总数据做最终操作（写Excel、生成报告等）
-- 汇总文件格式：每行一条 JSON 记录 {"字段1":"值1", "字段2":"值2"}
-- 处理完成后删除中间汇总文件
-- 每步上下文只保留：当前处理结果 + 已处理计数（如 "第3/10份"）
-如果发现上下文已经很大（超过 5000 tokens），立即停止读取新文件，
-  先处理已有信息，输出结果
+- **谨慎对待删除/覆盖操作** — 删除文件或覆盖前确认
+- **回滚保障** — code_write 会自动备份，但 file_write 不会，重要文件修改前手动备份
+- **不要执行可疑命令** — 来源不明的 curl/bash 管道安装脚本不要执行
+- **Git 操作** — 不要强制推送到主分支，commit 前确保有文件修改
 
-## 输出要求
-- 用中文回答，代码注释用英文
-- 完成时给出核心结论 + 关键步骤
-- 无法完成时说明原因 + 需要什么
-- 主动汇报进度"""
+# ═══════════════════════════════════════════════════════════════
+#  输出要求
+# ═══════════════════════════════════════════════════════════════
+
+- 用中文回答用户，代码注释用英文
+- 完成时给出核心结论 + 关键步骤摘要
+- 无法完成时说明原因 + 缺少的条件
+- 主动汇报进度，让用户知道当前状态"""
 
 TEMPLATE_PATTERN = re.compile(r'\{\{\s*(\w+)\s*\}\}')
 
 
-def render_template(variables: Dict[str, str], base_system: str = "") -> str:
-    """渲染 system prompt 模板。"""
-    template = _BASE_TEMPLATE
+def render_template(variables: Dict[str, str], base_system: str = "", mode: str = "coding") -> str:
+    """渲染 system prompt 模板。根据 mode 选择对应模板，coding 使用默认模板。"""
+    if mode and mode != "coding":
+        from .modes import get_mode_config
+        mode_cfg = get_mode_config(mode)
+        if mode_cfg.system_template is not None:
+            template = mode_cfg.system_template
+        else:
+            template = _BASE_TEMPLATE
+    else:
+        template = _BASE_TEMPLATE
+
     if base_system:
         template = template + "\n\n" + base_system
 
@@ -879,7 +2009,9 @@ def get_filtered_tools(tool_registry: Any, skill: Optional[Any] = None) -> List[
     如果当前有匹配的 Skill，只暴露该 Skill 需要的工具；
     否则暴露全部可用工具。
     """
-    if hasattr(tool_registry, 'get_tool_defs_for_llm'):
+    if hasattr(tool_registry, 'get_openai_tools'):
+        all_tools = tool_registry.get_openai_tools()
+    elif hasattr(tool_registry, 'get_tool_defs_for_llm'):
         all_tools = tool_registry.get_tool_defs_for_llm()
     else:
         all_tools = []
@@ -1700,24 +2832,24 @@ class ToolExecutor:
         if self.policy:
             access = self.policy.check(call.name, call.id)
             if access == AccessLevel.DENY:
-                return ToolResult.error(
+                return ToolResult.fail(
                     call.id, call.name,
                     f"工具 '{call.name}' 已被禁止执行"
                 )
             elif access == AccessLevel.REQUIRE_APPROVAL:
                 logger.warning(f"⏸️ 工具 '{call.name}' 等待审批 (call_id={call.id[:12]})")
-                return ToolResult.error(
+                return ToolResult.fail(
                     call.id, call.name,
                     f"工具 '{call.name}' 需要人类审批才能执行"
                 )
 
         tool = self.registry.get(call.name)
         if not tool:
-            return ToolResult.error(call.id, call.name, f"工具 '{call.name}' 未注册")
+            return ToolResult.fail(call.id, call.name, f"工具 '{call.name}' 未注册")
 
         is_valid, error_msg = tool.validate_args(call.name, call.arguments)
         if not is_valid:
-            return ToolResult.error(call.id, call.name, error_msg or "参数无效")
+            return ToolResult.fail(call.id, call.name, error_msg or "参数无效")
 
         # 使用工具级重试配置
         tool_retry_errors = getattr(tool, 'retryable_exceptions', (ConnectionError, TimeoutError, OSError))
@@ -1753,22 +2885,22 @@ class ToolExecutor:
                 logger.warning(f"工具 '{call.name}' 返回错误: {result.error_message}, 准备重试")
 
             except asyncio.TimeoutError:
-                last_error = ToolResult.error(call.id, call.name, f"工具执行超时 ({timeout_val}s)")
+                last_error = ToolResult.fail(call.id, call.name, f"工具执行超时 ({timeout_val}s)")
                 if attempt >= tool_max_retries:
                     return last_error
                 logger.warning(f"工具 '{call.name}' 超时，准备重试 (attempt {attempt + 1})")
 
             except retryable_errors as e:
-                last_error = ToolResult.error(call.id, call.name, str(e))
+                last_error = ToolResult.fail(call.id, call.name, str(e))
                 if attempt >= tool_max_retries:
                     return last_error
                 logger.warning(f"工具 '{call.name}' 可重试异常: {e}, 准备重试")
 
             except Exception as e:
                 logger.exception(f"工具 {call.name} 异常: {e}")
-                return ToolResult.error(call.id, call.name, str(e))
+                return ToolResult.fail(call.id, call.name, str(e))
 
-        return last_error or ToolResult.error(call.id, call.name, "执行失败: 未知错误")
+        return last_error or ToolResult.fail(call.id, call.name, "执行失败: 未知错误")
 
     async def execute_parallel(
         self,
@@ -1794,1395 +2926,10 @@ class ToolExecutor:
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 final_results.append(
-                    ToolResult.error(calls[i].id, calls[i].name, str(result))
+                    ToolResult.fail(calls[i].id, calls[i].name, str(result))
                 )
             else:
                 final_results.append(result)
         return final_results
-
-
-================================================================================
-# FILE: tool\mcp.py
-================================================================================
-"""
-tool/mcp.py — MCP (Model Context Protocol) 工具适配器
-
-支持通过 MCP 协议自动发现和调用外部工具，无需手动注册。
-
-支持的 transport:
-  - stdio: 子进程通信 (mcp-server-filesystem 等官方服务)
-  - sse: HTTP SSE 通信 (远程 MCP 服务)
-
-用法:
-  # 注册一个 MCP stdio 服务
-  registry.register(MCPToolAdapter(
-      name="mcp_fs",
-      transport="stdio",
-      command=["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
-      description="文件系统 MCP 服务"
-  ))
-
-  # 注册一个 MCP SSE 服务
-  registry.register(MCPToolAdapter(
-      name="mcp_remote",
-      transport="sse",
-      url="http://localhost:3001/mcp",
-      description="远程 MCP 服务"
-  ))
-"""
-
-import asyncio
-import json
-import logging
-import subprocess
-from typing import Any, Dict, List, Optional
-
-try:
-    import httpx
-    HAS_HTTPX = True
-except ImportError:
-    HAS_HTTPX = False
-
-from .base import BaseTool, ToolParameter, ToolResult
-
-logger = logging.getLogger(__name__)
-
-
-# ═══════════════════════════════════════
-#  资源泄漏防护：注册 atexit 清理
-# ═════════════════════════════════════==
-import atexit as _atexit
-_mcp_instances: list = []
-
-
-def _close_all_mcp():
-    """关闭所有 MCP 适配器（atexit 回调）"""
-    import asyncio
-    for inst in _mcp_instances[:]:
-        try:
-            if inst._process:
-                inst._process.terminate()
-                inst._process.wait(timeout=3)
-        except Exception:
-            pass
-        try:
-            if inst._client:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(inst._client.aclose())
-                loop.close()
-        except Exception:
-            pass
-        inst._initialized = False
-    _mcp_instances.clear()
-
-
-_atexit.register(_close_all_mcp)
-
-
-class MCPToolAdapter(BaseTool):
-    """
-    MCP 协议适配器 — 自动发现并代理 MCP 服务的所有工具。
-
-    每个 MCPToolAdapter 实例对应一个 MCP 服务（含多个工具）。
-    通过 `__getattr__` 或 `get_tool(name)` 获取子工具。
-    """
-
-    def __init__(
-        self,
-        name: str,
-        description: str = "MCP 工具服务",
-        transport: str = "stdio",
-        command: Optional[List[str]] = None,
-        url: Optional[str] = None,
-        timeout: float = 30.0,
-    ):
-        self._name = name
-        self._desc = description
-        self.transport = transport
-        self.command = command or []
-        self.url = url
-        self.timeout = timeout
-
-        self._process: Optional[subprocess.Popen] = None
-        self._client: Optional[httpx.AsyncClient] = None
-        self._session_id: Optional[str] = None
-        self._tools: List[Dict] = []  # 自动发现的工具列表
-        self._initialized = False
-        self._finalized = False
-        self._stderr_task: Optional[asyncio.Task] = None  # stderr 读取任务
-
-        # 注册到全局清理列表（防泄漏）
-        _mcp_instances.append(self)
-        self._lock = asyncio.Lock()
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def description(self) -> str:
-        discovered = len(self._tools)
-        if discovered:
-            return f"{self._desc} ({discovered} 个子工具 via MCP)"
-        return self._desc
-
-    @property
-    def parameters(self) -> List[ToolParameter]:
-        return [
-            ToolParameter("tool", "string", "要调用的子工具名称", required=True),
-            ToolParameter("args", "object", "子工具的参数", required=True),
-        ]
-
-    async def initialize(self) -> bool:
-        """初始化 MCP 连接并自动发现工具"""
-        if self._initialized:
-            return True
-
-        async with self._lock:
-            if self._initialized:
-                return True
-
-            try:
-                if self.transport == "stdio":
-                    await self._init_stdio()
-                elif self.transport == "sse":
-                    await self._init_sse()
-                else:
-                    logger.error(f"不支持的 transport: {self.transport}")
-                    return False
-
-                # 自动发现工具
-                await self._discover_tools()
-                self._initialized = True
-                logger.info(f"MCP [{self._name}] 初始化完成: {len(self._tools)} 个工具")
-                return True
-
-            except Exception as e:
-                logger.error(f"MCP [{self._name}] 初始化失败: {e}")
-                return False
-
-    async def _init_stdio(self):
-        """启动 stdio 子进程"""
-        if not self.command:
-            raise ValueError("stdio transport 需要 command 参数")
-
-        self._process = subprocess.Popen(
-            self.command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        logger.info(f"MCP [{self._name}] stdio 进程已启动: {' '.join(self.command)}")
-
-        # 检测进程是否立即退出（启动失败场景）
-        await asyncio.sleep(0.1)
-        if self._process.poll() is not None:
-            stderr_output = self._process.stderr.read() if self._process.stderr else ""
-            raise RuntimeError(
-                f"MCP 进程启动失败 (exit={self._process.returncode}): {stderr_output[:500]}"
-            )
-
-        # 启动 stderr 读取任务（防止缓冲区满阻塞子进程）
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
-
-    async def _drain_stderr(self):
-        """异步读取 stderr，防止管道缓冲区满阻塞子进程"""
-        if not self._process or not self._process.stderr:
-            return
-        try:
-            while self._process.poll() is None:
-                line = await asyncio.get_event_loop().run_in_executor(
-                    None, self._process.stderr.readline
-                )
-                if not line:
-                    break
-                line = line.strip()
-                if line:
-                    logger.debug(f"MCP [{self._name}] stderr: {line[:200]}")
-        except Exception as e:
-            logger.debug(f"MCP [{self._name}] stderr 读取异常: {e}")
-
-    async def _init_sse(self):
-        """初始化 SSE 连接"""
-        if not HAS_HTTPX:
-            raise ImportError("SSE transport 需要 httpx 库: pip install httpx")
-        if not self.url:
-            raise ValueError("SSE transport 需要 url 参数")
-
-        self._client = httpx.AsyncClient(timeout=self.timeout)
-        resp = await self._client.post(f"{self.url}/session", json={})
-        if resp.status_code == 200:
-            data = resp.json()
-            self._session_id = data.get("sessionId")
-            logger.info(f"MCP [{self._name}] SSE 会话已创建: {self._session_id}")
-
-    async def _discover_tools(self):
-        """调用 MCP list_tools 方法发现所有工具"""
-        result = await self._send_request("list_tools", {})
-        if result and "tools" in result:
-            self._tools = result["tools"]
-        else:
-            logger.warning(f"MCP [{self._name}] list_tools 返回空")
-
-    async def _send_request(self, method: str, params: Dict) -> Optional[Dict]:
-        """发送 MCP JSON-RPC 请求"""
-        request = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params,
-        }
-
-        if self.transport == "stdio":
-            return await self._send_stdio(request)
-        elif self.transport == "sse":
-            return await self._send_sse(request)
-        return None
-
-    async def _send_stdio(self, request: Dict) -> Optional[Dict]:
-        """通过 stdio 发送请求"""
-        if not self._process or not self._process.stdin:
-            return None
-
-        line = json.dumps(request, ensure_ascii=False) + "\n"
-        self._process.stdin.write(line)
-        self._process.stdin.flush()
-
-        response_line = self._process.stdout.readline() if self._process.stdout else ""
-        if response_line:
-            try:
-                return json.loads(response_line.strip())
-            except json.JSONDecodeError as e:
-                logger.error(f"MCP stdio 响应解析失败: {e}, 原始: {response_line[:200]}")
-        return None
-
-    async def _send_sse(self, request: Dict) -> Optional[Dict]:
-        """通过 SSE HTTP 发送请求"""
-        if not self._client:
-            return None
-
-        try:
-            resp = await self._client.post(
-                f"{self.url}/message",
-                json=request,
-                params={"sessionId": self._session_id} if self._session_id else {},
-            )
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as e:
-            logger.error(f"MCP SSE 请求失败: {e}")
-        return None
-
-    async def execute(self, call_id: str, **kwargs) -> ToolResult:
-        """执行 MCP 工具的某个子工具"""
-        tool_name = kwargs.get("tool", "")
-        tool_args = kwargs.get("args", {})
-
-        if not tool_name:
-            return ToolResult.error(call_id, self._name, "缺少 tool 参数")
-
-        # 确保已初始化
-        if not self._initialized:
-            ok = await self.initialize()
-            if not ok:
-                return ToolResult.error(call_id, self._name, "MCP 初始化失败")
-
-        # 检查工具是否存在
-        discovered = {t.get("name", "") for t in self._tools}
-        if tool_name not in discovered:
-            available = ", ".join(sorted(discovered)) if discovered else "(无)"
-            return ToolResult.error(
-                call_id, self._name,
-                f"子工具 '{tool_name}' 不存在。可用工具: {available}"
-            )
-
-        # 调用 MCP tool_call
-        result = await self._send_request("tools/call", {
-            "name": tool_name,
-            "arguments": tool_args,
-        })
-
-        if result is None:
-            return ToolResult.error(call_id, self._name, "MCP 调用无响应")
-
-        if "error" in result:
-            return ToolResult.error(call_id, self._name, str(result["error"]))
-
-        content = result.get("content", [])
-        # MCP 返回的 content 是 content item 列表，提取文本
-        texts = []
-        for item in content if isinstance(content, list) else [content]:
-            if isinstance(item, dict):
-                texts.append(item.get("text", str(item)))
-            else:
-                texts.append(str(item))
-
-        return ToolResult.success(call_id, self._name, {
-            "tool": tool_name,
-            "result": "\n".join(texts),
-        })
-
-    def get_discovered_tools(self) -> List[Dict]:
-        """获取自动发现的所有子工具列表"""
-        return self._tools.copy()
-
-    def expand_to_tools(self) -> List["MCPSubTool"]:
-        """
-        将 MCP 服务的子工具展开为独立的 MCPSubTool 实例。
-
-        这样 LLM 直接看到 `mcp_fs_read`、`mcp_fs_write` 等具体工具，
-        而不是一个 `mcp_fs(tool="...")` 二级调用。
-        """
-        sub_tools = []
-        for t in self._tools:
-            sub_tool = MCPSubTool(
-                parent=self,
-                sub_name=t.get("name", ""),
-                description=t.get("description", ""),
-                input_schema=t.get("inputSchema", {}),
-            )
-            sub_tools.append(sub_tool)
-        return sub_tools
-
-    def get_tool_names(self) -> List[str]:
-        """获取自动发现的工具名称列表"""
-        return [t.get("name", "") for t in self._tools]
-
-    async def aclose(self):
-        """异步关闭（在事件循环中使用，推荐）"""
-        if self._finalized:
-            return
-        self._finalized = True
-
-        # 取消 stderr 读取任务
-        if self._stderr_task and not self._stderr_task.done():
-            self._stderr_task.cancel()
-            try:
-                await self._stderr_task
-            except asyncio.CancelledError:
-                pass
-            self._stderr_task = None
-
-        if self._process:
-            try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
-            except Exception:
-                try:
-                    self._process.kill()
-                except Exception:
-                    pass
-            finally:
-                self._process = None
-
-        if self._client:
-            try:
-                await self._client.aclose()
-            except Exception:
-                pass
-            self._client = None
-
-        self._initialized = False
-        # 从全局清理列表移除
-        try:
-            _mcp_instances.remove(self)
-        except ValueError:
-            pass
-        logger.info(f"MCP [{self._name}] 已关闭")
-
-    def close(self):
-        """同步关闭（在非事件循环中使用）"""
-        if self._finalized:
-            return
-        self._finalized = True
-
-        # 取消 stderr 读取任务（尽力而为）
-        if self._stderr_task and not self._stderr_task.done():
-            self._stderr_task.cancel()
-            self._stderr_task = None
-
-        if self._process:
-            try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
-            except Exception:
-                try:
-                    self._process.kill()
-                except Exception:
-                    pass
-            finally:
-                self._process = None
-
-        if self._client:
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if not loop.is_running():
-                    loop.run_until_complete(self._client.aclose())
-            except RuntimeError:
-                # 没有可用的事件循环，直接跳过
-                pass
-            self._client = None
-
-        self._initialized = False
-        # 从全局清理列表移除
-        try:
-            _mcp_instances.remove(self)
-        except ValueError:
-            pass
-        logger.info(f"MCP [{self._name}] 已关闭")
-
-
-class MCPSubTool(BaseTool):
-    """
-    MCP 子工具包装——每个子工具独立注册，LLM 直接可见。
-
-    由 MCPToolAdapter.expand_to_tools() 生成。
-    执行时委托给父 adapter 处理。
-    """
-
-    def __init__(
-        self,
-        parent: MCPToolAdapter,
-        sub_name: str,
-        description: str = "",
-        input_schema: Optional[Dict] = None,
-    ):
-        self._parent = parent
-        self._sub_name = sub_name
-        self._desc = description
-        self._input_schema = input_schema or {}
-
-    @property
-    def name(self) -> str:
-        return f"{self._parent.name}_{self._sub_name}"
-
-    @property
-    def description(self) -> str:
-        return self._desc or f"MCP 子工具: {self._sub_name}"
-
-    @property
-    def parameters(self) -> List[ToolParameter]:
-        """从 MCP inputSchema 转换为 ToolParameter 列表"""
-        params = []
-        schema = self._input_schema
-        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        required_list = schema.get("required", []) if isinstance(schema, dict) else []
-
-        for pname, pinfo in properties.items():
-            if isinstance(pinfo, dict):
-                ptype = pinfo.get("type", "string")
-                pdesc = pinfo.get("description", "")
-            else:
-                ptype, pdesc = "string", ""
-            params.append(ToolParameter(
-                name=pname,
-                type=ptype,
-                description=pdesc,
-                required=pname in required_list,
-            ))
-        return params
-
-    async def execute(self, call_id: str, **kwargs) -> ToolResult:
-        """委托 parent 执行"""
-        # 先确保 parent 已初始化
-        if not self._parent._initialized:
-            ok = await self._parent.initialize()
-            if not ok:
-                return ToolResult.error(call_id, self.name, "MCP 初始化失败")
-
-        result = await self._parent._send_request("tools/call", {
-            "name": self._sub_name,
-            "arguments": kwargs,
-        })
-
-        if result is None:
-            return ToolResult.error(call_id, self.name, "MCP 调用无响应")
-
-        if "error" in result:
-            return ToolResult.error(call_id, self.name, str(result["error"]))
-
-        content = result.get("content", [])
-        texts = []
-        for item in content if isinstance(content, list) else [content]:
-            if isinstance(item, dict):
-                texts.append(item.get("text", str(item)))
-            else:
-                texts.append(str(item))
-
-        return ToolResult.success(call_id, self.name, {
-            "tool": self._sub_name,
-            "result": "\n".join(texts),
-        })
-
-    def close(self):
-        """委托到 parent 关闭"""
-        self._parent.close()
-
-
-================================================================================
-# FILE: tool\parser.py
-================================================================================
-"""
-engine/tool/parser.py — JSON 解析 + 结果格式化
-
-从 agent_loop.py 提取的 JSON 解析工具和 tool result 构建函数。
-"""
-
-import ast
-import json
-import logging
-import re
-from typing import Any, Dict, List, Optional, Tuple
-
-logger = logging.getLogger(__name__)
-
-
-def make_tool_result(call_id: str, content: str) -> Dict:
-    """统一构建 tool result 消息，确保永远不会漏掉 tool_call_id"""
-    return {
-        "role": "tool",
-        "tool_call_id": call_id or "",
-        "content": content,
-    }
-
-
-def parse_tool_args(
-    tool_name: str,
-    tool_args_raw: str,
-    tool_registry: Optional[Any] = None,
-) -> Tuple[Dict, bool]:
-    """多层 JSON 解析。
-    返回 (parsed_dict, ok)，不涉及 messages 副作用（由调用方处理）。
-    """
-    stripped = tool_args_raw.strip()
-
-    # 第 1 层：直接 json.loads
-    try:
-        parsed = json.loads(stripped)
-        if isinstance(parsed, dict):
-            return parsed, True
-    except json.JSONDecodeError:
-        pass
-
-    # 第 2 层：修复常见 JSON 错误后再试
-    try:
-        fixed = fix_common_json_errors(stripped)
-        parsed = json.loads(fixed)
-        if isinstance(parsed, dict):
-            return parsed, True
-    except (json.JSONDecodeError, Exception):
-        pass
-
-    # 第 3 层：ast.literal_eval（处理单引号等 Python 风格字典）
-    if stripped.startswith("{") and stripped.endswith("}") and len(stripped) < 10000:
-        try:
-            parsed = ast.literal_eval(stripped)
-            if isinstance(parsed, dict):
-                return parsed, True
-        except (ValueError, SyntaxError, MemoryError):
-            pass
-
-    # 第 4 层：正则修复 command 字段中未转义的双引号
-    try:
-        fixed = re.sub(
-            r'"command"\s*:\s*"(.+?)"(?=\s*[,}]|\s*\n\s*"(?!command))',
-            lambda m: f'"command": {json.dumps(m.group(1))}',
-            stripped,
-            flags=re.DOTALL,
-        )
-        parsed = json.loads(fixed)
-        if isinstance(parsed, dict):
-            return parsed, True
-    except (json.JSONDecodeError, Exception):
-        pass
-
-    # 全部失败
-    return {}, False
-
-
-def get_tool_param_hint(tool_registry: Any, tool_name: str) -> str:
-    """获取工具的参数格式提示。"""
-    if tool_registry is None:
-        return ""
-    tool_def = (
-        tool_registry.get_tool_def(tool_name)
-        if hasattr(tool_registry, "get_tool_def") else None
-    )
-    if tool_def and hasattr(tool_def, "parameters"):
-        param_lines = []
-        for p in tool_def.parameters:
-            req = "(必填)" if getattr(p, "required", False) else "(可选)"
-            desc = getattr(p, "description", "")[:80]
-            param_lines.append(f"  - {p.name} {req}: {desc}")
-        if param_lines:
-            return "\n期望参数格式:\n" + "\n".join(param_lines)
-    return ""
-
-
-def fix_common_json_errors(raw: str) -> str:
-    """修复常见 JSON 格式错误。"""
-    # 移除尾部逗号: ,} → } 和 ,] → ]
-    raw = re.sub(r",\s*}", "}", raw)
-    raw = re.sub(r",\s*]", "]", raw)
-
-    # 单引号 → 双引号（仅在看起来像 Python 字典时）
-    if "'" in raw and '"' not in raw:
-        raw = raw.replace("'", '"')
-
-    # 修复 True/False/None → true/false/null（Python → JSON）
-    raw = re.sub(r"\bTrue\b", "true", raw)
-    raw = re.sub(r"\bFalse\b", "false", raw)
-    raw = re.sub(r"\bNone\b", "null", raw)
-
-    return raw
-
-
-================================================================================
-# FILE: tool\policy.py
-================================================================================
-"""
-tool/policy.py — 工具权限策略
-
-定义工具的访问控制：
-- ALLOW: 无条件允许
-- DENY: 无条件拒绝
-- REQUIRE_APPROVAL: 需要人类审批
-
-使用方式：
-    policy = ToolPolicy()
-    policy.set("shell_execute", AccessLevel.REQUIRE_APPROVAL)
-    policy.set("file_write", AccessLevel.REQUIRE_APPROVAL)
-
-    executor = ToolExecutor(registry, policy=policy)
-"""
-
-from dataclasses import dataclass, field
-from typing import Dict, Optional
-from enum import Enum
-import logging
-
-logger = logging.getLogger(__name__)
-
-
-class AccessLevel(Enum):
-    ALLOW = "allow"
-    DENY = "deny"
-    REQUIRE_APPROVAL = "require_approval"
-
-
-DEFAULT_POLICY: Dict[str, AccessLevel] = {
-    # Shell — 默认禁止，需显式授权
-    "shell_execute": AccessLevel.DENY,
-    "shell_run": AccessLevel.REQUIRE_APPROVAL,
-
-    # 文件写操作 — 默认需审批
-    "file_write": AccessLevel.REQUIRE_APPROVAL,
-    "file_append": AccessLevel.REQUIRE_APPROVAL,
-
-    # 代码编辑 — 默认需审批（小修改动态放行）
-    "code_write": AccessLevel.REQUIRE_APPROVAL,
-    "code_create": AccessLevel.REQUIRE_APPROVAL,
-    "code_append": AccessLevel.REQUIRE_APPROVAL,
-
-    # 进程管理 — 默认禁止
-    "process_list": AccessLevel.DENY,
-
-    # Git 写操作 — 默认需审批
-    "git_commit": AccessLevel.REQUIRE_APPROVAL,
-    "git_push": AccessLevel.REQUIRE_APPROVAL,
-
-    # 其余工具默认 allow
-}
-
-
-@dataclass
-class ToolPolicy:
-    """
-    工具权限策略
-
-    支持规则的动态添加和查询。
-    approve() 和 deny() 用于在运行时临时覆盖（如人类确认后）。
-    """
-
-    _rules: Dict[str, AccessLevel] = field(default_factory=lambda: dict(DEFAULT_POLICY))
-    _pending_approvals: Dict[str, str] = field(default_factory=dict)  # tool_name -> call_id
-
-    def get(self, tool_name: str) -> AccessLevel:
-        """获取工具的访问级别"""
-        return self._rules.get(tool_name, AccessLevel.ALLOW)
-
-    def set(self, tool_name: str, level: AccessLevel) -> None:
-        """设置工具的访问级别"""
-        self._rules[tool_name] = level
-        logger.info(f"策略: {tool_name} -> {level.value}")
-
-    def check(self, tool_name: str, call_id: str = "") -> AccessLevel:
-        """
-        检查工具是否允许执行
-
-        Returns:
-            AccessLevel: ALLOW / DENY / REQUIRE_APPROVAL
-        """
-        level = self.get(tool_name)
-
-        if level == AccessLevel.DENY:
-            logger.warning(f"🔒 工具被禁止: {tool_name}")
-        elif level == AccessLevel.REQUIRE_APPROVAL:
-            self._pending_approvals[call_id] = tool_name
-            logger.info(f"📝 需要审批: {tool_name} (call_id={call_id[:12]})")
-
-        return level
-
-    def check_dynamic(self, tool_name: str, tool_args: Dict, call_id: str = "") -> AccessLevel:
-        """
-        带参数感知的动态检查。
-
-        某些工具在小修改时自动放行（如 code_write ≤50 行）。
-        """
-        # code_write/code_append/code_create: 小修改自动放行
-        if tool_name in ("code_write", "code_append", "code_create"):
-            new_text = tool_args.get("new_text", "")
-            if isinstance(new_text, str):
-                line_count = len(new_text.splitlines())
-                if line_count <= 50:
-                    return AccessLevel.ALLOW
-
-        return self.check(tool_name, call_id)
-
-    def approve(self, call_id: str) -> bool:
-        """批准一个待审批的调用"""
-        if call_id in self._pending_approvals:
-            tool_name = self._pending_approvals.pop(call_id)
-            logger.info(f"✅ 已批准: {tool_name}")
-            return True
-        return False
-
-    def deny(self, call_id: str) -> bool:
-        """拒绝一个待审批的调用"""
-        if call_id in self._pending_approvals:
-            tool_name = self._pending_approvals.pop(call_id)
-            logger.info(f"❌ 已拒绝: {tool_name}")
-            return True
-        return False
-
-    def reset(self) -> None:
-        """重置为默认策略"""
-        self._rules = dict(DEFAULT_POLICY)
-        self._pending_approvals.clear()
-        logger.info("策略已重置为默认值")
-
-
-================================================================================
-# FILE: tool\registry.py
-================================================================================
-"""
-工具注册中心 — v3.0 原子工具扁平化
-
-设计：
-  - 注册的是工具大类（BaseTool 子类）
-  - 导出的是扁平化原子工具列表（供 LLM 调用）
-  - 执行时按原子工具名路由到对应大类的 handler
-"""
-
-import json
-import logging
-import re
-import time
-from typing import Dict, List, Optional, Type, Any
-
-from .base import BaseTool, ToolDefinition
-
-logger = logging.getLogger("ToolRegistry")
-
-
-class ToolRegistry:
-    """
-    工具注册中心
-
-    注册大类 → 导出原子工具 → 按名执行
-    """
-
-    _instance: Optional["ToolRegistry"] = None
-    _singleton_enabled: bool = True  # 类变量控制，测试时可禁用
-
-    def __new__(cls):
-        if cls._singleton_enabled and cls._instance is not None:
-            return cls._instance
-        instance = super().__new__(cls)
-        if cls._singleton_enabled:
-            cls._instance = instance
-            instance._initialized = False
-        else:
-            instance._initialized = False
-        return instance
-
-    @classmethod
-    def disable_singleton(cls):
-        """测试用：禁用单例模式，允许创建独立实例"""
-        cls._singleton_enabled = False
-        cls._instance = None
-
-    @classmethod
-    def enable_singleton(cls):
-        """恢复单例模式"""
-        cls._singleton_enabled = True
-        cls._instance = None
-
-    def __init__(self):
-        if self._initialized:
-            return
-
-        # 大类注册表: {namespace: (tool_class, init_kwargs)}
-        self._categories: Dict[str, tuple] = {}
-
-        # 大类实例缓存: {namespace: instance}
-        self._instances: Dict[str, BaseTool] = {}
-
-        # 扁平化原子工具: {atomic_name: (namespace, ToolDefinition)}
-        self._atomic_tools: Dict[str, tuple] = {}
-
-        # OpenAI 格式缓存
-        self._openai_cache: Optional[List[Dict]] = None
-
-        # 结果缓存
-        self._result_cache: Dict[str, tuple] = {}
-        self._result_cache_ttl: float = 300.0
-
-        self._lock = __import__('threading').Lock()
-
-        self._initialized = True
-        logger.debug("ToolRegistry v3 初始化（原子工具扁平化）")
-
-    @classmethod
-    def reset(cls):
-        if cls._instance:
-            cls._instance.clear()
-        cls._instance = None
-
-    # ── 注册（懒加载）──
-
-    def register(self, tool_class: Type[BaseTool], **init_kwargs) -> "ToolRegistry":
-        """注册工具大类"""
-        with self._lock:
-            try:
-                temp = tool_class(**init_kwargs)
-                ns = temp.name
-            except Exception as e:
-                logger.error(f"实例化失败 {tool_class.__name__}: {e}")
-                return self
-
-            self._categories[ns] = (tool_class, dict(init_kwargs))
-            self._instances.pop(ns, None)
-            self._atomic_tools.clear()
-            self._openai_cache = None
-
-            # 校验工具名规范
-            if not re.match(r'^[a-z][a-z0-9_]*$', ns):
-                logger.warning(f"大类名 '{ns}' 非 snake_case")
-
-            logger.debug(f"注册大类: {ns}")
-        return self
-
-    def register_many(self, tool_classes: List[Type[BaseTool]]) -> "ToolRegistry":
-        for tc in tool_classes:
-            self.register(tc)
-        return self
-
-    def register_with_config(self, config: Dict[Type[BaseTool], Dict]) -> "ToolRegistry":
-        for tc, kwargs in config.items():
-            self.register(tc, **kwargs)
-        return self
-
-    # ── 获取实例（懒加载）──
-
-    def _get_instance(self, namespace: str) -> Optional[BaseTool]:
-        if namespace in self._instances:
-            return self._instances[namespace]
-
-        if namespace in self._categories:
-            cls, kwargs = self._categories[namespace]
-            try:
-                inst = cls(**kwargs)
-                self._instances[namespace] = inst
-                return inst
-            except Exception as e:
-                logger.error(f"实例化失败 {namespace}: {e}")
-        return None
-
-    # ── 扁平化原子工具 ──
-
-    def _build_flattened_index(self):
-        """构建扁平化原子工具索引"""
-        if self._atomic_tools:
-            return
-
-        for ns in self._categories:
-            inst = self._get_instance(ns)
-            if not inst:
-                continue
-
-            tool_defs = inst.tools if callable(inst.tools) else inst.tools
-            for td in tool_defs:
-                if td.name in self._atomic_tools:
-                    prev_ns = self._atomic_tools[td.name][0]
-                    logger.warning(f"原子工具 '{td.name}' 冲突: {prev_ns} vs {ns}")
-                self._atomic_tools[td.name] = (ns, td)
-
-    # ── 查询 ──
-
-    def list_tools(self) -> List[str]:
-        """列出所有原子工具名"""
-        self._build_flattened_index()
-        return list(self._atomic_tools.keys())
-
-    def list_categories(self) -> List[str]:
-        """列出所有大类名"""
-        return list(self._categories.keys())
-
-    def get_all_definitions(self) -> List[ToolDefinition]:
-        """获取所有原子工具定义"""
-        self._build_flattened_index()
-        return [td for _, td in sorted(self._atomic_tools.values(), key=lambda x: x[0])]
-
-    def get_openai_tools(self) -> List[Dict]:
-        """获取 OpenAI 格式的工具列表（带缓存）"""
-        if self._openai_cache:
-            return self._openai_cache
-
-        defs = self.get_all_definitions()
-        result = [td.to_openai_format() for td in defs]
-        self._openai_cache = result
-        return result
-
-    def get(self, atomic_name: str) -> Optional[BaseTool]:
-        """【向后兼容】通过原子工具名获取所属大类的实例"""
-        self._build_flattened_index()
-        entry = self._atomic_tools.get(atomic_name)
-        if entry:
-            ns = entry[0]
-            return self._get_instance(ns)
-        return None
-
-    def get_tool_def(self, atomic_name: str) -> Optional[ToolDefinition]:
-        """获取原子工具定义"""
-        self._build_flattened_index()
-        entry = self._atomic_tools.get(atomic_name)
-        return entry[1] if entry else None
-
-    def is_read_tool(self, atomic_name: str) -> bool:
-        """判断原子工具是否只读"""
-        td = self.get_tool_def(atomic_name)
-        return td.is_read if td else False
-
-    def has_tool(self, atomic_name: str) -> bool:
-        self._build_flattened_index()
-        return atomic_name in self._atomic_tools
-
-    def count_atomic(self) -> int:
-        self._build_flattened_index()
-        return len(self._atomic_tools)
-
-    def count_categories(self) -> int:
-        return len(self._categories)
-
-    # ── 执行 ──
-
-    async def execute(self, atomic_name: str, call_id: str, **kwargs) -> Any:
-        """执行原子工具
-
-        Args:
-            atomic_name: 原子工具名（如 "excel_read_sheet"）
-            call_id: 调用 ID
-            **kwargs: 工具参数
-        Returns:
-            ToolResult
-        """
-        self._build_flattened_index()
-        entry = self._atomic_tools.get(atomic_name)
-        if not entry:
-            raise ValueError(f"未知工具: {atomic_name}")
-
-        ns, td = entry
-        inst = self._get_instance(ns)
-        if not inst:
-            raise ValueError(f"无法实例化工具类: {ns}")
-
-        return await inst.execute(call_id, atomic_name, **kwargs)
-
-    # ── 状态 ──
-
-    def get_status(self) -> Dict:
-        return {
-            "categories": self.count_categories(),
-            "atomic_tools": self.count_atomic(),
-            "names": self.list_tools(),
-            "category_list": self.list_categories(),
-        }
-
-    # ── 结果缓存 ──
-
-    def get_cached_result(self, tool_name: str, args: Dict) -> Optional[Any]:
-        key = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
-        entry = self._result_cache.get(key)
-        if not entry:
-            return None
-        cached_at, result = entry
-        if time.monotonic() - cached_at > self._result_cache_ttl:
-            self._result_cache.pop(key, None)
-            return None
-        return result
-
-    def cache_result(self, tool_name: str, args: Dict, result: Any) -> None:
-        key = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
-        self._result_cache[key] = (time.monotonic(), result)
-        if len(self._result_cache) > 1000:
-            sorted_items = sorted(
-                self._result_cache.items(),
-                key=lambda x: x[1][0],
-            )
-            for k, _ in sorted_items[:len(sorted_items) // 2]:
-                self._result_cache.pop(k, None)
-
-    # ── 校验 ──
-
-    def validate_all(self) -> List[str]:
-        """检查所有工具的一致性"""
-        issues = []
-        self._build_flattened_index()
-
-        seen_names = {}
-        for atomic_name, (ns, td) in self._atomic_tools.items():
-            # 命名重复检查
-            if atomic_name in seen_names:
-                issues.append(f"原子工具名冲突: '{atomic_name}' (大类 {seen_names[atomic_name]} vs {ns})")
-            seen_names[atomic_name] = ns
-
-            # 规范检查
-            if not re.match(r'^[a-z][a-z0-9_]*$', atomic_name):
-                issues.append(f"'{atomic_name}': 名称非 snake_case")
-
-        return issues
-
-    # ── 管理 ──
-
-    def remove(self, ns: str) -> bool:
-        with self._lock:
-            self._categories.pop(ns, None)
-            self._instances.pop(ns, None)
-            self._atomic_tools.clear()
-            self._openai_cache = None
-        return ns not in self._categories
-
-    def clear_cache(self):
-        with self._lock:
-            self._instances.clear()
-            self._atomic_tools.clear()
-            self._openai_cache = None
-
-    def clear(self):
-        with self._lock:
-            self._categories.clear()
-            self._instances.clear()
-            self._atomic_tools.clear()
-            self._openai_cache = None
-
-    def print_summary(self) -> None:
-        status = self.get_status()
-        logger.info(
-            f"ToolRegistry v3: {status['categories']} 个大类, "
-            f"{status['atomic_tools']} 个原子工具"
-        )
-        for ns in sorted(self.list_categories()):
-            inst = self._get_instance(ns)
-            tool_names = inst.get_tool_names() if inst else []
-            logger.info(f"  📦 {ns} ({len(tool_names)} 个工具): {', '.join(tool_names)}")
-
-
-================================================================================
-# FILE: tracer.py
-================================================================================
-"""
-engine/tracer.py — Agent 轻量级可观测性追踪器
-
-零外部依赖，基于 dataclass + time 实现。
-全局单例 tracer。
-
-用法:
-  from engine.tracer import tracer
-  tracer.start_trace(request_id)
-  tracer.start_span(request_id, name, type)
-  ... do work ...
-  tracer.end_span(request_id, tokens_prompt=..., tokens_completion=..., model=...)
-  tracer.print_summary(request_id)
-"""
-
-from __future__ import annotations
-
-import json
-import logging
-import time
-from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
-
-logger = logging.getLogger(__name__)
-
-
-# ── 模型定价表 ──────────────────────────────────
-# (input_price_per_1M, output_price_per_1M) 美元
-MODEL_PRICES: Dict[str, tuple[float, float]] = {
-    # DeepSeek
-    "deepseek-chat": (0.14, 0.28),
-    "deepseek-reasoner": (0.55, 2.19),
-    # OpenAI
-    "gpt-4o": (2.50, 10.00),
-    "gpt-4o-2024-08-06": (2.50, 10.00),
-    "gpt-4o-mini": (0.15, 0.60),
-    "gpt-4o-mini-2024-07-18": (0.15, 0.60),
-    "gpt-3.5-turbo": (0.50, 1.50),
-    # 通用 fallback
-    "default": (0.50, 1.50),
-}
-
-
-@dataclass
-class TraceSpan:
-    """追踪的一个 Span（节点、LLM 调用、工具调用等）"""
-    name: str
-    type: str                         # llm | tool | node | graph | router
-    start_time: float                 # time.time()
-    end_time: Optional[float] = None
-    tokens_prompt: int = 0
-    tokens_completion: int = 0
-    cost: float = 0.0
-    error: Optional[str] = None
-    model: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def duration_ms(self) -> float:
-        if self.end_time:
-            return (self.end_time - self.start_time) * 1000
-        return 0.0
-
-    @property
-    def total_tokens(self) -> int:
-        return self.tokens_prompt + self.tokens_completion
-
-
-class AgentTracer:
-    """
-    轻量级 Agent 追踪器
-
-    用法：
-        tracer = AgentTracer()
-
-        # 开始一次完整追踪
-        tracer.start_trace("req_abc123")
-
-        # 开始一个 Span
-        tracer.start_span("req_abc123", "think", "llm")
-
-        # ... 执行 LLM 调用 ...
-
-        # 结束 Span
-        tracer.end_span("req_abc123", model="gpt-4o",
-                        tokens_prompt=100, tokens_completion=50)
-
-        # 打印摘要
-        tracer.print_summary("req_abc123")
-    """
-
-    MAX_TRACES = 1000  # 追踪数量上限，防止内存无限增长
-
-    def __init__(self):
-        self.traces: Dict[str, List[TraceSpan]] = {}
-        self._active_stacks: Dict[str, List[TraceSpan]] = defaultdict(list)
-        # request_id -> 创建时间，用于总时长计算
-        self._started_at: Dict[str, float] = {}
-
-    # ── 生命周期 ──
-
-    def start_trace(self, request_id: str) -> None:
-        """开始一次完整追踪"""
-        # 超过上限时，清理最早的追踪
-        if len(self.traces) >= self.MAX_TRACES:
-            oldest_key = min(
-                self.traces.keys(),
-                key=lambda k: self._started_at.get(k, 0)
-            )
-            self.cleanup(oldest_key)
-
-        self.traces[request_id] = []
-        self._started_at[request_id] = time.time()
-
-    def cleanup(self, request_id: str) -> None:
-        """清理指定追踪的数据，释放内存"""
-        self.traces.pop(request_id, None)
-        self._active_stacks.pop(request_id, None)
-        self._started_at.pop(request_id, None)
-
-    def start_span(self, request_id: str, name: str, span_type: str) -> None:
-        """
-        开始一个 Span
-
-        Args:
-            request_id: 追踪 ID
-            name: Span 名称（如节点名）
-            span_type: 类型（"llm"、"tool"、"node"、"router"、"graph"）
-        """
-        span = TraceSpan(name=name, type=span_type, start_time=time.time())
-        self._active_stacks[request_id].append(span)
-
-    def end_span(self, request_id: str, **kwargs) -> None:
-        """
-        结束当前活跃的 Span
-
-        可接受的 kwargs：
-            model: str               — LLM 模型名
-            tokens_prompt: int       — 输入 token 数
-            tokens_completion: int   — 输出 token 数
-            error: str               — 错误信息
-            metadata: dict           — 附加元数据
-        """
-        stack = self._active_stacks.get(request_id)
-        if not stack:
-            logger.warning(f"[tracer] end_span 无活跃 span: {request_id}")
-            return
-
-        span = stack.pop()
-        span.end_time = time.time()
-
-        # 注入 kwargs
-        for key, val in kwargs.items():
-            if key == "metadata" and isinstance(val, dict):
-                span.metadata.update(val)
-            elif hasattr(span, key):
-                setattr(span, key, val)
-
-        # 自动计算成本
-        if span.type == "llm":
-            span.cost = self._calculate_cost(
-                span.model or "default",
-                span.tokens_prompt,
-                span.tokens_completion,
-            )
-
-        self.traces[request_id].append(span)
-        logger.debug(f"[tracer] span done: {span.type}:{span.name} "
-                     f"{span.duration_ms:.0f}ms tokens={span.total_tokens} "
-                     f"cost=${span.cost:.6f}")
-
-    # ── 查询 ──
-
-    def get_summary(self, request_id: str) -> Optional[Dict[str, Any]]:
-        """生成追踪摘要（可用于前端渲染或日志输出）"""
-        spans = self.traces.get(request_id)
-        if spans is None:
-            return None
-
-        started = self._started_at.get(request_id, 0)
-        total_duration = (time.time() - started) * 1000 if started else 0
-
-        total_cost = sum(s.cost for s in spans)
-        total_tokens = sum(s.total_tokens for s in spans)
-        errors = [s for s in spans if s.error]
-
-        # 按类型分组
-        by_type: Dict[str, list] = defaultdict(list)
-        for s in spans:
-            by_type[s.type].append(s)
-
-        span_entries = []
-        for s in spans:
-            span_entries.append({
-                "name": s.name,
-                "type": s.type,
-                "duration_ms": round(s.duration_ms, 1),
-                "tokens_prompt": s.tokens_prompt,
-                "tokens_completion": s.tokens_completion,
-                "total_tokens": s.total_tokens,
-                "cost": round(s.cost, 6),
-                "error": s.error,
-                "model": s.model,
-            })
-
-        return {
-            "request_id": request_id,
-            "total_duration_ms": round(total_duration, 1),
-            "total_tokens": total_tokens,
-            "total_cost": round(total_cost, 6),
-            "total_cost_display": f"${total_cost:.6f}",
-            "span_count": len(spans),
-            "error_count": len(errors),
-            "by_type": {t: len(v) for t, v in by_type.items()},
-            "spans": span_entries,
-        }
-
-    def print_summary(self, request_id: str) -> None:
-        """将追踪摘要打印到控制台"""
-        summary = self.get_summary(request_id)
-        if not summary:
-            return
-
-        # 计算各类型的图标
-        icons = {
-            "llm": "🧠",
-            "tool": "🔧",
-            "node": "📦",
-            "router": "🔀",
-            "graph": "🌐",
-        }
-
-        print(f"\n{'=' * 60}")
-        print(f"📊 Agent Trace: {summary['request_id']}")
-        print(f"  总耗时: {summary['total_duration_ms']:.0f}ms")
-        print(f"  总Token: {summary['total_tokens']:,}")
-        print(f"  总成本: {summary['total_cost_display']}")
-        print(f"  Spans: {summary['span_count']} | Errors: {summary['error_count']} | "
-              f"类型: {summary['by_type']}")
-        print(f"{'─' * 60}")
-
-        for span in summary["spans"]:
-            icon = icons.get(span["type"], "•")
-            status = "❌" if span["error"] else "✅"
-            token_info = f" tokens={span['total_tokens']}" if span["total_tokens"] else ""
-            model_info = f" [{span['model']}]" if span["model"] else ""
-            error_info = f" | {span['error'][:40]}" if span["error"] else ""
-
-            print(f"  {icon} {span['name']:20s} "
-                  f"{span['duration_ms']:6.0f}ms "
-                  f"${span['cost']:.6f}{token_info}{model_info}"
-                  f" {status}{error_info}")
-
-        print(f"{'=' * 60}\n")
-
-    def to_json(self, request_id: str) -> Optional[str]:
-        """导出为 JSON 字符串"""
-        summary = self.get_summary(request_id)
-        if not summary:
-            return None
-        return json.dumps(summary, ensure_ascii=False, indent=2)
-
-    # ── 内部方法 ──
-
-    @staticmethod
-    def _calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-        """计算 LLM 调用成本"""
-        prices = MODEL_PRICES.get(model) or MODEL_PRICES.get("default")
-        if not prices:
-            return 0.0
-        input_price, output_price = prices
-        cost = (
-            (prompt_tokens / 1_000_000) * input_price
-            + (completion_tokens / 1_000_000) * output_price
-        )
-        return round(cost, 6)
-
-
-# 全局单例
-tracer = AgentTracer()
 
 

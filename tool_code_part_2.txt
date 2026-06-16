@@ -1,4 +1,657 @@
 ================================================================================
+# FILE: pdf_tool.py
+================================================================================
+"""
+PDF 工具（原子工具版）
+
+原子工具:
+  pdf_read    — 读取 PDF 文件内容
+  pdf_split   — 拆分 PDF 文件
+  pdf_concat  — 合并多个 PDF 文件
+
+v3.1: 新增 pdf_split / pdf_concat；PyPDF2 → pypdf 迁移
+"""
+
+import os
+import logging
+from typing import Any, Dict, List, Tuple
+
+from engine.tool.base import BaseTool, ToolDefinition, ToolParameter, ToolResult
+
+# PyPDF2 已停止维护，迁移到 pypdf（API 完全兼容）
+try:
+    import pypdf as PyPDF2
+except ImportError:
+    import PyPDF2
+
+logger = logging.getLogger("jarvis.tools.pdf")
+
+
+class PdfTool(BaseTool):
+    """PDF 文档工具集"""
+
+    def __init__(self):
+        self._handlers = {
+            "pdf_read": self._handle_read,
+            "pdf_split": self._handle_split,
+            "pdf_concat": self._handle_concat,
+        }
+
+    @property
+    def name(self) -> str:
+        return "pdf"
+
+    @property
+    def category(self) -> str:
+        return "data"
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="pdf_read",
+                description="""读取 PDF 文件内容，支持文本提取、表格提取、扫描件检测。
+
+自动降级：优先使用 pdfplumber（高质量），回退到 pypdf（基础提取）。
+
+使用场景：
+- 读取 PDF 文档的文本内容
+- 提取 PDF 中的表格数据（银行询证函、财务报表等建议开启 extract_tables）
+- 按关键词过滤页面（如只读取含 "总计" 的页面）
+
+不适用场景：
+- 扫描件 PDF（图片类 PDF）→ 检测到扫描件会自动提示""",
+                parameters=[
+                    ToolParameter("path", "string", "PDF 文件路径", required=True),
+                    ToolParameter("max_pages", "number", "最大读取页数，默认 10。长文档可适当增加", required=False),
+                    ToolParameter("extract_tables", "boolean", "是否提取表格数据（含表格的 PDF 建议开启），默认 false", required=False),
+                    ToolParameter("keywords", "string", "逗号分隔的关键词列表，只保留含这些词的页面（如 '总计,合计,金额'）", required=False),
+                ],
+                is_read=True,
+                examples=[
+                    'pdf_read(path="report.pdf")',
+                    'pdf_read(path="invoice.pdf", max_pages=5, extract_tables=True)  # 读取前5页并提取表格',
+                    'pdf_read(path="report.pdf", keywords="总计,结论", max_pages=20)  # 只读含关键词的页面',
+                ],
+                constraints=[
+                    "扫描件 PDF 无法提取文字，会返回提示信息",
+                    "表格提取仅当 extract_tables=True 时生效",
+                    "大文件（100+页）建议限制 max_pages",
+                    "需要安装 pdfplumber 和 pypdf：pip install pdfplumber pypdf",
+                ],
+            ),
+            ToolDefinition(
+                name="pdf_split",
+                description="""拆分 PDF 文件为多个子文件。
+
+两种拆分方式：
+1. 指定页码范围：ranges="1-3,5,8-10"（提取指定页面）
+2. 按固定页数拆分：split_size=10（每 10 页一个文件）
+
+支持两种方式混用。""",
+                parameters=[
+                    ToolParameter("path", "string", "源 PDF 文件路径", required=True),
+                    ToolParameter("output_dir", "string", "输出目录路径（自动创建）", required=True),
+                    ToolParameter("ranges", "string", "页码范围，如 '1-3,5,8-10'。不填则按 split_size 拆分", required=False),
+                    ToolParameter("split_size", "number", "无 ranges 时，按此页数拆分（每 N 页一个文件），默认 10", required=False),
+                ],
+                examples=[
+                    'pdf_split(path="report.pdf", output_dir="./parts", ranges="1-5,8-10")',
+                    'pdf_split(path="report.pdf", output_dir="./parts", split_size=20)  # 每20页一个文件',
+                ],
+                constraints=[
+                    "会产生临时文件，使用后注意清理",
+                    "页码从 1 开始计数",
+                ],
+            ),
+            ToolDefinition(
+                name="pdf_concat",
+                description="""合并多个 PDF 文件为一个新文件。
+按 paths 列表顺序合并页面。
+
+使用场景：
+- 合并多个 PDF 报告为一个文件
+- 将拆分后的文件重新合并""",
+                parameters=[
+                    ToolParameter("paths", "array", "要合并的 PDF 文件路径列表（按顺序合并）", required=True),
+                    ToolParameter("output_path", "string", "合并后的输出文件路径", required=True),
+                ],
+                examples=[
+                    'pdf_concat(paths=["part1.pdf", "part2.pdf"], output_path="merged.pdf")',
+                ],
+                constraints=[
+                    "所有输入文件必须存在，否则合并失败",
+                    "按 paths 列表顺序合并，不是按文件名排序",
+                ],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return handler(call_id, **kwargs)
+        except Exception as e:
+            logger.exception(f"PDF 工具 {tool_name} 异常")
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    # ==================== pdf_read ====================
+
+    def _handle_read(self, call_id: str, path: str, max_pages: int = 10,
+                     extract_tables: bool = False, keywords: str = "") -> ToolResult:
+        if not path or not os.path.exists(path):
+            return ToolResult.fail(call_id, "pdf_read", f"文件不存在: {path}")
+
+        meta = self._extract_metadata(path)
+        is_scanned = self._is_likely_scanned(path)
+
+        result = {
+            "path": path,
+            **meta,
+            "is_scanned": is_scanned,
+            "pages": [],
+            "tables": [],
+        }
+
+        if is_scanned:
+            result["_hint"] = "检测为扫描件（图片类PDF），文本提取可能为空。建议使用 OCR 工具。"
+            return ToolResult.ok(call_id, "pdf_read", result)
+
+        try:
+            import pdfplumber
+            with pdfplumber.open(path) as pdf:
+                total = len(pdf.pages)
+                result["page_count"] = total
+                pages_to_read = min(max_pages, total)
+
+                for i in range(pages_to_read):
+                    page = pdf.pages[i]
+                    text = page.extract_text() or ""
+                    tables = page.extract_tables() if extract_tables else []
+
+                    page_data = {
+                        "page_num": i + 1,
+                        "text": text[:3000] if text else "",
+                        "chars": len(text),
+                    }
+                    if tables:
+                        page_data["tables"] = [self._table_to_text(t) for t in tables]
+                        result["tables"].extend(page_data["tables"])
+                    result["pages"].append(page_data)
+
+                return ToolResult.ok(call_id, "pdf_read", result)
+
+        except ImportError:
+            logger.warning("pdfplumber 未安装，降级到 pypdf")
+            return self._read_with_pypdf2(call_id, path, max_pages)
+        except Exception as e:
+            return ToolResult.fail(call_id, "pdf_read", str(e))
+
+    def _read_with_pypdf2(self, call_id: str, path: str, max_pages: int) -> ToolResult:
+        try:
+            with open(path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                total = len(reader.pages)
+                result = {"path": path, "page_count": total, "engine": "pypdf (降级)", "pages": []}
+                pages_to_read = min(max_pages, total)
+
+                for i in range(pages_to_read):
+                    page = reader.pages[i]
+                    text = page.extract_text() or ""
+                    page_data = {"page_num": i + 1, "text": text[:3000], "chars": len(text)}
+                    result["pages"].append(page_data)
+
+                return ToolResult.ok(call_id, "pdf_read", result)
+
+        except ImportError:
+            return ToolResult.fail(call_id, "pdf_read", "需要 pdfplumber 或 pypdf: pip install pdfplumber pypdf")
+        except Exception as e:
+            return ToolResult.fail(call_id, "pdf_read", str(e))
+
+    # ==================== pdf_split ====================
+
+    def _handle_split(self, call_id: str, path: str, output_dir: str,
+                      ranges: str = "", split_size: int = 10) -> ToolResult:
+        if not os.path.exists(path):
+            return ToolResult.fail(call_id, "pdf_split", f"文件不存在: {path}")
+
+        try:
+            reader = PyPDF2.PdfReader(path)
+            total_pages = len(reader.pages)
+
+            # 解析拆分范围
+            if ranges:
+                split_ranges = self._parse_page_ranges(ranges, total_pages)
+            else:
+                split_ranges = [
+                    (i, min(i + split_size - 1, total_pages - 1))
+                    for i in range(0, total_pages, split_size)
+                ]
+
+            if not split_ranges:
+                return ToolResult.fail(call_id, "pdf_split", "未能解析出有效的页码范围")
+
+            os.makedirs(output_dir, exist_ok=True)
+            base_name = os.path.splitext(os.path.basename(path))[0]
+            generated_files = []
+
+            for idx, (start, end) in enumerate(split_ranges):
+                writer = PyPDF2.PdfWriter()
+                for page_num in range(start, end + 1):
+                    writer.add_page(reader.pages[page_num])
+
+                out_name = f"{base_name}_part{idx + 1}_p{start + 1}-{end + 1}.pdf"
+                out_path = os.path.join(output_dir, out_name)
+
+                with open(out_path, "wb") as f:
+                    writer.write(f)
+                generated_files.append(out_path)
+
+            return ToolResult.ok(call_id, "pdf_split", {
+                "source": path,
+                "output_dir": output_dir,
+                "generated_files": generated_files,
+                "total_parts": len(generated_files),
+            })
+
+        except Exception as e:
+            return ToolResult.fail(call_id, "pdf_split", f"拆分失败: {e}")
+
+    # ==================== pdf_concat ====================
+
+    def _handle_concat(self, call_id: str, paths: List[str], output_path: str) -> ToolResult:
+        if not paths:
+            return ToolResult.fail(call_id, "pdf_concat", "文件列表不能为空")
+
+        writer = PyPDF2.PdfWriter()
+        merged_files = []
+
+        for p in paths:
+            if not os.path.exists(p):
+                return ToolResult.fail(call_id, "pdf_concat", f"文件不存在: {p}")
+            try:
+                reader = PyPDF2.PdfReader(p)
+                for page in reader.pages:
+                    writer.add_page(page)
+                merged_files.append(p)
+            except Exception as e:
+                return ToolResult.fail(call_id, "pdf_concat", f"读取 {p} 失败: {e}")
+
+        try:
+            out_dir = os.path.dirname(os.path.abspath(output_path))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(output_path, "wb") as f:
+                writer.write(f)
+        except Exception as e:
+            return ToolResult.fail(call_id, "pdf_concat", f"写入文件失败: {e}")
+
+        return ToolResult.ok(call_id, "pdf_concat", {
+            "output_path": output_path,
+            "merged_files": merged_files,
+            "total_pages": len(writer.pages),
+        })
+
+    # ==================== 辅助方法 ====================
+
+    @staticmethod
+    def _parse_page_ranges(ranges_str: str, total_pages: int) -> List[Tuple[int, int]]:
+        """解析页码范围（如 '1-3,5,8-10'），返回 0-indexed 的 (start, end)"""
+        ranges = []
+        for part in ranges_str.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                start_str, end_str = part.split("-", 1)
+                start = max(1, int(start_str.strip()))
+                end = min(total_pages, int(end_str.strip()))
+                if start <= end:
+                    ranges.append((start - 1, end - 1))
+            else:
+                idx = int(part.strip())
+                if 1 <= idx <= total_pages:
+                    ranges.append((idx - 1, idx - 1))
+        return ranges
+
+    def _extract_metadata(self, path: str) -> Dict[str, Any]:
+        meta = {"file_name": os.path.basename(path), "file_size": os.path.getsize(path)}
+        try:
+            with open(path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                meta["page_count"] = len(reader.pages)
+                info = reader.metadata
+                if info:
+                    for k in ("/Title", "/Author", "/Subject", "/Creator", "/Producer", "/CreationDate", "/ModDate"):
+                        v = info.get(k)
+                        if v:
+                            meta[k.lstrip("/").lower()] = str(v)
+        except Exception:
+            pass
+        return meta
+
+    @staticmethod
+    def _is_likely_scanned(path: str) -> bool:
+        try:
+            with open(path, "rb") as f:
+                head = f.read(2048)
+            text_markers = [b"/Text", b"/Font", b"/CIDFont"]
+            return not any(m in head for m in text_markers)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _table_to_text(table) -> str:
+        rows = []
+        for row in table:
+            rows.append(" | ".join(str(cell or "") for cell in row))
+        return "\n".join(rows)
+
+
+================================================================================
+# FILE: pentest_tool.py
+================================================================================
+"""
+渗透测试工具（原子工具版）
+
+原子工具:
+  pentest_run  — 执行渗透测试工具（基于 WSL）
+"""
+
+import asyncio
+import logging
+from typing import List
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_SECURITY,
+)
+
+logger = logging.getLogger(__name__)
+
+PENTEST_TOOLS = {
+    "nmap": "端口扫描和服务探测", "amass": "子域名枚举（OWASP）",
+    "dnsrecon": "DNS 信息收集", "theharvester": "邮箱/域名/员工名收集",
+    "whois": "域名注册信息查询", "traceroute": "路由追踪",
+    "sublist3r": "快速子域名枚举", "enum4linux": "Windows/Samba 信息枚举",
+    "nikto": "Web 服务器漏洞扫描", "dirb": "目录/文件暴力扫描",
+    "gobuster": "目录/子域/DNS 暴力扫描", "ffuf": "Web fuzzing",
+    "whatweb": "Web 技术栈识别", "wpscan": "WordPress 漏洞扫描",
+    "sqlmap": "SQL 注入", "searchsploit": "Exploit-DB 漏洞搜索",
+    "metasploit": "渗透测试框架", "hydra": "在线密码暴力破解",
+    "john": "离线密码破解", "hashcat": "GPU 加速密码破解",
+    "netcat": "TCP/UDP 连接", "curl": "HTTP 请求调试",
+    "wget": "文件下载", "responder": "LLMNR/NBT-NS 欺骗",
+    "exiftool": "文件元数据提取", "binwalk": "固件分析",
+    "steghide": "隐写术检测",
+}
+
+PENTEST_CATEGORIES = {
+    "recon": ["nmap", "amass", "dnsrecon", "theharvester", "whois", "traceroute", "sublist3r", "enum4linux", "whatweb"],
+    "web": ["nikto", "dirb", "gobuster", "ffuf", "sqlmap", "wpscan", "curl", "wget"],
+    "exploit": ["metasploit", "searchsploit"],
+    "password": ["hydra", "john", "hashcat"],
+    "network": ["netcat", "responder"],
+    "forensics": ["exiftool", "binwalk", "steghide"],
+}
+
+
+class PentestTool(BaseTool):
+    """渗透测试工具集"""
+
+    def __init__(self):
+        self._handlers = {"pentest_run": self._handle_run}
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "pentest"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_SECURITY
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="pentest_run",
+                description="""在 WSL（Windows Subsystem for Linux）中执行渗透测试工具。
+支持 27+ 个常用安全工具，按功能分类：
+
+recon     — 信息收集 (nmap, amass, whois, dnsrecon, theharvester)
+web       — Web 漏洞扫描 (nikto, sqlmap, dirb, gobuster, ffuf, wpscan)
+exploit   — 漏洞利用 (metasploit, searchsploit)
+password  — 密码破解 (hydra, john, hashcat)
+network   — 网络工具 (netcat, responder, curl)
+forensics — 取证工具 (exiftool, binwalk, steghide)
+custom    — 自定义 WSL 命令""",
+                parameters=[
+                    ToolParameter("action", "string",
+                        "功能分类：recon/web/exploit/password/network/forensics/custom。custom 可执行任意 WSL 命令", required=True,
+                        enum=["recon", "web", "exploit", "password", "network", "forensics", "custom"]),
+                    ToolParameter("tool", "string", "工具名称，如 nmap, sqlmap, hydra 等", required=True),
+                    ToolParameter("args", "string", "工具的命令行参数和选项，如 '-sV localhost'", required=False),
+                    ToolParameter("timeout", "number", "执行超时秒数，默认 120 秒。长扫描任务（如 nmap 全端口）需增加", required=False),
+                ],
+                examples=[
+                    'pentest_run(action="recon", tool="nmap", args="-sV localhost")  # 端口和服务版本探测',
+                    'pentest_run(action="web", tool="sqlmap", args="-u https://target.com?id=1")  # SQL注入检测',
+                    'pentest_run(action="custom", tool="ls", args="-la")  # 在 WSL 中执行任意命令',
+                    'pentest_run(action="recon", tool="amass", args="enum -d example.com", timeout=300)  # 域名枚举（长超时）',
+                ],
+                constraints=[
+                    "需要安装 WSL（Windows Subsystem for Linux）",
+                    "工具需先在 WSL 中安装：sudo apt install <tool>",
+                    "默认超时 120 秒，长时间扫描（如全端口 nmap）请增加 timeout",
+                    "首次使用工具时会自动检查是否已安装",
+                ],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    async def _handle_run(self, call_id: str, action: str, tool: str,
+                          args: str = "", timeout: int = 120) -> ToolResult:
+        if not tool:
+            return ToolResult.fail(call_id, "pentest_run", "需要 tool 参数")
+
+        if action == "custom":
+            return await self._wsl_exec(call_id, f"{tool} {args}".strip(), timeout)
+
+        # 检查是否已安装
+        check = await self._wsl_cmd(f"which {tool} 2>/dev/null || echo 'NOT_FOUND'", 10)
+        if "NOT_FOUND" in check:
+            return ToolResult.fail(call_id, "pentest_run",
+                f"'{tool}' 未安装。请在 WSL 中安装: sudo apt install {tool}")
+
+        cmd = f"{tool} {args}" if args else tool
+        return await self._wsl_exec(call_id, cmd, timeout)
+
+    async def _wsl_cmd(self, cmd: str, timeout: int) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            "wsl", "--", "bash", "-c", cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return (stdout.decode("utf-8", errors="replace") +
+                stderr.decode("utf-8", errors="replace")).strip()
+
+    async def _wsl_exec(self, call_id: str, cmd: str, timeout: int) -> ToolResult:
+        logger.info(f"WSL: {cmd}")
+        try:
+            output = await self._wsl_cmd(cmd, timeout)
+            return ToolResult.ok(call_id, "pentest_run", {
+                "tool": cmd.split()[0],
+                "command": cmd,
+                "output": output,
+            })
+        except asyncio.TimeoutError:
+            return ToolResult.fail(call_id, "pentest_run", f"执行超时（{timeout}秒）")
+        except Exception as e:
+            return ToolResult.fail(call_id, "pentest_run", str(e))
+
+
+================================================================================
+# FILE: shell_tool.py
+================================================================================
+"""
+Shell 工具（原子工具版）
+
+原子工具:
+  shell_run  — 执行 Shell 命令或 Python 代码
+"""
+
+import asyncio
+import os
+import re
+import logging
+import tempfile
+from typing import List
+
+from engine.tool.base import (
+    BaseTool, ToolDefinition, ToolParameter, ToolResult,
+    CATEGORY_SYSTEM,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ShellExecuteTool(BaseTool):
+    """Shell 命令执行工具"""
+
+    def __init__(self, **kwargs):
+        self._default_timeout = kwargs.get("timeout", 30)
+        self._handlers = {"shell_run": self._handle_run}
+        for t in self.tools:
+            t.handler = self._handlers.get(t.name)
+
+    @property
+    def name(self) -> str:
+        return "shell"
+
+    @property
+    def category(self) -> str:
+        return CATEGORY_SYSTEM
+
+    @property
+    def tools(self) -> List[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name="shell_run",
+                description="""执行 Shell 命令或 Python 代码。
+
+用法1 — 简单命令：shell_run(command='dir')  适合单行命令
+用法2 — Python 代码：shell_run(code='...')  适合多行 Python（自动写临时文件执行）
+
+推荐用 code 参数执行多行 Python，避免 JSON 转义和引号嵌套问题。
+
+使用场景：
+- 运行构建/编译命令（python build.py, npm run build）
+- 检查系统状态（dir, ls, git status, pip list）
+- 执行数据分析脚本
+- 运行自动化测试""",
+                parameters=[
+                    ToolParameter("command", "string", "Shell 命令字符串（简单命令用 command，多行脚本用 code）", required=False),
+                    ToolParameter("code", "string", "Python 代码（多行用，自动写入 .py 临时文件再执行，避免 JSON 转义问题）", required=False),
+                    ToolParameter("timeout", "number", "超时秒数，默认 30。大数据处理/编译等操作应适当增加", required=False),
+                ],
+                examples=[
+                    'shell_run(command="dir")  # Windows 下列出目录',
+                    'shell_run(command="python -m pytest tests/")  # 运行测试',
+                    'shell_run(code="import os\\nfor f in os.listdir(\".\"):\\n    print(f)")  # 多行Python',
+                    'shell_run(command="pip list --format=columns", timeout=60)  # 设置更长超时',
+                ],
+                constraints=[
+                    "Windows 用 dir/cls/type，Linux/Mac 用 ls/clear/cat",
+                    "默认超时 30 秒，长时间任务（安装依赖、大数据处理）请增加 timeout",
+                    "含有管道/重定向/复杂转义的复杂命令，拆分为多个简单命令或直接用 code 参数",
+                    "连续 2 次 shell_run 失败后，不要重复相同的命令，考虑换方案",
+                    "file_rename 后目录变动不会自动同步，shell_run 默认在工作目录执行",
+                ],
+            ),
+        ]
+
+    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
+        try:
+            return await handler(call_id, **kwargs)
+        except Exception as e:
+            return ToolResult.fail(call_id, tool_name, str(e))
+
+    async def _handle_run(self, call_id: str, command: str = "", code: str = "",
+                          timeout: int = None) -> ToolResult:
+        timeout = timeout or self._default_timeout
+
+        # 优先处理 code 参数
+        if code:
+            command = self._prepare_code_execution(code)
+            logger.info(f"执行 Python 代码 ({len(code)} 字符)")
+        elif not command:
+            return ToolResult.fail(call_id, "shell_run", "需要 command 或 code 参数")
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                shell=True,
+            )
+            stdout_data, stderr_data = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+
+            stdout = self._decode(stdout_data)
+            stderr = self._decode(stderr_data)
+
+            if not stdout.strip() and not stderr.strip():
+                stdout = "命令执行完成，无输出"
+
+            return ToolResult.ok(call_id, "shell_run", {
+                "stdout": stdout,
+                "stderr": stderr,
+                "return_code": proc.returncode,
+            })
+
+        except asyncio.TimeoutError:
+            return ToolResult.fail(call_id, "shell_run",
+                f"执行超时（{timeout}秒），如需更长超时请增加 timeout 参数")
+        except Exception as e:
+            return ToolResult.fail(call_id, "shell_run", str(e))
+
+    @staticmethod
+    def _decode(data: bytes) -> str:
+        try:
+            return data.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            try:
+                return data.decode("gbk").strip()
+            except UnicodeDecodeError:
+                return data.decode("utf-8", errors="replace").strip()
+
+    @staticmethod
+    def _prepare_code_execution(code: str) -> str:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", encoding="utf-8", delete=False,
+        )
+        tmp.write(code)
+        tmp.close()
+        return f'python "{tmp.name}"'
+
+
+================================================================================
 # FILE: system_tool.py
 ================================================================================
 """
@@ -46,23 +699,45 @@ class SystemTool(BaseTool):
         return [
             ToolDefinition(
                 name="system_info",
-                description="获取系统信息：操作系统、CPU、内存、磁盘、Python 版本等。",
+                description="""获取系统信息：操作系统类型和版本、CPU 核心数、内存大小和使用率、
+磁盘空间和使用率、Python 版本、当前工作目录。
+需要安装 psutil 获取更详细的硬件信息。
+
+使用场景：
+- 了解当前运行环境
+- 确认可用资源（内存/磁盘）""",
                 parameters=[],
                 is_read=True,
                 examples=["system_info()"],
+                constraints=[
+                    "硬件信息（CPU/内存/磁盘）需要安装 psutil：pip install psutil",
+                    "没有 psutil 时只返回操作系统和 Python 版本",
+                ],
             ),
             ToolDefinition(
                 name="system_time",
-                description="获取当前日期和时间。",
+                description="""获取当前系统的日期和时间。
+
+使用场景：
+- 记录操作时间
+- 生成带时间戳的文件名""",
                 parameters=[
-                    ToolParameter("format", "string", "时间格式，默认 '%Y-%m-%d %H:%M:%S'", required=False),
+                    ToolParameter("format", "string", "时间格式字符串，默认 '%Y-%m-%d %H:%M:%S'。参考 Python strftime 格式", required=False),
                 ],
                 is_read=True,
-                examples=['system_time()', 'system_time(format="%Y年%m月%d日")'],
+                examples=[
+                    'system_time()',
+                    'system_time(format="%Y年%m月%d日 %H时%M分")',
+                    'system_time(format="%Y%m%d_%H%M%S")  # 用于文件名的时间戳',
+                ],
             ),
             ToolDefinition(
                 name="system_cwd",
-                description="获取当前工作目录路径。",
+                description="""获取当前工作目录的绝对路径。
+
+使用场景：
+- 确认当前文件操作的基础路径
+- 需要构建绝对路径时参考""",
                 parameters=[],
                 is_read=True,
                 examples=["system_cwd()"],
@@ -329,28 +1004,41 @@ class TodoTool(BaseTool):
         return [
             ToolDefinition(
                 name="todo_write",
-                description=(
-                    "写入或更新完整的任务列表。每次调用时传入所有任务的完整状态。"
-                    "用于追踪多步骤任务的进度，让用户和系统都能看到当前进展。"
-                ),
+                description="""写入或更新完整的任务列表（覆盖式更新）。
+用于追踪多步骤任务的进度，让用户和系统都能看到当前进展。
+
+使用场景：
+- 复杂任务（5 步以上）开始时创建任务清单
+- 每完成一个步骤后更新对应任务状态
+- 让用户清晰了解当前进度
+
+每次调用时传入所有任务的完整状态（不是增量更新）。
+已有任务通过 id 字段匹配更新，新任务自动分配新 id。""",
                 parameters=[
                     ToolParameter(
                         "todos", "array",
-                        "任务列表，每项包含: content(任务描述), status(pending/in_progress/completed/cancelled), priority(low/medium/high)",
+                        "任务列表数组，每项包含: content(任务描述), status(状态), priority(可选,优先级), id(可选,更新已有任务时传)。status: pending=待处理/in_progress=进行中/completed=已完成/cancelled=已取消。priority: low/medium/high",
                         required=True,
                     ),
                 ],
                 examples=[
-                    'todo_write(todos=[{"content":"读取文件","status":"completed","priority":"high"},{"content":"修改配置","status":"in_progress","priority":"medium"}])',
+                    'todo_write(todos=[{"content":"读取文件","status":"completed","priority":"high"},{"content":"修改配置","status":"in_progress","priority":"medium"},{"content":"运行测试","status":"pending","priority":"high"}])',
+                    'todo_write(todos=[{"id":"t1","content":"读取文件","status":"completed"},{"content":"新增功能","status":"in_progress"}])  # t1更新,t2新任务',
                 ],
                 constraints=[
-                    "每次调用传入完整列表，不是增量更新",
-                    "status 只能是 pending/in_progress/completed/cancelled",
+                    "每次调用传入完整列表，不是增量更新（缺失的任务会被删除）",
+                    "status 只能是 pending/in_progress/completed/cancelled 之一",
+                    "id 字段可选，用于更新已有任务；不传 id 会创建新任务",
+                    "复杂任务推荐在开始时创建完整清单，逐步更新状态",
                 ],
             ),
             ToolDefinition(
                 name="todo_list",
-                description="查询当前任务追踪列表的状态。返回所有任务及其完成进度。",
+                description="""查询当前任务追踪列表中的所有任务及其完成进度。
+
+使用场景：
+- 随时查看当前任务进度
+- 确认还有哪些任务未完成""",
                 parameters=[],
                 is_read=True,
                 examples=["todo_list()"],
@@ -445,32 +1133,86 @@ class WebTool(BaseTool):
         return [
             ToolDefinition(
                 name="web_fetch",
-                description="抓取网页内容并提取纯文本。先用 web_search 找到 URL 再用此工具获取详情。",
+                description="""抓取网页内容并提取纯文本（自动去除 HTML 标签和脚本）。
+
+工作流程：web_search 找到 URL → web_fetch 获取详细内容。
+
+使用场景：
+- 获取网页文章的正文内容
+- 抓取 API 文档
+- 获取网页上的结构化信息
+
+不适用场景：
+- 搜索信息（先用 web_search 或 kimi_search）
+- 需要登录的页面
+- 动态渲染的 SPA 页面（JavaScript 生成的内容）""",
                 parameters=[
-                    ToolParameter("url", "string", "网页 URL", required=True),
-                    ToolParameter("max_chars", "number", "最大字符数，默认 5000", required=False),
+                    ToolParameter("url", "string", "网页的完整 URL（包含 http:// 或 https://）", required=True),
+                    ToolParameter("max_chars", "number", "最大字符数，默认 5000。长文章可增加到 10000", required=False),
                 ],
                 is_read=True,
-                examples=['web_fetch(url="https://example.com")'],
+                examples=[
+                    'web_fetch(url="https://example.com")',
+                    'web_fetch(url="https://docs.python.org/3/", max_chars=10000)  # 获取更多内容',
+                ],
+                constraints=[
+                    "需要网络连接，超时 15 秒",
+                    "无法执行 JavaScript，SPA 页面可能抓取不到动态内容",
+                    "返回纯文本（HTML 标签已去除），不是原始 HTML",
+                    "如果返回内容不完整，增加 max_chars 参数",
+                ],
             ),
             ToolDefinition(
                 name="web_search",
-                description="搜索网络信息，返回结果标题和链接。再用 web_fetch 获取详细内容。",
+                description="""搜索网络信息，返回结果标题、链接和摘要片段。
+再用 web_fetch 获取具体页面的详细内容。
+
+使用场景：
+- 搜索技术问题和解决方案
+- 查找文档和教程
+- 获取最新的新闻和信息
+
+不适用场景：
+- 需要详细总结和分析 → 用 kimi_search（AI 直接总结）""",
                 parameters=[
-                    ToolParameter("query", "string", "搜索关键词", required=True),
-                    ToolParameter("count", "number", "结果数量，默认 5", required=False),
+                    ToolParameter("query", "string", "搜索关键词（越具体越好，建议用中文关键词）", required=True),
+                    ToolParameter("count", "number", "返回结果数量，默认 5，最大 10", required=False),
                 ],
                 is_read=True,
-                examples=['web_search(query="Python 异步编程")'],
+                examples=[
+                    'web_search(query="Python 异步编程最佳实践")',
+                    'web_search(query="2024年AI发展趋势", count=10)  # 获取更多结果',
+                ],
+                constraints=[
+                    "需要网络连接",
+                    "返回的是搜索结果摘要，详细内容需用 web_fetch 获取",
+                    "搜索结果可能不完整，如果没找到需要的信息请调整关键词重试",
+                ],
             ),
             ToolDefinition(
                 name="kimi_search",
-                description="使用 Kimi AI 智能搜索（更快更准），直接返回搜索总结和参考资料。需要配置 MOONSHOT_API_KEY。",
+                description="""使用 Kimi（Moonshot）AI 智能搜索。
+直接返回搜索总结和分析结果，比普通搜索更快更准。
+
+使用场景：
+- 需要快速了解一个主题的全面信息
+- 需要搜索结果的综合分析而不是原始链接
+- web_search 结果不理想时的替代方案
+
+需要配置 MOONSHOT_API_KEY 环境变量。""",
                 parameters=[
-                    ToolParameter("query", "string", "搜索关键词", required=True),
+                    ToolParameter("query", "string", "搜索关键词或问题描述", required=True),
                 ],
                 is_read=True,
-                examples=['kimi_search(query="2024年AI发展趋势")'],
+                examples=[
+                    'kimi_search(query="2024年人工智能发展趋势")',
+                    'kimi_search(query="Python asyncio 和线程池的对比")',
+                ],
+                constraints=[
+                    "需要配置 MOONSHOT_API_KEY 环境变量",
+                    "如果未配置 API Key，会返回错误提示",
+                    "每次搜索会消耗 API 额度",
+                ],
             ),
         ]
 
@@ -635,21 +1377,53 @@ class WordTool(BaseTool):
         return [
             ToolDefinition(
                 name="word_read",
-                description="读取 Word 文档（.docx）的文本内容。",
+                description="""读取 Word 文档（.docx）的文本内容。
+自动提取所有段落的文本，忽略格式信息。
+
+使用场景：
+- 读取 .docx 报告的文本内容
+- 从 Word 文档中提取信息
+
+不适用场景：
+- 读取 .doc 格式（旧版 Word）→ 建议先转换为 .docx
+- 读取 PDF → 用 pdf_read""",
                 parameters=[
-                    ToolParameter("path", "string", "文件路径", required=True),
+                    ToolParameter("path", "string", "Word 文件路径（仅支持 .docx 格式）", required=True),
                 ],
                 is_read=True,
-                examples=['word_read(path="report.docx")'],
+                examples=[
+                    'word_read(path="report.docx")',
+                ],
+                constraints=[
+                    "仅支持 .docx 格式，不支持 .doc（旧版 Word）",
+                    "只提取纯文本内容，不包含图片/表格/样式",
+                    "需要安装 python-docx：pip install python-docx",
+                ],
             ),
             ToolDefinition(
                 name="word_write",
-                description="写入 Word 文档。将文本写入新的 .docx 文件。",
+                description="""写入新的 Word 文档（.docx）。
+将文本内容写入一个新的 Word 文档，每行文本生成一个段落。
+
+使用场景：
+- 生成 Word 格式的报告
+- 创建简单的 .docx 文档
+
+不适用场景：
+- 修改已有 Word 文档 → 用 word_read + 修改后 word_write 覆盖""",
                 parameters=[
-                    ToolParameter("path", "string", "文件路径", required=True),
-                    ToolParameter("text", "string", "文档内容（多行文本用 \\n 分隔）", required=True),
+                    ToolParameter("path", "string", "输出文件路径（必须 .docx 结尾）", required=True),
+                    ToolParameter("text", "string", "文档内容，换行符 \\n 表示段落分隔", required=True),
                 ],
-                examples=['word_write(path="output.docx", text="标题\\n\\n正文内容")'],
+                examples=[
+                    'word_write(path="output.docx", text="标题\\n\\n正文内容\\n\\n结尾")',
+                ],
+                constraints=[
+                    "每行文本（被 \\n 分隔）会生成一个独立段落",
+                    "不支持图片/表格/复杂格式，纯文本输出",
+                    "如果文件已存在会覆盖",
+                    "需要安装 python-docx：pip install python-docx",
+                ],
             ),
         ]
 

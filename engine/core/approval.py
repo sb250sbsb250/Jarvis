@@ -51,6 +51,8 @@ class ApprovalGate:
         self._pending: Dict[str, asyncio.Event] = {}
         # call_id -> bool (审批结果)
         self._results: Dict[str, bool] = {}
+        # 已超时或显式拒绝的 call_id（防止 approve() 穿透到 policy）
+        self._denied: set = set()
 
     def set_auto_approve(self, enabled: bool) -> None:
         """切换自动审批模式"""
@@ -129,6 +131,7 @@ class ApprovalGate:
         except asyncio.TimeoutError:
             logger.warning(f"⏰ 审批超时: {tool_name} (call_id={call_id[:12]})")
             self._pending.pop(call_id, None)
+            self._denied.add(call_id)  # 标记为已拒绝，防止 approve() 穿透
             return False
 
         result = self._results.pop(call_id, False)
@@ -143,6 +146,8 @@ class ApprovalGate:
 
     def approve(self, call_id: str) -> bool:
         """批准一个待审批的调用"""
+        if call_id in self._denied:
+            return False  # 已超时/拒绝，不再穿透到 policy
         if call_id in self._pending:
             self._results[call_id] = True
             self._pending[call_id].set()
@@ -155,6 +160,7 @@ class ApprovalGate:
         if call_id in self._pending:
             self._results[call_id] = False
             self._pending[call_id].set()
+            self._denied.add(call_id)
             return True
         return self._policy.deny(call_id)
 

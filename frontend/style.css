@@ -647,7 +647,8 @@ body, #app {
     white-space: nowrap;
 }
 
-.model-dropdown {
+.model-dropdown,
+.mode-dropdown {
     appearance: none;
     -webkit-appearance: none;
     background: rgba(255,255,255,0.04);
@@ -666,15 +667,18 @@ body, #app {
     background-position: right 8px center;
     min-width: 120px;
 }
-.model-dropdown:hover:not(:disabled) {
+.model-dropdown:hover:not(:disabled),
+.mode-dropdown:hover:not(:disabled) {
     border-color: rgba(99,102,241,0.3);
     background-color: rgba(99,102,241,0.06);
 }
-.model-dropdown:focus {
+.model-dropdown:focus,
+.mode-dropdown:focus {
     border-color: rgba(99,102,241,0.5);
     box-shadow: 0 0 0 2px rgba(99,102,241,0.1);
 }
-.model-dropdown:disabled {
+.model-dropdown:disabled,
+.mode-dropdown:disabled {
     opacity: 0.4;
     cursor: not-allowed;
 }

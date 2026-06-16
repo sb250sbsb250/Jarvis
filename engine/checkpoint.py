@@ -65,6 +65,9 @@ class Checkpoint:
         tool_calls_log: List,
         findings: List[str],
         edited_files: Optional[List[str]] = None,
+        compressed_summary: str = "",
+        total_tokens_used: int = 0,
+        compressed_until: int = 0,
     ) -> None:
         """
         保存检查点。
@@ -97,6 +100,9 @@ class Checkpoint:
                 for r in tool_calls_log
             ],
             "findings": findings,
+            "compressed_summary": compressed_summary,
+            "total_tokens_used": total_tokens_used,
+            "compressed_until": compressed_until,
         }
 
 

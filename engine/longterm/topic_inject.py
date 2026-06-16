@@ -74,7 +74,12 @@ class Injector:
             top_k=5,
             max_tokens=self.max_injection_tokens,
         )
-        self._last_injected = self._extract_topic_ids(block)
+        # 通过搜索获取实际注入的 topic IDs（避免从文本解析的复杂性）
+        try:
+            results = search_topics(self.store, user_input, top_k=5, min_confidence=0.15)
+            self._last_injected = [r["topic"]["id"] for r in results]
+        except Exception:
+            self._last_injected = []
         return block
 
     @staticmethod

@@ -1,0 +1,16 @@
+name: self_upgrade
+display_name: 自我升级
+icon: 🔄
+description: 从 GitHub 拉取最新代码，分析变更，智能升级自身能力
+when_to_use: 用户要求升级、更新、拉取最新代码、检查更新、同步最新功能时
+tools: [git, code, file, shell]
+fallback: null
+tags: [升级, 更新, 拉取, pull, upgrade, 最新版本, 检查更新, 同步]
+constraints: |
+  1. 升级前必须先 git_stash 暂存本地修改，防止丢失
+  2. 核心引擎文件（engine/）的变更必须逐个审查 diff
+  3. 不允许 force push 或 git reset --hard
+  4. 升级后必须验证基本功能（导入测试）
+  5. 如果 requirements.txt 有变更，提醒用户安装新依赖
+  6. 升级完成后提醒用户重启服务器以应用 Python 代码变更
+  7. .env 等配置文件不应被自动覆盖

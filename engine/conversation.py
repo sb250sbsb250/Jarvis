@@ -103,6 +103,7 @@ class ConversationSession:
         working_dir: str = ".",
         on_event: Optional[Callable[[str, Dict], Awaitable[None]]] = None,
         model: Optional[str] = None,
+        mode: str = "coding",
     ) -> Dict[str, Any]:
         """
         发送一条消息，自动携带前面所有对话历史。
@@ -112,6 +113,7 @@ class ConversationSession:
             working_dir: 工作目录
             on_event: 事件回调
             model: 指定使用的模型名称（可选）
+            mode: 工作模式（"coding" / "workbuddy" / "video"）
 
         Returns:
             AgentLoop.run() 的完整返回值
@@ -137,6 +139,7 @@ class ConversationSession:
             compressed_until=self.compressed_until,
             compressed_summary=self.compressed_summary,
             model_override=model,
+            mode=mode,
         )
 
         # ── 保存本轮完整消息列表 ──

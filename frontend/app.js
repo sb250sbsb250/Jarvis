@@ -19,6 +19,12 @@ const app = createApp({
     const currentSessionId = ref(null);
     const modelName = ref('deepseek-v4-pro');
     const searchEnabled = ref(false);
+    const currentMode = ref('coding');
+    const availableModes = ref([
+      { id: 'coding', name: '编程模式', icon: '💻' },
+      { id: 'workbuddy', name: 'WorkBuddy', icon: '📋' },
+      { id: 'video', name: '视频脚本', icon: '🎬' },
+    ]);
     
     function selectModel(model) {
       if (sending.value) return;
@@ -297,7 +303,7 @@ const app = createApp({
       await nextTick();
 
       // SSE 连接
-      const { stream, controller } = API.createChatStream(text, currentSessionId.value, modelName.value, searchEnabled.value);
+      const { stream, controller } = API.createChatStream(text, currentSessionId.value, modelName.value, searchEnabled.value, currentMode.value);
       _abortController = controller;
 
       try {
@@ -582,6 +588,19 @@ const app = createApp({
       }
     }
 
+    // ── 加载工作模式 ──
+    async function loadModes() {
+      try {
+        const data = await API.getModes();
+        if (data && data.modes && data.modes.length > 0) {
+          availableModes.value = data.modes;
+        }
+      } catch (e) {
+        console.error('Load modes error:', e);
+        // 保持默认值
+      }
+    }
+
     function onGlobalKeydown(e) {
       if (e.key === 'Escape') {
         showSettings.value = false;
@@ -618,7 +637,8 @@ const app = createApp({
 
       await Promise.all([
         loadConversations(),
-        loadApiKeys()
+        loadApiKeys(),
+        loadModes()
       ]);
 
       if (conversations.value.length > 0) {
@@ -657,6 +677,7 @@ const app = createApp({
     return {
       messages, inputText, sending, statusText, statusClass,
       conversations, currentSessionId, modelName, searchEnabled, selectModel,
+      currentMode, availableModes,
       showSettings, apiProviders,
       sendMessage, interruptSession, newConversation,
       switchConversation, deleteConversation,

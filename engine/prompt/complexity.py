@@ -157,7 +157,7 @@ class ComplexityRouter:
 - 先理解问题，再给出方案"""
 
     @classmethod
-    def get_max_tokens(mode: str, input_length: int = 0) -> int:
+    def get_max_tokens(cls, mode: str, input_length: int = 0) -> int:
         base = {
             "simple": 100000,
             "standard": 100000,

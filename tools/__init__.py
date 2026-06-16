@@ -27,7 +27,7 @@ from .pdf_tool import PdfTool                # 1 个原子工具
 from .word_tool import WordTool              # 2 个原子工具
 from .shell_tool import ShellExecuteTool     # 1 个原子工具
 from .web_tool import WebTool                # 2 个原子工具
-from .git_tool import GitTool                # 3 个原子工具
+from .git_tool import GitTool                # 10 个原子工具
 from .system_tool import SystemTool          # 3 个原子工具
 from .image_tool import ImageTool            # 2 个原子工具
 from .pentest_tool import PentestTool        # 1 个原子工具
@@ -44,7 +44,7 @@ ALL_TOOL_CLASSES: List[type] = [
     PentestTool,       # 渗透: run
     ShellExecuteTool,  # Shell: run
     WebTool,           # 网络: fetch/search
-    GitTool,           # Git: status/commit/push
+    GitTool,           # Git: status/commit/push/pull/fetch/diff/log/branch_list/stash/stash_pop
     SystemTool,        # 系统: info/time/cwd
     ImageTool,         # 图片: read/ocr
     TodoTool,          # Todo: write/list
@@ -83,6 +83,8 @@ STANDARD_TOOL_NAMES = [
     "web_fetch", "web_search",
     # Git
     "git_status", "git_commit", "git_push",
+    "git_pull", "git_fetch", "git_diff", "git_log",
+    "git_branch_list", "git_stash", "git_stash_pop",
     # 系统
     "system_info", "system_time", "system_cwd",
     # 图片

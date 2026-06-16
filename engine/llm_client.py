@@ -38,9 +38,6 @@ class LLMClient:
         response = await client.chat_completion(messages, tools)
     """
 
-    # ── Fallback 加载标记（防止重复日志）
-    _fallbacks_initialized: bool = False
-
     # ── 模型路由表：ResponseMode → 推荐模型 ──
     MODEL_ROUTING = {
         "direct":   "deepseek-chat",
@@ -85,6 +82,7 @@ class LLMClient:
 
         # ── 加载备用提供商（Fallback） ──
         self._fallbacks: List[tuple[str, AsyncOpenAI, str]] = []
+        self._fallbacks_initialized = False  # 实例级别，支持运行时配置更新
         self._load_fallback_providers()
 
     def _load_fallback_providers(self):
@@ -102,13 +100,13 @@ class LLMClient:
                     AsyncOpenAI(api_key=key, base_url=base_url, timeout=self.config.timeout_seconds),
                     model,
                 ))
-                if not LLMClient._fallbacks_initialized:
+                if not self._fallbacks_initialized:
                     logger.info(f"🔁 Fallback 提供商已加载: {name} ({model})")
 
-        if self._fallbacks and not LLMClient._fallbacks_initialized:
+        if self._fallbacks and not self._fallbacks_initialized:
             names = [fb[0] for fb in self._fallbacks]
             logger.info(f"🔁 共 {len(self._fallbacks)} 个 Fallback 提供商: {', '.join(names)}")
-            LLMClient._fallbacks_initialized = True
+            self._fallbacks_initialized = True
 
     @staticmethod
     def get_supported_models() -> List[str]:

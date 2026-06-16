@@ -137,6 +137,9 @@
                             </label>
                             <span class="search-label">智能搜索</span>
                         </div>
+                        <select class="mode-dropdown" v-model="currentMode" :disabled="sending">
+                            <option v-for="m in availableModes" :key="m.id" :value="m.id">{{ m.icon }} {{ m.name }}</option>
+                        </select>
                         <select class="model-dropdown" v-model="modelName" :disabled="sending">
                             <option value="deepseek-v4-pro">DeepSeek Pro</option>
                             <option value="deepseek-v4-flash">DeepSeek Flash</option>

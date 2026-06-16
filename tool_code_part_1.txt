@@ -30,7 +30,7 @@ from .pdf_tool import PdfTool                # 1 个原子工具
 from .word_tool import WordTool              # 2 个原子工具
 from .shell_tool import ShellExecuteTool     # 1 个原子工具
 from .web_tool import WebTool                # 2 个原子工具
-from .git_tool import GitTool                # 3 个原子工具
+from .git_tool import GitTool                # 10 个原子工具
 from .system_tool import SystemTool          # 3 个原子工具
 from .image_tool import ImageTool            # 2 个原子工具
 from .pentest_tool import PentestTool        # 1 个原子工具
@@ -47,7 +47,7 @@ ALL_TOOL_CLASSES: List[type] = [
     PentestTool,       # 渗透: run
     ShellExecuteTool,  # Shell: run
     WebTool,           # 网络: fetch/search
-    GitTool,           # Git: status/commit/push
+    GitTool,           # Git: status/commit/push/pull/fetch/diff/log/branch_list/stash/stash_pop
     SystemTool,        # 系统: info/time/cwd
     ImageTool,         # 图片: read/ocr
     TodoTool,          # Todo: write/list
@@ -86,6 +86,8 @@ STANDARD_TOOL_NAMES = [
     "web_fetch", "web_search",
     # Git
     "git_status", "git_commit", "git_push",
+    "git_pull", "git_fetch", "git_diff", "git_log",
+    "git_branch_list", "git_stash", "git_stash_pop",
     # 系统
     "system_info", "system_time", "system_cwd",
     # 图片
@@ -500,49 +502,105 @@ class CodeGraphTool(BaseTool):
         return [
             ToolDefinition(
                 name="code_graph_related",
-                description="查询文件的所有 import 关系和同包文件。",
-                parameters=[ToolParameter("path", "string", "文件路径", required=True)],
+                description="""查询指定文件的 import 依赖关系和同包文件列表。
+显示该文件导入了哪些模块，以及哪些模块导入了该文件。
+
+使用场景：
+- 修改前了解文件的依赖关系
+- 重构时确认哪些文件会受影响""",
+                parameters=[ToolParameter("path", "string", "文件路径（相对于项目根目录）", required=True)],
                 is_read=True,
-                examples=['code_graph_related(path="app.py")'],
+                examples=[
+                    'code_graph_related(path="app.py")',
+                    'code_graph_related(path="engine/agent_loop.py")',
+                ],
+                constraints=["只支持 Python 文件分析", "首次使用需要扫描项目（大型项目可能较慢）"],
             ),
             ToolDefinition(
                 name="code_graph_symbol",
-                description="搜索函数/类符号的定义位置。",
-                parameters=[ToolParameter("symbol", "string", "函数名或类名", required=True)],
+                description="""搜索函数/类/方法的定义位置。
+支持模糊匹配，返回所有匹配符号的文件路径和行号。
+
+使用场景：
+- 找某个函数是在哪里定义的
+- 确认类的继承关系
+- 导航到代码的特定位置""",
+                parameters=[ToolParameter("symbol", "string", "函数名或类名（支持部分匹配）", required=True)],
                 is_read=True,
-                examples=['code_graph_symbol(symbol="main")', 'code_graph_symbol(symbol="UserService")'],
+                examples=[
+                    'code_graph_symbol(symbol="main")',
+                    'code_graph_symbol(symbol="UserService")',
+                    'code_graph_symbol(symbol="validate_")  # 模糊搜索',
+                ],
+                constraints=["只支持 Python 文件", "返回最多 15 个结果"],
             ),
             ToolDefinition(
                 name="code_graph_callers",
-                description="追踪某个函数被谁调用了（调用链反向追溯）。",
-                parameters=[ToolParameter("symbol", "string", "函数名", required=True)],
+                description="""追踪某个函数被哪些地方的代码调用了（反向调用链）。
+
+使用场景：
+- 重构/重命名函数前确认所有调用点
+- 分析函数变更的潜在影响范围""",
+                parameters=[ToolParameter("symbol", "string", "函数名（精确匹配）", required=True)],
                 is_read=True,
-                examples=['code_graph_callers(symbol="validate_user")'],
+                examples=[
+                    'code_graph_callers(symbol="validate_user")',
+                ],
+                constraints=["只支持 Python 文件", "只能追踪同一项目内的调用", "外部库的调用无法追踪"],
             ),
             ToolDefinition(
                 name="code_graph_callees",
-                description="追踪某个函数调用了哪些其他函数。",
+                description="""追踪某个函数内部调用了哪些其他函数（正向调用链）。
+
+使用场景：
+- 理解函数的执行流程
+- 分析函数的逻辑分支和依赖""",
                 parameters=[ToolParameter("symbol", "string", "函数名", required=True)],
                 is_read=True,
-                examples=['code_graph_callees(symbol="main")'],
+                examples=[
+                    'code_graph_callees(symbol="main")',
+                ],
+                constraints=["只支持 Python 文件", "只能追踪同一项目内的调用"],
             ),
             ToolDefinition(
                 name="code_graph_impact",
-                description="分析修改某个文件可能的影响范围（哪些文件会受影响）。",
-                parameters=[ToolParameter("path", "string", "文件路径", required=True)],
+                description="""分析修改某个文件可能的影响范围。
+列出直接依赖该文件的其他文件，以及该文件中被外部调用的函数。
+
+使用场景：
+- 重大重构前评估影响
+- 安全修改已有代码""",
+                parameters=[ToolParameter("path", "string", "要修改的文件路径（相对于项目根目录）", required=True)],
                 is_read=True,
-                examples=['code_graph_impact(path="app.py")'],
+                examples=[
+                    'code_graph_impact(path="app.py")',
+                    'code_graph_impact(path="engine/core/guard.py")',
+                ],
+                constraints=["只支持 Python 文件", "只统计直接依赖（间接依赖不包含）"],
             ),
             ToolDefinition(
                 name="code_graph_folder",
-                description="列出文件夹的代码结构：模块 → 类 → 函数。",
-                parameters=[ToolParameter("path", "string", "文件夹路径（相对路径，空=根目录）", required=False)],
+                description="""列出指定文件夹的代码结构概览。
+显示模块文件 → 类 → 函数 的树形结构。
+
+使用场景：
+- 快速了解一个模块的组织结构
+- 找某个文件夹下有哪些类和函数""",
+                parameters=[ToolParameter("path", "string", "文件夹路径（相对路径，不传则扫描根目录）", required=False)],
                 is_read=True,
-                examples=['code_graph_folder()', 'code_graph_folder(path="engine/tool")'],
+                examples=[
+                    'code_graph_folder()',
+                    'code_graph_folder(path="engine/tool")',
+                ],
             ),
             ToolDefinition(
                 name="code_graph_stats",
-                description="项目代码图谱概览（文件数、符号数、依赖边数）。",
+                description="""获取项目代码图谱的全景概要：
+总文件数、总符号数（函数/类）、import 依赖关系总数。
+
+使用场景：
+- 了解项目规模
+- 评估项目的模块复杂度""",
                 parameters=[],
                 is_read=True,
                 examples=['code_graph_stats()'],
@@ -655,63 +713,170 @@ class CodeTool(BaseTool):
         return [
             ToolDefinition(
                 name="code_read",
-                description="专门用于编程语言代码文件（.py, .js, .ts, .java, .go 等）。自动提取类/函数结构。非代码文件（日志/配置/数据）请用 file_read。",
+                description="""读取编程语言代码文件内容，自动提取类/函数/方法结构信息。
+
+使用场景：
+- 查看 .py/.js/.ts/.java/.go/.rs/.cpp 等代码文件的内容
+- 快速定位函数或类的定义位置
+- 在修改前确认文件内容
+
+不适用场景：
+- 读取日志/配置/数据/文本文件 → 用 file_read
+- 读取 PDF/Word/Excel → 用对应的专用工具
+- 仅需知道文件是否存在 → 用 file_glob""",
                 parameters=[
-                    ToolParameter("path", "string", "文件路径", required=True),
-                    ToolParameter("start_line", "number", "起始行，默认 1", required=False),
-                    ToolParameter("end_line", "number", "结束行，默认全部", required=False),
+                    ToolParameter("path", "string", "文件路径（相对或绝对路径）", required=True),
+                    ToolParameter("start_line", "number", "起始行号（从 1 开始），默认从第 1 行", required=False),
+                    ToolParameter("end_line", "number", "结束行号（包含），默认到文件末尾", required=False),
                 ],
                 is_read=True,
-                examples=['code_read(path="app.py")', 'code_read(path="app.py", start_line=10, end_line=50)'],
+                examples=[
+                    'code_read(path="app.py")  # 读取整个文件',
+                    'code_read(path="src/main.py", start_line=10, end_line=50)  # 读取第10-50行',
+                    'code_read(path="utils/helpers.py", start_line=1, end_line=30)  # 只读取文件开头部分',
+                ],
+                constraints=[
+                    "仅支持编程语言代码文件，非代码文件请用 file_read",
+                    "指定行范围可以节省 token，但要注意行号从 1 开始",
+                    "读取 Python 文件时会自动提取类/函数结构信息",
+                ],
             ),
             ToolDefinition(
                 name="code_diff",
-                description="预览代码文件的修改差异（不修改文件）。通过 old_text/new_text 精确替换。非代码文件对比请用 file_diff。",
+                description="""预览代码文件的修改差异（不修改文件本身）。
+通过 old_text/new_text 精确替换来模拟修改，输出 unified diff 格式。
+
+使用场景：
+- 在 code_write 前预览修改效果
+- 验证 old_text 能在文件中唯一匹配
+- 确认 diff 结果符合预期后再提交
+
+不适用场景：
+- 直接修改文件 → 用 code_write
+- 对比两个不同文件 → 用 file_diff""",
                 parameters=[
                     ToolParameter("path", "string", "文件路径", required=True),
-                    ToolParameter("old_text", "string", "要替换的旧代码", required=True),
-                    ToolParameter("new_text", "string", "替换后的新代码", required=True),
+                    ToolParameter("old_text", "string", "要被替换的原始代码段（必须精确匹配，包括缩进和空行）", required=True),
+                    ToolParameter("new_text", "string", "替换后的新代码段（缩进风格需与 old_text 一致）", required=True),
                 ],
                 is_read=True,
-                examples=['code_diff(path="app.py", old_text="旧代码", new_text="新代码")'],
-                constraints=["old_text 必须在文件中唯一匹配，否则会报错"],
+                examples=[
+                    'code_diff(path="app.py", old_text="def hello():\\n    print(\"hi\")", new_text="def hello(name: str):\\n    print(f\"hi {name}\")")',
+                    'code_diff(path="server.js", old_text="app.listen(3000);", new_text="app.listen(process.env.PORT || 3000);")',
+                ],
+                constraints=[
+                    "old_text 必须在文件中唯一匹配，否则会报错",
+                    "old_text 必须与文件内容完全一致（包括缩进和空行），建议先 code_read 确认",
+                    "匹配到 0 处：请用 code_read 再次确认文件当前内容",
+                    "匹配到多处：old_text 太短，增加上下文使其唯一",
+                ],
             ),
             ToolDefinition(
                 name="code_write",
-                description="提交代码修改（带 .bak 自动备份+回滚）。先用 code_diff 预览再执行。非代码文件写入请用 file_write。",
+                description="""提交代码修改到文件（带 .bak 自动备份，可通过 code_rollback 回滚）。
+
+安全流程：先 code_diff 预览 → 再 code_write 提交。
+
+使用场景：
+- 修复代码中的 bug
+- 修改现有函数的逻辑
+- 重构代码结构
+
+不适用场景：
+- 创建新文件 → 用 code_create
+- 追加内容到文件末尾 → 用 code_append
+- 修改非代码文件（日志/配置/数据）→ 用 file_write""",
                 parameters=[
                     ToolParameter("path", "string", "文件路径", required=True),
-                    ToolParameter("old_text", "string", "要替换的旧代码", required=True),
-                    ToolParameter("new_text", "string", "替换后的新代码", required=True),
+                    ToolParameter("old_text", "string", "要被替换的原始代码段（必须精确匹配）", required=True),
+                    ToolParameter("new_text", "string", "替换后的新代码段", required=True),
                 ],
-                examples=['code_write(path="app.py", old_text="旧代码", new_text="新代码")'],
-                constraints=["先 code_diff 预览再执行", "自动备份到 .bak"],
+                examples=[
+                    'code_write(path="app.py", old_text="def hello():\\n    print(\"hi\")", new_text="def hello(name: str):\\n    print(f\"hi {name}\")")',
+                    'code_write(path="main.go", old_text="fmt.Println(\"old\")", new_text="fmt.Println(\"new\")")',
+                ],
+                constraints=[
+                    "必须先 code_diff 预览确认 old_text 能唯一匹配，再执行 code_write",
+                    "自动备份到 .bak 文件，修改失败可用 code_rollback 回滚",
+                    "old_text 找不到匹配时：重新 code_read 确认文件内容",
+                    "不要连续修改同一文件超过 3 次而不检查结果和语法",
+                    "一次调用只替换一处，多处修改请多次调用",
+                ],
             ),
             ToolDefinition(
                 name="code_rollback",
-                description="回滚最近一次 code_write 修改。支持从 .bak 文件恢复。",
+                description="""回滚最近的 code_write 修改，将文件恢复到修改前的状态。
+优先从 .bak 备份文件恢复，如果 .bak 不存在则尝试文本反向替换。
+
+使用场景：
+- code_write 后代码出现语法错误
+- 修改结果不符合预期
+- 需要恢复到原始版本重新开始""",
                 parameters=[
-                    ToolParameter("path", "string", "文件路径", required=True),
+                    ToolParameter("path", "string", "要回滚的文件路径", required=True),
                 ],
-                examples=['code_rollback(path="app.py")'],
+                examples=[
+                    'code_rollback(path="app.py")  # 回滚 app.py 到修改前的状态',
+                ],
+                constraints=[
+                    "只能回滚最近一次 code_write 的修改",
+                    "如果连续多次修改了同一个文件，可多次调用 rollback 逐次回滚",
+                    "文件被删除或手动修改后可能无法回滚",
+                ],
             ),
             ToolDefinition(
                 name="code_append",
-                description="追加代码到代码文件末尾（带 .bak 备份）。非代码内容追加请用 file_append。",
+                description="""追加代码到代码文件末尾（带 .bak 自动备份）。
+
+使用场景：
+- 在文件末尾添加新的函数/类/方法
+- 添加 import 语句
+- 追加配置代码或常量定义
+
+不适用场景：
+- 修改文件中间的内容 → 用 code_write
+- 创建新文件 → 用 code_create
+- 追加非代码内容 → 用 file_append""",
                 parameters=[
                     ToolParameter("path", "string", "文件路径", required=True),
-                    ToolParameter("new_text", "string", "要追加的代码", required=True),
+                    ToolParameter("new_text", "string", "要追加的代码内容", required=True),
                 ],
-                examples=['code_append(path="app.py", new_text="# 新增函数")'],
+                examples=[
+                    'code_append(path="app.py", new_text="def new_function():\\n    pass")',
+                    'code_append(path="utils.py", new_text="import json\\nimport os")',
+                ],
+                constraints=[
+                    "自动备份到 .bak，追加出错可用 code_rollback 回滚",
+                    "追加内容会在文件末尾另起新行",
+                    "不要在同一个循环中连续追加大量小片段，尽量一次追加完整内容",
+                ],
             ),
             ToolDefinition(
                 name="code_create",
-                description="创建新的代码文件（已有文件自动备份到 .bak）。创建非代码文件请用 file_write。",
+                description="""创建新的代码文件。
+如果文件已存在则自动备份到 .bak 再覆盖。目录路径不存在时会自动创建。
+
+使用场景：
+- 从头编写新模块/新脚本
+- 生成新的测试文件
+- 创建配置文件模板
+
+不适用场景：
+- 修改已有文件 → 用 code_write
+- 创建非代码文件 → 用 file_write""",
                 parameters=[
-                    ToolParameter("path", "string", "文件路径", required=True),
-                    ToolParameter("new_text", "string", "文件完整内容", required=True),
+                    ToolParameter("path", "string", "文件路径（可以包含子目录）", required=True),
+                    ToolParameter("new_text", "string", "文件的完整内容", required=True),
                 ],
-                examples=['code_create(path="new_app.py", new_text="def main():\\n    pass")'],
+                examples=[
+                    'code_create(path="new_module.py", new_text="def main():\\n    pass\\n\\nif __name__ == \"__main__\":\\n    main()")',
+                    'code_create(path="tests/test_utils.py", new_text="import pytest\\n\\ndef test_hello():\\n    assert True")',
+                ],
+                constraints=[
+                    "创建新文件时请确保提供完整的文件内容",
+                    "如果文件已存在会覆盖（自动备份到 .bak）",
+                    "目录路径不存在时会自动创建",
+                ],
             ),
         ]
 
@@ -954,101 +1119,202 @@ class ExcelTool(BaseTool):
         return [
             ToolDefinition(
                 name="excel_open",
-                description="打开 Excel 文件。必须最先调用，获得 ref（引用标识）后才能操作其他工具。",
+                description="""打开 Excel 文件，获得一个引用标识（ref）。
+
+Excel 工具的初始步骤！必须先调用此工具获得 ref，后续操作都通过 ref 引用文件。
+
+使用场景：
+- 打开已有 .xlsx/.xls 文件进行读取或编辑
+- 创建一个新的 Excel 文件（如果文件不存在会自动创建）
+
+工作流程：
+excel_open → excel_list_sheets → excel_read_sheet/write → excel_save → excel_close""",
                 parameters=[
-                    ToolParameter("file_path", "string", "Excel 文件路径", required=True),
-                    ToolParameter("ref", "string", "文件引用标识，后续操作用。默认用文件名", required=False),
+                    ToolParameter("file_path", "string", "Excel 文件路径（支持相对和绝对路径）", required=True),
+                    ToolParameter("ref", "string", "文件引用标识，后续操作都通过这个 ref 引用。默认用文件名（不含扩展名）", required=False),
                 ],
-                examples=['excel_open(file_path="data.xlsx")', 'excel_open(file_path="report.xlsx", ref="rpt")'],
-                constraints=["必须先调用此工具获得 ref", "操作完毕记得 excel_save + excel_close"],
+                examples=[
+                    'excel_open(file_path="data.xlsx")',
+                    'excel_open(file_path="report.xlsx", ref="rpt")',
+                ],
+                constraints=[
+                    "必须先调用此工具获得 ref，后续所有操作都基于 ref",
+                    "操作完毕后必须调用 excel_save + excel_close 释放 Excel 进程资源",
+                    "同一个 ref 只能打开一个文件，重复打开会覆盖",
+                ],
             ),
             ToolDefinition(
                 name="excel_close",
-                description="关闭 Excel 文件，释放资源。关闭前会自动保存。",
-                parameters=[ToolParameter("ref", "string", "文件引用标识", required=True)],
-                examples=['excel_close(ref="data.xlsx")'],
+                description="""关闭 Excel 文件，释放系统资源。
+关闭前会自动保存文件。操作完毕后务必调用此工具，否则 Excel 进程会残留在后台。""",
+                parameters=[ToolParameter("ref", "string", "文件引用标识（与 excel_open 时使用的 ref 一致）", required=True)],
+                examples=['excel_close(ref="data")'],
+                constraints=[
+                    "关闭前会自动保存（无需先调 excel_save）",
+                    "请务必在操作完成后调用，否则 Excel 进程不会退出",
+                ],
             ),
             ToolDefinition(
                 name="excel_list_sheets",
-                description="列出 Excel 文件的所有工作表及其行列数。",
+                description="""列出 Excel 文件的所有工作表名称及其行列数。
+打开文件后的第一步，先了解文件结构再进行后续操作。""",
                 parameters=[ToolParameter("ref", "string", "文件引用标识", required=True)],
-                examples=['excel_list_sheets(ref="data.xlsx")'],
+                examples=['excel_list_sheets(ref="data")'],
                 is_read=True,
             ),
             ToolDefinition(
                 name="excel_read_sheet",
-                description="读取工作表数据。支持分页，自动跳过空列。",
+                description="""读取工作表的数据内容。支持分页读取，自动跳过空列。
+
+使用场景：
+- 读取工作表的所有数据
+- 只读取某几行的数据（通过 start_row/end_row 参数）
+- 了解数据的列名和内容""",
                 parameters=[
                     ToolParameter("ref", "string", "文件引用标识", required=True),
-                    ToolParameter("sheet_name", "string", "工作表名称", required=True),
-                    ToolParameter("start_row", "number", "起始行，默认 1", required=False),
-                    ToolParameter("end_row", "number", "结束行，默认到末尾", required=False),
-                    ToolParameter("header_row", "number", "表头所在行，默认 1", required=False),
+                    ToolParameter("sheet_name", "string", "工作表名称（如 'Sheet1'，通过 excel_list_sheets 获取）", required=True),
+                    ToolParameter("start_row", "number", "起始行号（从 1 开始），默认 1", required=False),
+                    ToolParameter("end_row", "number", "结束行号，默认到工作表末尾", required=False),
+                    ToolParameter("header_row", "number", "表头所在行号，默认 1。用于生成列名", required=False),
                 ],
-                examples=['excel_read_sheet(ref="d", sheet_name="Sheet1", start_row=1, end_row=50)'],
+                examples=[
+                    'excel_read_sheet(ref="data", sheet_name="Sheet1", start_row=1, end_row=50)',
+                    'excel_read_sheet(ref="rpt", sheet_name="员工表", header_row=2)  # 表头在第2行',
+                ],
                 is_read=True,
+                constraints=[
+                    "如果工作表名包含中文或空格，确保 sheet_name 完全匹配",
+                    "大数据量时建议分页读取，不要一次读取全部行",
+                    "header_row 用于确定列名，默认第 1 行为表头",
+                ],
             ),
             ToolDefinition(
                 name="excel_get_structure",
-                description="获取工作表结构信息：列名、合并单元格区域等。",
+                description="""获取工作表的列名和合并单元格信息（轻量版，不含数据）。
+比 excel_read_sheet 更快，只返回结构不返回数据。
+
+使用场景：
+- 快速了解工作表有哪些列
+- 查看合并单元格区域
+- 在写入前确认表头名称""",
                 parameters=[
                     ToolParameter("ref", "string", "文件引用标识", required=True),
                     ToolParameter("sheet_name", "string", "工作表名称", required=True),
-                    ToolParameter("header_row", "number", "表头行，默认 1", required=False),
+                    ToolParameter("header_row", "number", "表头所在行，默认 1", required=False),
                 ],
                 is_read=True,
+                examples=[
+                    'excel_get_structure(ref="data", sheet_name="Sheet1")',
+                ],
             ),
             ToolDefinition(
                 name="excel_write_cell",
-                description="写入单个单元格的值。",
+                description="""写入单个单元格的值。
+按行列号定位，适用于精确的单元格写入。
+
+使用场景：
+- 修改某个单元格的值
+- 设置标题或汇总行
+
+如果是按列名写入整行数据，建议用 excel_write_by_header（更直观）。""",
                 parameters=[
                     ToolParameter("ref", "string", "文件引用标识", required=True),
                     ToolParameter("sheet_name", "string", "工作表名称", required=True),
                     ToolParameter("row", "number", "行号（从 1 开始）", required=True),
-                    ToolParameter("column", "number", "列号（从 1 开始）", required=True),
-                    ToolParameter("value", "string", "要写入的值", required=True),
+                    ToolParameter("column", "number", "列号（从 1 开始，A=1, B=2, ...）", required=True),
+                    ToolParameter("value", "string", "要写入的值（数字或文本）", required=True),
+                ],
+                examples=[
+                    'excel_write_cell(ref="data", sheet_name="Sheet1", row=2, column=3, value="已完成")',
+                ],
+                constraints=[
+                    "row/column 都从 1 开始计数（A1=row=1,column=1）",
+                    "写入后需调用 excel_save 保存",
                 ],
             ),
             ToolDefinition(
                 name="excel_write_by_header",
-                description="按列名写入一行数据。自动匹配表头，支持模糊匹配。",
+                description="""按列名写入一行数据到指定行。
+自动根据表头名称匹配列位置，支持模糊匹配。
+
+使用场景：
+- 按列名填充一行数据（最常用的写入方式）
+- 更新已有行的指定列值
+- data 字典中未匹配到的列会被忽略（不会报错）""",
                 parameters=[
                     ToolParameter("ref", "string", "文件引用标识", required=True),
                     ToolParameter("sheet_name", "string", "工作表名称", required=True),
-                    ToolParameter("row", "number", "写入的行号", required=True),
-                    ToolParameter("data", "object", "列名→值的字典，如 {'姓名': '张三', '年龄': 25}", required=True),
-                    ToolParameter("header_row", "number", "表头行，默认 1", required=False),
+                    ToolParameter("row", "number", "写入的目标行号", required=True),
+                    ToolParameter("data", "object", "列名→值的字典，如 {'姓名': '张三', '年龄': 25, '状态': '已完成'}", required=True),
+                    ToolParameter("header_row", "number", "表头所在行，默认 1", required=False),
                 ],
-                examples=['excel_write_by_header(ref="d", sheet_name="Sheet1", row=5, data={"姓名": "张三"})'],
+                examples=[
+                    'excel_write_by_header(ref="data", sheet_name="Sheet1", row=5, data={"姓名": "张三", "年龄": 25})',
+                ],
+                constraints=[
+                    "先调用 excel_list_sheets 或 excel_get_structure 确认列名",
+                    "data 字典的 key 需与表头名称匹配（支持模糊匹配）",
+                    "写入后需调用 excel_save 保存",
+                ],
             ),
             ToolDefinition(
                 name="excel_insert_rows",
-                description="在指定行前插入行，自动复制上一行格式（边框、字体、数字格式）。",
+                description="""在指定行前插入一行或多行，自动复制上一行的格式（边框、字体、数字格式）。
+
+使用场景：
+- 在表格中间插入新数据行
+- 批量插入多行
+
+注意：不会复制公式，只复制格式。""",
                 parameters=[
                     ToolParameter("ref", "string", "文件引用标识", required=True),
                     ToolParameter("sheet_name", "string", "工作表名称", required=True),
-                    ToolParameter("start_row", "number", "从第几行开始插入", required=True),
+                    ToolParameter("start_row", "number", "从第几行之前开始插入（如 start_row=3 表示在第3行前插入）", required=True),
                     ToolParameter("count", "number", "插入行数，默认 1", required=False),
                 ],
-                constraints=["插入后记得调用 excel_save"],
+                examples=[
+                    'excel_insert_rows(ref="data", sheet_name="Sheet1", start_row=3, count=2)  # 在第3行前插入2行',
+                ],
+                constraints=[
+                    "不能在第 1 行前插入（会报错）",
+                    "插入后记得调用 excel_save 保存",
+                    "自动复制上一行的格式，但不复制公式",
+                ],
             ),
             ToolDefinition(
                 name="excel_format_range",
-                description="设置单元格格式：字体加粗/大小/颜色、数字格式、对齐方式。",
+                description="""设置单元格区域的格式：字体加粗/大小/颜色、数字格式、对齐方式。
+
+使用场景：
+- 设置表头字体加粗
+- 设置数字格式（如金额保留两位小数）
+- 设置单元格对齐方式（居中/左对齐/右对齐）""",
                 parameters=[
                     ToolParameter("ref", "string", "文件引用标识", required=True),
                     ToolParameter("sheet_name", "string", "工作表名称", required=True),
-                    ToolParameter("range", "string", "单元格范围，如 'A1:C10'", required=True),
-                    ToolParameter("font", "object", "字体设置：{bold: true, size: 12, color: '#FF0000'}", required=False),
-                    ToolParameter("number_format", "string", "数字格式，如 '#,##0.00'", required=False),
-                    ToolParameter("alignment", "object", "对齐：{horizontal: 'center', vertical: 'center'}", required=False),
+                    ToolParameter("range", "string", "单元格范围，如 'A1:C10' 或 'B2:B100'", required=True),
+                    ToolParameter("font", "object", "字体设置字典：{bold: true, size: 12, color: '#FF0000', name: '微软雅黑'}", required=False),
+                    ToolParameter("number_format", "string", "数字格式代码，如 '#,##0.00' 或 '0%'", required=False),
+                    ToolParameter("alignment", "object", "对齐设置：{horizontal: 'center'|'left'|'right', vertical: 'center'|'top'|'bottom'}", required=False),
                 ],
-                examples=['excel_format_range(ref="d", sheet_name="Sheet1", range="A1:C1", font={"bold": true})'],
+                examples=[
+                    'excel_format_range(ref="data", sheet_name="Sheet1", range="A1:C1", font={"bold": true})',
+                    'excel_format_range(ref="rpt", sheet_name="销售表", range="D2:D100", number_format="#,##0.00")',
+                ],
+                constraints=[
+                    "font.color 支持 #RRGGBB 格式（如 '#FF0000' 为红色）",
+                    "对齐方式的 horizontal: center/left/right, vertical: center/top/bottom",
+                ],
             ),
             ToolDefinition(
                 name="excel_save",
-                description="保存 Excel 文件的更改。",
+                description="保存 Excel 文件的更改到磁盘。写入/修改/插入/格式化后需要调用来保存。",
                 parameters=[ToolParameter("ref", "string", "文件引用标识", required=True)],
+                examples=['excel_save(ref="data")'],
+                constraints=[
+                    "修改后一定要调用保存，否则更改会丢失",
+                    "excel_close 会自动保存，但建议操作过程中手动保存",
+                ],
             ),
         ]
 
@@ -1402,79 +1668,182 @@ class FileTool(BaseTool):
         return [
             ToolDefinition(
                 name="file_list",
-                description="列出指定目录下的文件。支持通配符过滤。不传 path 默认当前目录。",
+                description="""列出指定目录下的文件列表，支持通配符过滤。
+
+使用场景：
+- 查看目录下有哪些文件
+- 按扩展名筛选文件（如所有 .py 文件）
+- 确认文件名和路径后再进行其他操作""",
                 parameters=[
-                    ToolParameter("pattern", "string", "文件匹配模式，如 '*.py'，默认 '*'", required=False),
-                    ToolParameter("path", "string", "目标目录路径，默认当前目录", required=False),
-                    ToolParameter("recursive", "boolean", "是否递归子目录，默认 true", required=False),
-                ],
-                is_read=True,
-                examples=['file_list()', 'file_list(pattern="*.py")', 'file_list(path="C:/Downloads", pattern="*.pdf")'],
-            ),
-            ToolDefinition(
-                name="file_read",
-                description="读取任意文件内容（日志/配置/文档/数据等）。支持指定行范围。读取代码文件建议用 code_read（会提取类/函数结构）。",
-                parameters=[
-                    ToolParameter("path", "string", "文件路径", required=True),
-                    ToolParameter("start_line", "number", "起始行号，默认 1", required=False),
-                    ToolParameter("end_line", "number", "结束行号，默认到文件末尾", required=False),
+                    ToolParameter("pattern", "string", "文件匹配模式，如 '*.py' 或 '*.{py,js}'，默认 '*' 匹配所有", required=False),
+                    ToolParameter("path", "string", "目标目录路径，默认当前工作目录", required=False),
+                    ToolParameter("recursive", "boolean", "是否递归子目录，默认 true。设为 false 只列出当前目录", required=False),
                 ],
                 is_read=True,
                 examples=[
-                    'file_read(path="app.py")',
-                    'file_read(path="app.py", start_line=10, end_line=50)',
+                    'file_list()  # 列出当前目录所有文件（递归）',
+                    'file_list(pattern="*.py")  # 列出所有 Python 文件',
+                    'file_list(path="C:/Downloads", pattern="*.pdf", recursive=False)  # 仅在 Downloads 目录下找 PDF',
+                ],
+                constraints=[
+                    "默认递归子目录，如果目录深度很大可能会慢",
+                    "自动排除 .git, __pycache__, node_modules 等目录",
+                    "最多返回 100 个结果",
+                    "不传 pattern 时仅返回文件名，不包含扩展名过滤",
+                ],
+            ),
+            ToolDefinition(
+                name="file_read",
+                description="""读取任意文件内容（日志/配置/文档/数据/文本等）。支持指定行范围。
+
+使用场景：
+- 读取 .txt, .log, .json, .yaml, .md, .env, .gitignore 等文本文件
+- 读取代码文件的内容（但推荐用 code_read，会自动提取类/函数结构）
+- 读取大数据文件的部分行
+
+不适用场景：
+- 读取编程语言代码文件准备修改 → 用 code_read（会提取类/函数结构）
+- 读取 PDF/Word/Excel → 用对应的专用工具""",
+                parameters=[
+                    ToolParameter("path", "string", "文件路径（相对或绝对路径）", required=True),
+                    ToolParameter("start_line", "number", "起始行号（从 1 开始），默认从第 1 行", required=False),
+                    ToolParameter("end_line", "number", "结束行号（包含），默认到文件末尾", required=False),
+                ],
+                is_read=True,
+                examples=[
+                    'file_read(path="config.json")',
+                    'file_read(path="log.txt", start_line=100, end_line=200)  # 读取第100-200行',
+                    'file_read(path=".env")  # 读取环境变量配置',
+                ],
+                constraints=[
+                    "文件不存在时会报错，先用 file_glob 或 file_list 确认路径",
+                    "默认 UTF-8 编码，其他编码会自动转换",
+                    "超大文件（>50MB）建议指定行范围读取",
                 ],
             ),
             ToolDefinition(
                 name="file_glob",
-                description="使用通配符匹配文件路径。支持 ** 递归匹配。",
+                description="""使用通配符模式搜索匹配的文件路径。支持 ** 递归匹配。
+
+使用场景：
+- 找项目中所有匹配某个模式的文件
+- 确认文件路径是否存在
+- 在全项目中搜索文件""",
                 parameters=[
-                    ToolParameter("pattern", "string", "通配符模式，如 '**/*.py'，默认 '*'", required=True),
-                    ToolParameter("path", "string", "搜索起始目录，默认当前目录", required=False),
+                    ToolParameter("pattern", "string", "通配符模式，如 '**/*.py' 找所有 Python 文件", required=True),
+                    ToolParameter("path", "string", "搜索起始目录，默认当前工作目录", required=False),
                 ],
                 is_read=True,
-                examples=['file_glob(pattern="**/*.py")', 'file_glob(pattern="src/**/*.ts")'],
+                examples=[
+                    'file_glob(pattern="**/*.py")  # 查找所有 Python 文件',
+                    'file_glob(pattern="src/**/*.ts")  # 查找 src 下所有 TypeScript 文件',
+                    'file_glob(pattern="*config*")  # 查找文件名包含 config 的文件',
+                ],
+                constraints=[
+                    "最多返回 200 个结果",
+                    "自动排除隐藏目录（以 . 开头的目录）",
+                    "pattern 必须明确：纯文件名（不含通配符）不一定能匹配到",
+                ],
             ),
             ToolDefinition(
                 name="file_write",
-                description="写入/覆盖任意文件内容（日志/配置/文档/数据等）。自动创建不存在的目录。修改代码文件建议用 code_write（带备份和回滚）。",
+                description="""写入或覆盖文件内容。自动创建不存在的目录。
+适合写入日志、配置、数据、文档等非代码文件。
+
+使用场景：
+- 写入配置文件（JSON/YAML/INI/Toml）
+- 写入数据文件（CSV/TSV/txt）
+- 写入文档（Markdown）
+
+不适用场景：
+- 修改编程语言代码文件 → 用 code_write（有备份和回滚）
+- 追加内容 → 用 file_append
+- 创建代码文件 → 用 code_create（有备份）""",
                 parameters=[
-                    ToolParameter("path", "string", "文件路径", required=True),
-                    ToolParameter("content", "string", "要写入的内容", required=True),
+                    ToolParameter("path", "string", "文件路径（相对或绝对路径）", required=True),
+                    ToolParameter("content", "string", "要写入的文件内容", required=True),
                 ],
                 examples=[
-                    'file_write(path="hello.txt", content="Hello World")',
+                    'file_write(path="config.json", content="{\"key\": \"value\"}")',
+                    'file_write(path="output.txt", content="Hello World\\n第二行内容")',
+                    'file_write(path="docs/README.md", content="# 项目介绍\\n\\n这是一个示例项目")',
                 ],
-                constraints=["此操作会覆盖已有文件！如需追加请用 file_append"],
+                constraints=[
+                    "⚠️ 此操作会直接覆盖已有文件，没有自动备份！",
+                    "如需追加内容请用 file_append，不要一次性读写全文件",
+                    "修改代码文件请用 code_write（有 .bak 自动备份）",
+                    "目录路径不存在时会自动创建",
+                ],
             ),
             ToolDefinition(
                 name="file_append",
-                description="追加内容到任意文件末尾。如果文件不存在会自动创建。追加代码建议用 code_append（带备份）。",
+                description="""追加内容到文件末尾。如果文件不存在会自动创建。
+
+使用场景：
+- 写日志文件
+- 向数据文件追加新行
+- 大数据处理时用 file_append 逐步写入中间结果到汇总文件
+
+不适用场景：
+- 追加代码到代码文件 → 用 code_append（有 .bak 备份）""",
                 parameters=[
                     ToolParameter("path", "string", "文件路径", required=True),
-                    ToolParameter("content", "string", "要追加的内容", required=True),
+                    ToolParameter("content", "string", "要追加的内容（自动在末尾换行）", required=True),
                 ],
-                examples=['file_append(path="log.txt", content="新日志行")'],
+                examples=[
+                    'file_append(path="log.txt", content="2024-01-01 任务完成")',
+                    'file_append(path="_summary.jsonl", content="{\"id\": 1, \"status\": \"ok\"}")  # 大数据处理中间结果',
+                ],
+                constraints=[
+                    "如果文件不存在会自动创建新文件",
+                    "自动在文件末尾换行后再追加，每条内容独立成行",
+                    "追加代码文件建议用 code_append（带 .bak 备份）",
+                ],
             ),
             ToolDefinition(
                 name="file_rename",
-                description="重命名或移动文件。支持跨目录移动。",
+                description="""重命名或移动文件。支持跨目录移动。
+
+使用场景：
+- 重命名文件
+- 移动文件到其他目录
+- 整理文件目录结构""",
                 parameters=[
                     ToolParameter("path", "string", "当前文件路径", required=True),
-                    ToolParameter("new_path", "string", "新文件路径（或新文件名）", required=True),
+                    ToolParameter("new_path", "string", "新文件路径（可以是不同的目录+文件名）", required=True),
                 ],
-                examples=['file_rename(path="old.txt", new_path="new.txt")'],
-                constraints=["目标路径已存在时会报错"],
+                examples=[
+                    'file_rename(path="old.txt", new_path="new.txt")',
+                    'file_rename(path="temp/data.csv", new_path="archive/data_2024.csv")',
+                ],
+                constraints=[
+                    "目标路径已存在时会报错",
+                    "跨目录移动会自动创建目标目录",
+                    "只支持文件，不支持目录重命名",
+                ],
             ),
             ToolDefinition(
                 name="file_diff",
-                description="对比两个任意文件的差异，输出 unified diff 格式。代码文件差异预览建议用 code_diff。",
+                description="""对比两个文件的差异，输出 unified diff 格式。
+
+使用场景：
+- 对比两个配置文件的不同
+- 对比两个版本的数据文件
+- 对比代码文件（代码文件建议用 code_diff 获得更准确的行内差异）""",
                 parameters=[
                     ToolParameter("path_a", "string", "第一个文件路径", required=True),
                     ToolParameter("path_b", "string", "第二个文件路径", required=True),
                 ],
                 is_read=True,
-                examples=['file_diff(path_a="v1.py", path_b="v2.py")'],
+                examples=[
+                    'file_diff(path_a="config_dev.json", path_b="config_prod.json")',
+                    'file_diff(path_a="output_v1.txt", path_b="output_v2.txt")',
+                ],
+                constraints=[
+                    "两个文件都必须存在",
+                    "如果文件完全相同，diff 输出为空",
+                    "代码文件的差异预览建议用 code_diff（更精确的行匹配）",
+                ],
             ),
         ]
 
@@ -1696,6 +2065,13 @@ class GitTool(BaseTool):
             "git_status": self._handle_status,
             "git_commit": self._handle_commit,
             "git_push": self._handle_push,
+            "git_pull": self._handle_pull,
+            "git_fetch": self._handle_fetch,
+            "git_diff": self._handle_diff,
+            "git_log": self._handle_log,
+            "git_branch_list": self._handle_branch_list,
+            "git_stash": self._handle_stash,
+            "git_stash_pop": self._handle_stash_pop,
         }
         for t in self.tools:
             t.handler = self._handlers.get(t.name)
@@ -1713,33 +2089,211 @@ class GitTool(BaseTool):
         return [
             ToolDefinition(
                 name="git_status",
-                description="查看 Git 仓库工作区状态（修改/新增/删除的文件）。",
+                description="""查看 Git 仓库工作区状态（修改/新增/删除/未追踪的文件）。
+
+使用场景：
+- 在 commit 前查看有哪些文件被修改了
+- 确认当前工作区是否干净
+- 快速了解项目的 Git 状态""",
                 parameters=[
-                    ToolParameter("path", "string", "仓库路径，默认当前目录", required=False),
+                    ToolParameter("path", "string", "Git 仓库路径，默认当前工作目录", required=False),
                 ],
                 is_read=True,
-                examples=['git_status()', 'git_status(path="/home/project")'],
+                examples=[
+                    'git_status()',
+                    'git_status(path="/home/project")',
+                ],
+                constraints=[
+                    "当前目录必须是 Git 仓库（有 .git 目录）",
+                    "非 Git 仓库会返回错误",
+                ],
             ),
             ToolDefinition(
                 name="git_commit",
-                description="提交修改到本地仓库。自动执行 git add . 再 commit。",
+                description="""提交修改到本地仓库。自动执行 git add . 再 commit。
+
+使用场景：
+- 完成功能开发后提交代码
+- 修复 bug 后提交
+
+提交前建议：先 git_status 确认有哪些文件被修改""",
                 parameters=[
-                    ToolParameter("message", "string", "提交信息", required=True),
-                    ToolParameter("path", "string", "仓库路径，默认当前目录", required=False),
-                    ToolParameter("add_all", "boolean", "是否自动 git add .，默认 true", required=False),
+                    ToolParameter("message", "string", "提交信息（建议按约定格式如 'feat: 新增...' 或 'fix: 修复...'）", required=True),
+                    ToolParameter("path", "string", "Git 仓库路径，默认当前目录", required=False),
+                    ToolParameter("add_all", "boolean", "是否自动执行 git add . 添加所有变更，默认 true", required=False),
                 ],
-                examples=['git_commit(message="fix: 修复登录bug")'],
-                constraints=["提交前请确保有文件修改"],
+                examples=[
+                    'git_commit(message="fix: 修复登录bug")',
+                    'git_commit(message="feat: 新增用户导出功能", add_all=True)',
+                ],
+                constraints=[
+                    "提交前请确保有文件修改（建议先 git_status 检查）",
+                    "message 参数是必需的，不能为空",
+                    "add_all=true 会添加所有未追踪的文件，如只想提交部分文件请设为 false",
+                    "commit 只提交到本地，如需推送到远程请再调用 git_push",
+                ],
             ),
             ToolDefinition(
                 name="git_push",
-                description="推送本地提交到远程仓库。",
+                description="""推送本地提交到远程仓库。
+在 git_commit 之后调用，将本地 commit 推送到远程。
+
+使用场景：
+- 完成本地提交后推送到远程仓库
+- 与团队成员共享代码""",
                 parameters=[
-                    ToolParameter("path", "string", "仓库路径，默认当前目录", required=False),
-                    ToolParameter("remote", "string", "远程名称，默认 origin", required=False),
-                    ToolParameter("branch", "string", "分支名，默认当前分支", required=False),
+                    ToolParameter("path", "string", "Git 仓库路径，默认当前目录", required=False),
+                    ToolParameter("remote", "string", "远程仓库名称，默认 origin", required=False),
+                    ToolParameter("branch", "string", "目标分支名，默认推送当前分支到同名远程分支", required=False),
                 ],
-                examples=['git_push()', 'git_push(branch="main")'],
+                examples=[
+                    'git_push()',
+                    'git_push(branch="main")',
+                    'git_push(remote="origin", branch="develop")',
+                ],
+                constraints=[
+                    "推送前需要先有本地 commit（先 git_commit）",
+                    "需要远程仓库的访问权限",
+                    "不要强制推送到主分支（main/master）",
+                ],
+            ),
+            ToolDefinition(
+                name="git_pull",
+                description="""从远程仓库拉取并合并最新代码。
+
+使用场景：
+- 升级前拉取远程更新
+- 同步团队成员的最新提交""",
+                parameters=[
+                    ToolParameter("path", "string", "Git 仓库路径，默认当前目录", required=False),
+                    ToolParameter("remote", "string", "远程仓库名称，默认 origin", required=False),
+                    ToolParameter("branch", "string", "远程分支名，默认拉取同名远程分支", required=False),
+                ],
+                examples=[
+                    'git_pull()',
+                    'git_pull(branch="main")',
+                    'git_pull(remote="origin", branch="develop")',
+                ],
+                constraints=[
+                    "拉取前建议先 git_stash 暂存本地未提交的修改",
+                    "如有冲突会返回冲突信息，需要手动解决",
+                ],
+            ),
+            ToolDefinition(
+                name="git_fetch",
+                description="""从远程仓库 fetch 最新信息（不合并，仅更新远程引用）。
+
+使用场景：
+- 在 pull 前先 fetch 查看远程有什么变化
+- 配合 git_diff 查看远程与本地的差异""",
+                parameters=[
+                    ToolParameter("path", "string", "Git 仓库路径，默认当前目录", required=False),
+                    ToolParameter("remote", "string", "远程仓库名称，默认 origin", required=False),
+                ],
+                is_read=True,
+                examples=[
+                    'git_fetch()',
+                    'git_fetch(remote="origin")',
+                ],
+            ),
+            ToolDefinition(
+                name="git_diff",
+                description="""比较两个 Git 引用（分支/commit/tag）之间的差异。
+
+使用场景：
+- 查看远程分支与本地的差异（git_fetch 后使用）
+- 审查某个 commit 的变更内容
+- 升级前查看远程有哪些文件变了""",
+                parameters=[
+                    ToolParameter("path", "string", "Git 仓库路径，默认当前目录", required=False),
+                    ToolParameter("base", "string", "基准引用（如 HEAD, main, commit hash）", required=True),
+                    ToolParameter("target", "string", "目标引用（如 origin/main, 某个 commit）", required=True),
+                    ToolParameter("stat_only", "boolean", "只返回文件变更统计，不返回详细 diff，默认 false", required=False),
+                ],
+                is_read=True,
+                examples=[
+                    'git_diff(base="HEAD", target="origin/main", stat_only=True)',
+                    'git_diff(base="HEAD~3", target="HEAD")',
+                ],
+                constraints=[
+                    "stat_only=True 返回文件级别摘要（推荐用于概览）",
+                    "stat_only=False 返回详细代码差异（内容较长）",
+                    "base 和 target 必须是有效的 git 引用",
+                ],
+            ),
+            ToolDefinition(
+                name="git_log",
+                description="""查看 Git commit 历史记录。
+
+使用场景：
+- 了解最近的提交历史
+- 查找某个功能的提交时间
+- 查看远程分支的更新情况""",
+                parameters=[
+                    ToolParameter("path", "string", "Git 仓库路径，默认当前目录", required=False),
+                    ToolParameter("count", "integer", "显示最近几条，默认 10", required=False),
+                    ToolParameter("oneline", "boolean", "单行摘要格式，默认 true", required=False),
+                ],
+                is_read=True,
+                examples=[
+                    'git_log(count=5)',
+                    'git_log(count=20, oneline=False)',
+                ],
+            ),
+            ToolDefinition(
+                name="git_branch_list",
+                description="""列出 Git 仓库的分支。
+
+使用场景：
+- 查看当前有哪些分支
+- 确认远程分支是否存在""",
+                parameters=[
+                    ToolParameter("path", "string", "Git 仓库路径，默认当前目录", required=False),
+                    ToolParameter("remote", "boolean", "是否也显示远程分支，默认 true", required=False),
+                ],
+                is_read=True,
+                examples=[
+                    'git_branch_list()',
+                    'git_branch_list(remote=False)',
+                ],
+            ),
+            ToolDefinition(
+                name="git_stash",
+                description="""暂存当前未提交的修改（git stash push）。
+
+使用场景：
+- 升级或拉取远程代码前暂存本地修改
+- 临时切换到其他任务""",
+                parameters=[
+                    ToolParameter("path", "string", "Git 仓库路径，默认当前目录", required=False),
+                    ToolParameter("message", "string", "暂存说明，可选", required=False),
+                ],
+                examples=[
+                    'git_stash()',
+                    'git_stash(message="升级前暂存")',
+                ],
+                constraints=[
+                    "暂存后工作区会变为干净状态",
+                    "使用 git_stash_pop 恢复暂存的修改",
+                ],
+            ),
+            ToolDefinition(
+                name="git_stash_pop",
+                description="""恢复最近一次 git_stash 暂存的修改。
+
+使用场景：
+- 升级完成后恢复之前的本地修改
+- 拉取远程代码后恢复暂存""",
+                parameters=[
+                    ToolParameter("path", "string", "Git 仓库路径，默认当前目录", required=False),
+                ],
+                examples=[
+                    'git_stash_pop()',
+                ],
+                constraints=[
+                    "如果没有 stash 记录会报错",
+                    "恢复时可能有冲突，需要手动解决",
+                ],
             ),
         ]
 
@@ -1806,6 +2360,122 @@ class GitTool(BaseTool):
             "output": result.stdout.strip(),
         })
 
+    async def _handle_pull(self, call_id: str, path: str = ".", remote: str = "origin",
+                           branch: str = "") -> ToolResult:
+        import subprocess
+        cmd = ["git", "pull", remote]
+        if branch:
+            cmd.append(branch)
+        result = subprocess.run(
+            cmd, cwd=path,
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            return ToolResult.fail(call_id, "git_pull", f"git pull 失败: {result.stderr.strip()}")
+        return ToolResult.ok(call_id, "git_pull", {
+            "remote": remote,
+            "branch": branch or "当前分支",
+            "output": result.stdout.strip(),
+        })
+
+    async def _handle_fetch(self, call_id: str, path: str = ".", remote: str = "origin") -> ToolResult:
+        import subprocess
+        result = subprocess.run(
+            ["git", "fetch", remote], cwd=path,
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode != 0:
+            return ToolResult.fail(call_id, "git_fetch", f"git fetch 失败: {result.stderr.strip()}")
+        return ToolResult.ok(call_id, "git_fetch", {
+            "remote": remote,
+            "output": result.stdout.strip() or result.stderr.strip() or "fetch 完成",
+        })
+
+    async def _handle_diff(self, call_id: str, base: str, target: str,
+                           path: str = ".", stat_only: bool = False) -> ToolResult:
+        import subprocess
+        cmd = ["git", "diff"]
+        if stat_only:
+            cmd.append("--stat")
+        cmd.append(f"{base}..{target}")
+        result = subprocess.run(
+            cmd, cwd=path,
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode != 0:
+            return ToolResult.fail(call_id, "git_diff", f"git diff 失败: {result.stderr.strip()}")
+        output = result.stdout.strip()
+        if not output:
+            output = "无差异"
+        return ToolResult.ok(call_id, "git_diff", {
+            "base": base,
+            "target": target,
+            "stat_only": stat_only,
+            "diff": output,
+        })
+
+    async def _handle_log(self, call_id: str, path: str = ".",
+                          count: int = 10, oneline: bool = True) -> ToolResult:
+        import subprocess
+        cmd = ["git", "log", f"-{count}"]
+        if oneline:
+            cmd.append("--oneline")
+        result = subprocess.run(
+            cmd, cwd=path,
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return ToolResult.fail(call_id, "git_log", f"git log 失败: {result.stderr.strip()}")
+        return ToolResult.ok(call_id, "git_log", {
+            "count": count,
+            "log": result.stdout.strip() or "无历史记录",
+        })
+
+    async def _handle_branch_list(self, call_id: str, path: str = ".",
+                                  remote: bool = True) -> ToolResult:
+        import subprocess
+        cmd = ["git", "branch"]
+        if remote:
+            cmd.append("-a")
+        result = subprocess.run(
+            cmd, cwd=path,
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return ToolResult.fail(call_id, "git_branch_list", f"git branch 失败: {result.stderr.strip()}")
+        return ToolResult.ok(call_id, "git_branch_list", {
+            "branches": result.stdout.strip() or "无分支",
+        })
+
+    async def _handle_stash(self, call_id: str, path: str = ".",
+                            message: str = "") -> ToolResult:
+        import subprocess
+        cmd = ["git", "stash", "push"]
+        if message:
+            cmd.extend(["-m", message])
+        result = subprocess.run(
+            cmd, cwd=path,
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return ToolResult.fail(call_id, "git_stash", f"git stash 失败: {result.stderr.strip()}")
+        return ToolResult.ok(call_id, "git_stash", {
+            "message": message or "auto",
+            "output": result.stdout.strip(),
+        })
+
+    async def _handle_stash_pop(self, call_id: str, path: str = ".") -> ToolResult:
+        import subprocess
+        result = subprocess.run(
+            ["git", "stash", "pop"], cwd=path,
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return ToolResult.fail(call_id, "git_stash_pop", f"git stash pop 失败: {result.stderr.strip()}")
+        return ToolResult.ok(call_id, "git_stash_pop", {
+            "output": result.stdout.strip(),
+        })
+
 
 ================================================================================
 # FILE: image_tool.py
@@ -1856,23 +2526,55 @@ class ImageTool(BaseTool):
         return [
             ToolDefinition(
                 name="image_read",
-                description="读取图片信息：尺寸、格式、base64 编码。支持 jpg/png/bmp/gif/webp。",
+                description="""读取图片文件的基本信息：尺寸、格式、base64 编码。
+
+使用场景：
+- 获取图片的分辨率和格式信息
+- 获取图片的 base64 编码（用于发送到 LLM 多模态模型）
+- 检查图片文件大小
+
+支持格式：jpg/jpeg, png, bmp, gif, webp
+
+图片小于 5MB 时会自动生成 base64 编码。""",
                 parameters=[
-                    ToolParameter("path", "string", "图片路径", required=True),
+                    ToolParameter("path", "string", "图片文件路径", required=True),
                 ],
                 is_read=True,
-                examples=['image_read(path="photo.png")'],
+                examples=[
+                    'image_read(path="photo.png")',
+                    'image_read(path="screenshot.jpg")',
+                ],
+                constraints=[
+                    "仅支持常见图片格式（jpg/png/bmp/gif/webp）",
+                    "大于 5MB 的图片不会生成 base64 编码",
+                    "需要安装 Pillow 库：pip install Pillow",
+                ],
             ),
             ToolDefinition(
                 name="image_ocr",
-                description="使用 AI 识别图片中的文字。需要配置 QWEN_API_KEY。",
+                description="""使用通义千问（Qwen）VL 模型识别图片中的文字。
+
+使用场景：
+- 从发票/收据中提取文字
+- 从截图/照片中提取文本内容
+- 识别扫描文档中的文字
+
+需要配置 QWEN_API_KEY 或 DASHSCOPE_API_KEY 环境变量。""",
                 parameters=[
-                    ToolParameter("path", "string", "图片路径", required=True),
-                    ToolParameter("prompt", "string", "识别提示，如'提取发票金额和日期'", required=False),
+                    ToolParameter("path", "string", "图片文件路径", required=True),
+                    ToolParameter("prompt", "string", "识别提示词，如 '提取发票金额和日期' 或 '识别图中所有文字'，默认自动提取文字", required=False),
                 ],
                 is_read=True,
-                examples=['image_ocr(path="invoice.jpg", prompt="提取发票金额")'],
-                constraints=["需要配置 QWEN_API_KEY 环境变量"],
+                examples=[
+                    'image_ocr(path="invoice.jpg", prompt="提取发票金额")',
+                    'image_ocr(path="whiteboard.jpg", prompt="提取白板上的所有文字")',
+                ],
+                constraints=[
+                    "需要配置 QWEN_API_KEY 或 DASHSCOPE_API_KEY 环境变量",
+                    "需要使用 dashscope 库：pip install dashscope",
+                    "图片过大会影响识别速度和准确性",
+                    "仅支持中文和英文文字识别",
+                ],
             ),
         ]
 
@@ -1951,607 +2653,5 @@ class ImageTool(BaseTool):
             return ToolResult.fail(call_id, "image_ocr", "需要 dashscope: pip install dashscope")
         except Exception as e:
             return ToolResult.fail(call_id, "image_ocr", str(e))
-
-
-================================================================================
-# FILE: pdf_tool.py
-================================================================================
-"""
-PDF 工具（原子工具版）
-
-原子工具:
-  pdf_read    — 读取 PDF 文件内容
-  pdf_split   — 拆分 PDF 文件
-  pdf_concat  — 合并多个 PDF 文件
-
-v3.1: 新增 pdf_split / pdf_concat；PyPDF2 → pypdf 迁移
-"""
-
-import os
-import logging
-from typing import Any, Dict, List, Tuple
-
-from engine.tool.base import BaseTool, ToolDefinition, ToolParameter, ToolResult
-
-# PyPDF2 已停止维护，迁移到 pypdf（API 完全兼容）
-try:
-    import pypdf as PyPDF2
-except ImportError:
-    import PyPDF2
-
-logger = logging.getLogger("jarvis.tools.pdf")
-
-
-class PdfTool(BaseTool):
-    """PDF 文档工具集"""
-
-    def __init__(self):
-        self._handlers = {
-            "pdf_read": self._handle_read,
-            "pdf_split": self._handle_split,
-            "pdf_concat": self._handle_concat,
-        }
-
-    @property
-    def name(self) -> str:
-        return "pdf"
-
-    @property
-    def category(self) -> str:
-        return "data"
-
-    @property
-    def tools(self) -> List[ToolDefinition]:
-        return [
-            ToolDefinition(
-                name="pdf_read",
-                description="读取 PDF 文件内容。支持文本提取、表格提取、扫描件检测。自动降级（pdfplumber → pypdf）。",
-                parameters=[
-                    ToolParameter("path", "string", "PDF 文件路径", required=True),
-                    ToolParameter("max_pages", "number", "最大读取页数，默认 10", required=False),
-                    ToolParameter("extract_tables", "boolean", "是否提取表格（银行询证函建议开启）", required=False),
-                    ToolParameter("keywords", "string", "逗号分隔的关键词，优先保留含这些词的页面", required=False),
-                ],
-                is_read=True,
-                examples=[
-                    'pdf_read(path="report.pdf")',
-                    'pdf_read(path="report.pdf", max_pages=5, extract_tables=True)',
-                ],
-            ),
-            ToolDefinition(
-                name="pdf_split",
-                description="拆分 PDF 文件。可按指定页码范围（如 '1-5,8'）或按固定页数拆分为多个子文件。",
-                parameters=[
-                    ToolParameter("path", "string", "源 PDF 文件路径", required=True),
-                    ToolParameter("output_dir", "string", "输出目录路径", required=True),
-                    ToolParameter("ranges", "string", "页码范围，如 '1-3,5,8-10'。不填则按 split_size 拆分", required=False),
-                    ToolParameter("split_size", "number", "无 ranges 时，按此页数拆分（如每 10 页一个文件），默认 10", required=False),
-                ],
-                examples=[
-                    'pdf_split(path="report.pdf", output_dir="./parts", ranges="1-5,8-10")',
-                    'pdf_split(path="report.pdf", output_dir="./parts", split_size=20)',
-                ],
-                constraints=["会产生临时文件，注意清理"],
-            ),
-            ToolDefinition(
-                name="pdf_concat",
-                description="合并多个 PDF 文件为一个新文件。按 paths 列表顺序合并。",
-                parameters=[
-                    ToolParameter("paths", "array", "要合并的 PDF 文件路径列表（按顺序）", required=True),
-                    ToolParameter("output_path", "string", "合并后的输出文件路径", required=True),
-                ],
-                examples=[
-                    'pdf_concat(paths=["part1.pdf", "part2.pdf"], output_path="merged.pdf")',
-                ],
-                constraints=["所有文件必须存在，否则合并失败"],
-            ),
-        ]
-
-    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
-        handler = self._handlers.get(tool_name)
-        if not handler:
-            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
-        try:
-            return handler(call_id, **kwargs)
-        except Exception as e:
-            logger.exception(f"PDF 工具 {tool_name} 异常")
-            return ToolResult.fail(call_id, tool_name, str(e))
-
-    # ==================== pdf_read ====================
-
-    def _handle_read(self, call_id: str, path: str, max_pages: int = 10,
-                     extract_tables: bool = False, keywords: str = "") -> ToolResult:
-        if not path or not os.path.exists(path):
-            return ToolResult.fail(call_id, "pdf_read", f"文件不存在: {path}")
-
-        meta = self._extract_metadata(path)
-        is_scanned = self._is_likely_scanned(path)
-
-        result = {
-            "path": path,
-            **meta,
-            "is_scanned": is_scanned,
-            "pages": [],
-            "tables": [],
-        }
-
-        if is_scanned:
-            result["_hint"] = "检测为扫描件（图片类PDF），文本提取可能为空。建议使用 OCR 工具。"
-            return ToolResult.ok(call_id, "pdf_read", result)
-
-        try:
-            import pdfplumber
-            with pdfplumber.open(path) as pdf:
-                total = len(pdf.pages)
-                result["page_count"] = total
-                pages_to_read = min(max_pages, total)
-
-                for i in range(pages_to_read):
-                    page = pdf.pages[i]
-                    text = page.extract_text() or ""
-                    tables = page.extract_tables() if extract_tables else []
-
-                    page_data = {
-                        "page_num": i + 1,
-                        "text": text[:3000] if text else "",
-                        "chars": len(text),
-                    }
-                    if tables:
-                        page_data["tables"] = [self._table_to_text(t) for t in tables]
-                        result["tables"].extend(page_data["tables"])
-                    result["pages"].append(page_data)
-
-                return ToolResult.ok(call_id, "pdf_read", result)
-
-        except ImportError:
-            logger.warning("pdfplumber 未安装，降级到 pypdf")
-            return self._read_with_pypdf2(call_id, path, max_pages)
-        except Exception as e:
-            return ToolResult.fail(call_id, "pdf_read", str(e))
-
-    def _read_with_pypdf2(self, call_id: str, path: str, max_pages: int) -> ToolResult:
-        try:
-            with open(path, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
-                total = len(reader.pages)
-                result = {"path": path, "page_count": total, "engine": "pypdf (降级)", "pages": []}
-                pages_to_read = min(max_pages, total)
-
-                for i in range(pages_to_read):
-                    page = reader.pages[i]
-                    text = page.extract_text() or ""
-                    page_data = {"page_num": i + 1, "text": text[:3000], "chars": len(text)}
-                    result["pages"].append(page_data)
-
-                return ToolResult.ok(call_id, "pdf_read", result)
-
-        except ImportError:
-            return ToolResult.fail(call_id, "pdf_read", "需要 pdfplumber 或 pypdf: pip install pdfplumber pypdf")
-        except Exception as e:
-            return ToolResult.fail(call_id, "pdf_read", str(e))
-
-    # ==================== pdf_split ====================
-
-    def _handle_split(self, call_id: str, path: str, output_dir: str,
-                      ranges: str = "", split_size: int = 10) -> ToolResult:
-        if not os.path.exists(path):
-            return ToolResult.fail(call_id, "pdf_split", f"文件不存在: {path}")
-
-        try:
-            reader = PyPDF2.PdfReader(path)
-            total_pages = len(reader.pages)
-
-            # 解析拆分范围
-            if ranges:
-                split_ranges = self._parse_page_ranges(ranges, total_pages)
-            else:
-                split_ranges = [
-                    (i, min(i + split_size - 1, total_pages - 1))
-                    for i in range(0, total_pages, split_size)
-                ]
-
-            if not split_ranges:
-                return ToolResult.fail(call_id, "pdf_split", "未能解析出有效的页码范围")
-
-            os.makedirs(output_dir, exist_ok=True)
-            base_name = os.path.splitext(os.path.basename(path))[0]
-            generated_files = []
-
-            for idx, (start, end) in enumerate(split_ranges):
-                writer = PyPDF2.PdfWriter()
-                for page_num in range(start, end + 1):
-                    writer.add_page(reader.pages[page_num])
-
-                out_name = f"{base_name}_part{idx + 1}_p{start + 1}-{end + 1}.pdf"
-                out_path = os.path.join(output_dir, out_name)
-
-                with open(out_path, "wb") as f:
-                    writer.write(f)
-                generated_files.append(out_path)
-
-            return ToolResult.ok(call_id, "pdf_split", {
-                "source": path,
-                "output_dir": output_dir,
-                "generated_files": generated_files,
-                "total_parts": len(generated_files),
-            })
-
-        except Exception as e:
-            return ToolResult.fail(call_id, "pdf_split", f"拆分失败: {e}")
-
-    # ==================== pdf_concat ====================
-
-    def _handle_concat(self, call_id: str, paths: List[str], output_path: str) -> ToolResult:
-        if not paths:
-            return ToolResult.fail(call_id, "pdf_concat", "文件列表不能为空")
-
-        writer = PyPDF2.PdfWriter()
-        merged_files = []
-
-        for p in paths:
-            if not os.path.exists(p):
-                return ToolResult.fail(call_id, "pdf_concat", f"文件不存在: {p}")
-            try:
-                reader = PyPDF2.PdfReader(p)
-                for page in reader.pages:
-                    writer.add_page(page)
-                merged_files.append(p)
-            except Exception as e:
-                return ToolResult.fail(call_id, "pdf_concat", f"读取 {p} 失败: {e}")
-
-        try:
-            out_dir = os.path.dirname(os.path.abspath(output_path))
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-            with open(output_path, "wb") as f:
-                writer.write(f)
-        except Exception as e:
-            return ToolResult.fail(call_id, "pdf_concat", f"写入文件失败: {e}")
-
-        return ToolResult.ok(call_id, "pdf_concat", {
-            "output_path": output_path,
-            "merged_files": merged_files,
-            "total_pages": len(writer.pages),
-        })
-
-    # ==================== 辅助方法 ====================
-
-    @staticmethod
-    def _parse_page_ranges(ranges_str: str, total_pages: int) -> List[Tuple[int, int]]:
-        """解析页码范围（如 '1-3,5,8-10'），返回 0-indexed 的 (start, end)"""
-        ranges = []
-        for part in ranges_str.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "-" in part:
-                start_str, end_str = part.split("-", 1)
-                start = max(1, int(start_str.strip()))
-                end = min(total_pages, int(end_str.strip()))
-                if start <= end:
-                    ranges.append((start - 1, end - 1))
-            else:
-                idx = int(part.strip())
-                if 1 <= idx <= total_pages:
-                    ranges.append((idx - 1, idx - 1))
-        return ranges
-
-    def _extract_metadata(self, path: str) -> Dict[str, Any]:
-        meta = {"file_name": os.path.basename(path), "file_size": os.path.getsize(path)}
-        try:
-            with open(path, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
-                meta["page_count"] = len(reader.pages)
-                info = reader.metadata
-                if info:
-                    for k in ("/Title", "/Author", "/Subject", "/Creator", "/Producer", "/CreationDate", "/ModDate"):
-                        v = info.get(k)
-                        if v:
-                            meta[k.lstrip("/").lower()] = str(v)
-        except Exception:
-            pass
-        return meta
-
-    @staticmethod
-    def _is_likely_scanned(path: str) -> bool:
-        try:
-            with open(path, "rb") as f:
-                head = f.read(2048)
-            text_markers = [b"/Text", b"/Font", b"/CIDFont"]
-            return not any(m in head for m in text_markers)
-        except Exception:
-            return False
-
-    @staticmethod
-    def _table_to_text(table) -> str:
-        rows = []
-        for row in table:
-            rows.append(" | ".join(str(cell or "") for cell in row))
-        return "\n".join(rows)
-
-
-================================================================================
-# FILE: pentest_tool.py
-================================================================================
-"""
-渗透测试工具（原子工具版）
-
-原子工具:
-  pentest_run  — 执行渗透测试工具（基于 WSL）
-"""
-
-import asyncio
-import logging
-from typing import List
-
-from engine.tool.base import (
-    BaseTool, ToolDefinition, ToolParameter, ToolResult,
-    CATEGORY_SECURITY,
-)
-
-logger = logging.getLogger(__name__)
-
-PENTEST_TOOLS = {
-    "nmap": "端口扫描和服务探测", "amass": "子域名枚举（OWASP）",
-    "dnsrecon": "DNS 信息收集", "theharvester": "邮箱/域名/员工名收集",
-    "whois": "域名注册信息查询", "traceroute": "路由追踪",
-    "sublist3r": "快速子域名枚举", "enum4linux": "Windows/Samba 信息枚举",
-    "nikto": "Web 服务器漏洞扫描", "dirb": "目录/文件暴力扫描",
-    "gobuster": "目录/子域/DNS 暴力扫描", "ffuf": "Web fuzzing",
-    "whatweb": "Web 技术栈识别", "wpscan": "WordPress 漏洞扫描",
-    "sqlmap": "SQL 注入", "searchsploit": "Exploit-DB 漏洞搜索",
-    "metasploit": "渗透测试框架", "hydra": "在线密码暴力破解",
-    "john": "离线密码破解", "hashcat": "GPU 加速密码破解",
-    "netcat": "TCP/UDP 连接", "curl": "HTTP 请求调试",
-    "wget": "文件下载", "responder": "LLMNR/NBT-NS 欺骗",
-    "exiftool": "文件元数据提取", "binwalk": "固件分析",
-    "steghide": "隐写术检测",
-}
-
-PENTEST_CATEGORIES = {
-    "recon": ["nmap", "amass", "dnsrecon", "theharvester", "whois", "traceroute", "sublist3r", "enum4linux", "whatweb"],
-    "web": ["nikto", "dirb", "gobuster", "ffuf", "sqlmap", "wpscan", "curl", "wget"],
-    "exploit": ["metasploit", "searchsploit"],
-    "password": ["hydra", "john", "hashcat"],
-    "network": ["netcat", "responder"],
-    "forensics": ["exiftool", "binwalk", "steghide"],
-}
-
-
-class PentestTool(BaseTool):
-    """渗透测试工具集"""
-
-    def __init__(self):
-        self._handlers = {"pentest_run": self._handle_run}
-        for t in self.tools:
-            t.handler = self._handlers.get(t.name)
-
-    @property
-    def name(self) -> str:
-        return "pentest"
-
-    @property
-    def category(self) -> str:
-        return CATEGORY_SECURITY
-
-    @property
-    def tools(self) -> List[ToolDefinition]:
-        return [
-            ToolDefinition(
-                name="pentest_run",
-                description="在 WSL 中执行渗透测试工具。支持 nmap/sqlmap/hydra 等 27 个工具。\n"
-                            "action 分类：\n"
-                            "  recon     — 信息收集 (nmap, amass, whois)\n"
-                            "  web       — Web 漏洞 (nikto, sqlmap, dirb)\n"
-                            "  exploit   — 漏洞利用 (metasploit, searchsploit)\n"
-                            "  password  — 密码破解 (hydra, john, hashcat)\n"
-                            "  network   — 网络工具 (netcat, responder)\n"
-                            "  forensics — 取证 (exiftool, binwalk)",
-                parameters=[
-                    ToolParameter("action", "string",
-                        "分类: recon/web/exploit/password/network/forensics/custom", required=True,
-                        enum=["recon", "web", "exploit", "password", "network", "forensics", "custom"]),
-                    ToolParameter("tool", "string", "工具名，如 nmap/sqlmap", required=True),
-                    ToolParameter("args", "string", "工具参数，如 '-sV localhost'", required=False),
-                    ToolParameter("timeout", "number", "超时秒数，默认 120", required=False),
-                ],
-                examples=[
-                    'pentest_run(action="recon", tool="nmap", args="-sV localhost")',
-                    'pentest_run(action="web", tool="sqlmap", args="-u https://target.com?id=1")',
-                    'pentest_run(action="custom", tool="ls", args="-la")',
-                ],
-                constraints=[
-                    "需要安装 WSL（Windows Subsystem for Linux）",
-                    "工具需先在 WSL 中安装：sudo apt install <tool>",
-                ],
-            ),
-        ]
-
-    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
-        handler = self._handlers.get(tool_name)
-        if not handler:
-            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
-        try:
-            return await handler(call_id, **kwargs)
-        except Exception as e:
-            return ToolResult.fail(call_id, tool_name, str(e))
-
-    async def _handle_run(self, call_id: str, action: str, tool: str,
-                          args: str = "", timeout: int = 120) -> ToolResult:
-        if not tool:
-            return ToolResult.fail(call_id, "pentest_run", "需要 tool 参数")
-
-        if action == "custom":
-            return await self._wsl_exec(call_id, f"{tool} {args}".strip(), timeout)
-
-        # 检查是否已安装
-        check = await self._wsl_cmd(f"which {tool} 2>/dev/null || echo 'NOT_FOUND'", 10)
-        if "NOT_FOUND" in check:
-            return ToolResult.fail(call_id, "pentest_run",
-                f"'{tool}' 未安装。请在 WSL 中安装: sudo apt install {tool}")
-
-        cmd = f"{tool} {args}" if args else tool
-        return await self._wsl_exec(call_id, cmd, timeout)
-
-    async def _wsl_cmd(self, cmd: str, timeout: int) -> str:
-        proc = await asyncio.create_subprocess_exec(
-            "wsl", "--", "bash", "-c", cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return (stdout.decode("utf-8", errors="replace") +
-                stderr.decode("utf-8", errors="replace")).strip()
-
-    async def _wsl_exec(self, call_id: str, cmd: str, timeout: int) -> ToolResult:
-        logger.info(f"WSL: {cmd}")
-        try:
-            output = await self._wsl_cmd(cmd, timeout)
-            return ToolResult.ok(call_id, "pentest_run", {
-                "tool": cmd.split()[0],
-                "command": cmd,
-                "output": output,
-            })
-        except asyncio.TimeoutError:
-            return ToolResult.fail(call_id, "pentest_run", f"执行超时（{timeout}秒）")
-        except Exception as e:
-            return ToolResult.fail(call_id, "pentest_run", str(e))
-
-
-================================================================================
-# FILE: shell_tool.py
-================================================================================
-"""
-Shell 工具（原子工具版）
-
-原子工具:
-  shell_run  — 执行 Shell 命令或 Python 代码
-"""
-
-import asyncio
-import os
-import re
-import logging
-import tempfile
-from typing import List
-
-from engine.tool.base import (
-    BaseTool, ToolDefinition, ToolParameter, ToolResult,
-    CATEGORY_SYSTEM,
-)
-
-logger = logging.getLogger(__name__)
-
-
-class ShellExecuteTool(BaseTool):
-    """Shell 命令执行工具"""
-
-    def __init__(self, **kwargs):
-        self._default_timeout = kwargs.get("timeout", 30)
-        self._handlers = {"shell_run": self._handle_run}
-        for t in self.tools:
-            t.handler = self._handlers.get(t.name)
-
-    @property
-    def name(self) -> str:
-        return "shell"
-
-    @property
-    def category(self) -> str:
-        return CATEGORY_SYSTEM
-
-    @property
-    def tools(self) -> List[ToolDefinition]:
-        return [
-            ToolDefinition(
-                name="shell_run",
-                description="执行 Shell 命令或 Python 代码。\n"
-                            "用法1 — 简单命令：shell_run(command='dir')\n"
-                            "用法2 — 多行 Python：shell_run(code='...')\n"
-                            "多行 Python 代码推荐用 code 参数（自动写临时文件执行，避免 JSON 转义问题）。",
-                parameters=[
-                    ToolParameter("command", "string", "Shell 命令（简单命令用）", required=False),
-                    ToolParameter("code", "string", "Python 代码（多行代码用，自动写文件执行）", required=False),
-                    ToolParameter("timeout", "number", "超时秒数，默认 30", required=False),
-                ],
-                examples=[
-                    'shell_run(command="dir")',
-                    'shell_run(command="python script.py")',
-                    'shell_run(code="import os; print(os.listdir(\'.\'))")',
-                ],
-                constraints=[
-                    "Windows 用 dir，Linux/Mac 用 ls",
-                    "默认超时 30 秒，大数据操作增加 timeout",
-                ],
-            ),
-        ]
-
-    async def execute(self, call_id: str, tool_name: str, **kwargs) -> ToolResult:
-        handler = self._handlers.get(tool_name)
-        if not handler:
-            return ToolResult.fail(call_id, tool_name, f"未知工具: {tool_name}")
-        try:
-            return await handler(call_id, **kwargs)
-        except Exception as e:
-            return ToolResult.fail(call_id, tool_name, str(e))
-
-    async def _handle_run(self, call_id: str, command: str = "", code: str = "",
-                          timeout: int = None) -> ToolResult:
-        timeout = timeout or self._default_timeout
-
-        # 优先处理 code 参数
-        if code:
-            command = self._prepare_code_execution(code)
-            logger.info(f"执行 Python 代码 ({len(code)} 字符)")
-        elif not command:
-            return ToolResult.fail(call_id, "shell_run", "需要 command 或 code 参数")
-
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                shell=True,
-            )
-            stdout_data, stderr_data = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-
-            stdout = self._decode(stdout_data)
-            stderr = self._decode(stderr_data)
-
-            if not stdout.strip() and not stderr.strip():
-                stdout = "命令执行完成，无输出"
-
-            return ToolResult.ok(call_id, "shell_run", {
-                "stdout": stdout,
-                "stderr": stderr,
-                "return_code": proc.returncode,
-            })
-
-        except asyncio.TimeoutError:
-            return ToolResult.fail(call_id, "shell_run",
-                f"执行超时（{timeout}秒），如需更长超时请增加 timeout 参数")
-        except Exception as e:
-            return ToolResult.fail(call_id, "shell_run", str(e))
-
-    @staticmethod
-    def _decode(data: bytes) -> str:
-        try:
-            return data.decode("utf-8").strip()
-        except UnicodeDecodeError:
-            try:
-                return data.decode("gbk").strip()
-            except UnicodeDecodeError:
-                return data.decode("utf-8", errors="replace").strip()
-
-    @staticmethod
-    def _prepare_code_execution(code: str) -> str:
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", encoding="utf-8", delete=False,
-        )
-        tmp.write(code)
-        tmp.close()
-        return f'python "{tmp.name}"'
 
 

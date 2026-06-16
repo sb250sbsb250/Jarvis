@@ -141,6 +141,7 @@ class AgentLoop:
             compressed_until: int = 0,
             compressed_summary: str = "",
             model_override: Optional[str] = None,
+            mode: str = "coding",
     ) -> Dict[str, Any]:
         """自主执行任务。"""
         self.edited_files.clear()
@@ -150,6 +151,8 @@ class AgentLoop:
 
         # 守卫状态重置
         self._guard_state = GuardState()
+
+        self._current_mode = mode
 
         # 组件初始化
         self._file_guard = FileEditGuard(working_dir)
@@ -196,6 +199,7 @@ class AgentLoop:
                 start_round = state.get("round", 0)
                 findings = state.get("findings", [])
                 self._context_builder.compressed_summary = state.get("compressed_summary", "")
+                self._context_builder.compressed_until = state.get("compressed_until", 0)
                 self._total_tokens_used = state.get("total_tokens_used", 0)
                 logger.info(
                     f"⏮️ 恢复检查点 (round={start_round}, "
@@ -216,6 +220,7 @@ class AgentLoop:
                     history=history, skip_last_user=skip_last_user,
                     compressed_until=compressed_until,
                     compressed_summary=compressed_summary,
+                    mode=mode,
                 )
         else:
             messages = await self._context_builder.build_messages(
@@ -224,6 +229,7 @@ class AgentLoop:
                 history=history, skip_last_user=skip_last_user,
                 compressed_until=compressed_until,
                 compressed_summary=compressed_summary,
+                mode=mode,
             )
 
         # ── 长期记忆注入 ──
@@ -236,15 +242,15 @@ class AgentLoop:
         self._model_override = model_override
         try:
             router = ComplexityRouter(self.llm_client)
-            mode, info = router.route(task)
-            self._task_mode = mode
+            complexity_mode, info = router.route(task)
+            self._task_mode = complexity_mode
             self._task_mode_info = info
             if info:
                 self._routed_model = info.get("model")
                 self._routed_temperature = info.get("temperature")
                 self._routed_max_tokens = info.get("max_tokens")
             _diag_print(
-                f"  ComplexityRouter: mode={mode.name}, "
+                f"  ComplexityRouter: mode={complexity_mode.name}, "
                 f"model={self._routed_model or 'default'}, "
                 f"tokens={self._routed_max_tokens or 'default'}"
             )
@@ -254,6 +260,19 @@ class AgentLoop:
             self._task_mode_info = None
 
         self._effective_model = self._model_override or self._routed_model
+
+        # ── 模式配置覆盖（在 ComplexityRouter 之后应用） ──
+        try:
+            from .prompt.modes import get_mode_config
+            mode_cfg = get_mode_config(mode)
+            if mode_cfg.temperature is not None:
+                self._routed_temperature = mode_cfg.temperature
+            if mode_cfg.max_tokens is not None:
+                self._routed_max_tokens = mode_cfg.max_tokens
+            if mode_cfg.default_model and not self._model_override:
+                self._effective_model = mode_cfg.default_model
+        except Exception as e:
+            logger.debug(f"模式配置未生效: {e}")
 
         # ═══════════════════════════════════════════════════════════
         #  主循环
@@ -278,6 +297,19 @@ class AgentLoop:
                 # ── 准备工具列表 ──
                 from .skill.matcher import get_filtered_tools
                 tools = get_filtered_tools(self.tool_registry, self.skill)
+
+                # ── 模式级工具过滤 ──
+                try:
+                    from .prompt.modes import get_mode_config
+                    mode_cfg = get_mode_config(mode)
+                    if mode_cfg.allowed_tools is not None:
+                        _allowed_set = set(mode_cfg.allowed_tools)
+                        tools = [
+                            t for t in tools
+                            if t.get("function", {}).get("name") in _allowed_set
+                        ]
+                except Exception:
+                    pass
 
                 # ── LLM 调用 ──
                 kwargs = {}
@@ -577,7 +609,7 @@ class AgentLoop:
 
                     # ── 轮次内 lint 检查 ──
                     if self.auto_lint and round_idx > 0 and round_idx % 5 == 0:
-                        await self._auto_lint_check(findings, round_idx, on_event)
+                        await self._auto_lint_check(findings, round_idx, on_event, messages=messages)
 
                     # ── 循环检测 ──
                     if detect_loop(tool_calls_log):
@@ -594,10 +626,11 @@ class AgentLoop:
                             self._checkpoint.save(
                                 messages=messages,
                                 tool_calls_log=tool_calls_log,
-                                round=round_display,
+                                round_idx=round_display,
                                 findings=findings,
                                 compressed_summary=self._context_builder.compressed_summary,
                                 total_tokens_used=self._total_tokens_used,
+                                compressed_until=self._context_builder.compressed_until,
                             )
                             logger.info(f"💾 检查点保存 (round={round_display})")
 
@@ -794,6 +827,7 @@ class AgentLoop:
     async def _auto_lint_check(
         self, findings: List[str], round_idx: int,
         on_event: Optional[Callable] = None,
+        messages: Optional[List[Dict]] = None,
     ) -> None:
         for file_path in list(self.edited_files):
             if not os.path.isfile(file_path):
@@ -804,6 +838,10 @@ class AgentLoop:
                     if on_event:
                         await on_event("lint_pass", {"file": file_path})
                 else:
+                    # 将 lint 结果注入到 LLM 上下文，让 LLM 知道代码有问题
+                    feedback = self.lint_runner.format_feedback(passes, file_path)
+                    if feedback and messages is not None:
+                        safe_inject_system(messages, feedback)
                     msg = f"⚠️ Lint 提醒: {file_path} 有代码风格问题"
                     findings.append(msg)
                     if on_event:

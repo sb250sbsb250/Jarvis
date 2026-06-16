@@ -200,6 +200,7 @@ class ContextBuilder:
         skip_last_user: bool = True,
         compressed_until: int = 0,
         compressed_summary: str = "",
+        mode: str = "coding",
     ) -> List[Dict]:
         """构建初始消息列表。返回 messages + 更新 compressed_* 状态。"""
         self.compressed_until = compressed_until
@@ -211,7 +212,7 @@ class ContextBuilder:
         if self.compressed_summary:
             variables["compressed_summary"] = f"## 📜 历史操作日志\n{self.compressed_summary}"
 
-        system_prompt = render_template(variables, base_system)
+        system_prompt = render_template(variables, base_system, mode=mode)
         messages.append({"role": "system", "content": system_prompt})
 
         if history:
@@ -262,6 +263,7 @@ class ContextBuilder:
             "skill_prompt": "",
             "constraints": "",
             "compressed_summary": "",
+            "self_knowledge": "",
         }
         if skill:
             if hasattr(skill, 'get_config_value'):
@@ -271,6 +273,14 @@ class ContextBuilder:
                 variables["skill_prompt"] = (
                     f"## 当前任务领域：{skill.meta.display_name}\n{sp}"
                 )
+            # 自我升级技能：注入自我架构知识
+            if getattr(skill.meta, 'name', '') == 'self_upgrade':
+                try:
+                    from ..core.self_analyzer import SelfAnalyzer
+                    analyzer = SelfAnalyzer()
+                    variables["self_knowledge"] = analyzer.generate_self_description()
+                except Exception:
+                    pass
         return variables
 
     # ── Token 预算检查 ──

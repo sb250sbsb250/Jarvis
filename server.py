@@ -54,6 +54,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     model: Optional[str] = None
     search_enabled: bool = False
+    mode: str = "coding"  # "coding" | "workbuddy" | "video"
 
 
 # ====================================================================
@@ -196,6 +197,7 @@ async def event_generator(
     session_id: Optional[str] = None,
     model_name: Optional[str] = None,
     search_enabled: bool = False,
+    mode: str = "coding",
 ) -> AsyncGenerator[str, None]:
     """生成 SSE 事件流。"""
     session = await session_manager.get_or_create_session(session_id) if session_id else await session_manager.create_session()
@@ -285,6 +287,7 @@ async def event_generator(
                 task=user_input,
                 on_event=on_event,
                 model=model_name,
+                mode=mode,
             )
         )
         _running_task = process_task
@@ -366,7 +369,7 @@ async def event_generator(
 @app.post("/api/chat/stream")
 async def chat_stream(req: ChatRequest):
     return StreamingResponse(
-        event_generator(req.message.strip(), session_id=req.session_id, model_name=req.model, search_enabled=req.search_enabled),
+        event_generator(req.message.strip(), session_id=req.session_id, model_name=req.model, search_enabled=req.search_enabled, mode=req.mode),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -468,6 +471,23 @@ async def approval_respond(body: ApprovalRequest):
         return {"status": "ok", "approved": body.approved}
     else:
         raise HTTPException(status_code=404, detail=f"No pending approval with call_id={body.call_id[:12]}")
+
+
+@app.get("/api/config/modes")
+async def get_modes():
+    """返回所有可用的工作模式"""
+    from engine.prompt.modes import get_all_modes
+    return {
+        "modes": [
+            {
+                "id": cfg.name,
+                "name": cfg.display_name,
+                "description": cfg.description,
+                "icon": cfg.icon,
+            }
+            for cfg in get_all_modes()
+        ]
+    }
 
 
 @app.get("/api/config/keys")

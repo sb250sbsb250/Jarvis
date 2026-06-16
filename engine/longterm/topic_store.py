@@ -322,7 +322,8 @@ class TopicStore:
             conn.close()
 
         # 同步到 BM25 索引
-        self._sync_to_bm25()
+        new_text = f"{title} {one_liner} {summary}"
+        self._sync_to_bm25(new_text)
 
         logger.info(f"Created topic: {topic_id} — {title[:40]}")
         return topic_id
@@ -609,9 +610,12 @@ class TopicStore:
         self._bm25.rebuild(texts)
         self._bm25_loaded = True
 
-    def _sync_to_bm25(self):
-        """重新同步 BM25 索引（增量添加后标记需要刷新）"""
-        self._bm25_loaded = False
+    def _sync_to_bm25(self, new_text: str = ""):
+        """增量同步 BM25 索引（新增文本时增量添加，否则标记全量重建）"""
+        if self._bm25_loaded and new_text:
+            self._bm25.add_document(new_text)
+        else:
+            self._bm25_loaded = False
 
     # ── 维护 ──
 

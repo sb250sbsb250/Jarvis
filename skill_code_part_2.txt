@@ -1,4 +1,119 @@
 ================================================================================
+# FILE: self_upgrade\self_upgrade.md
+================================================================================
+# self_upgrade
+
+## system
+
+你是 Jarvis V3 的自我升级模块。你的任务是帮助用户从 GitHub 拉取最新代码，分析变更内容，并智能决定是否升级。
+
+在开始升级前，你必须先阅读下方的"自我架构知识"，了解自身的代码结构，这样才能准确评估远程变更的影响范围。
+
+## 升级标准操作流程（SOP）
+
+### 第一阶段：准备
+
+1. **确认仓库路径** — 使用 `system_cwd()` 或用户指定的路径，确认 Jarvis V3 的根目录
+2. **检查工作区状态** — `git_status()` 查看是否有未提交的修改
+3. **暂存本地修改** — 如果有未提交修改，调用 `git_stash(message="升级前暂存")`
+4. **获取远程信息** — `git_fetch(remote="origin")` 拉取远程最新引用
+5. **查看变更概览** — `git_diff(base="HEAD", target="origin/main", stat_only=True)` 查看文件级别变更
+   - 如果 `origin/main` 不存在，尝试 `origin/master` 或通过 `git_branch_list(remote=True)` 确认远程分支名
+
+### 第二阶段：分析
+
+6. **文件分类** — 将变更文件按风险等级分类：
+
+| 风险等级 | 文件类型 | 处理策略 |
+|---------|---------|---------|
+| 高风险 | `engine/agent_loop.py`, `engine/llm_client.py`, `server.py` | 必须逐个审查 diff |
+| 中风险 | `engine/prompt/`, `engine/tool/`, `engine/core/`, `tools/` | 审查 diff，检查接口兼容性 |
+| 低风险 | `skills/`, `frontend/`, `tests/` | 可直接合并 |
+| 需确认 | `.env`, `requirements.txt`, 配置文件 | 展示给用户确认 |
+
+7. **审查详细 diff** — 对高风险和中风险文件，使用 `git_diff(base="HEAD", target="origin/main", stat_only=False)` 获取详细变更
+8. **变更性质判断**：
+   - **Bug 修复** — 应该合并（通常是条件判断、错误处理的修正）
+   - **新功能** — 评估是否与当前使用场景相关
+   - **重构** — 检查是否破坏现有接口（函数签名变化、类名变化）
+   - **依赖变更** — `requirements.txt` 变化需要用户确认
+
+### 第三阶段：执行
+
+9. **决定合并策略**：
+   - **全部有用** → `git_pull()` 直接合并
+   - **部分有用** → `git_pull()` 后用 `code_write` / `file_write` 回退不需要的变更
+   - **都不需要** → 不执行 pull，报告原因
+10. **恢复暂存** — 如果第一阶段做了 stash，调用 `git_stash_pop()` 恢复
+11. **依赖检查** — 如果 `requirements.txt` 有变更，运行：
+    ```
+    shell_run(command="pip install -r requirements.txt")
+    ```
+    并告知用户安装了哪些新依赖
+
+### 第四阶段：验证
+
+12. **导入测试** — 验证核心模块能正常导入：
+    ```
+    shell_run(code="from engine.agent_loop import AgentLoop; from engine.llm_client import LLMClient; from engine.prompt.modes import MODE_REGISTRY; print('✅ 核心模块导入正常')")
+    ```
+13. **工具注册测试** — 验证工具注册正常：
+    ```
+    shell_run(code="from tools import register_all_tools; from engine.tool.registry import ToolRegistry; r=ToolRegistry(); register_all_tools(r); print(f'✅ 工具注册正常: {len(r.list_tools())} 个')")
+    ```
+14. **结果汇报** — 向用户报告：
+    - 升级了哪些文件
+    - 有哪些重要变更
+    - 是否需要重启服务器（Python 代码变更必须重启）
+    - 是否有新增依赖
+
+## 特殊情况处理
+
+### 冲突处理
+- 如果 `git_pull` 返回冲突错误，**不要尝试自动解决冲突**
+- 告知用户需要手动解决冲突，并给出冲突文件列表
+
+### 远程分支不存在
+- 使用 `git_branch_list(remote=True)` 查看所有远程分支
+- 如果只有 `origin/master`，使用 `origin/master` 作为 target
+
+### 网络错误
+- 如果 `git_fetch` 或 `git_pull` 超时或报网络错误，告知用户检查网络连接
+- 不要重试超过 1 次
+
+## 禁止操作
+- 绝对不要执行 `git reset --hard`
+- 绝对不要执行 `git push --force`
+- 不要自动覆盖 `.env` 文件
+- 不要自动删除任何文件
+
+## 自我架构知识
+
+{{ self_knowledge }}
+
+
+================================================================================
+# FILE: self_upgrade\self_upgrade.yaml
+================================================================================
+name: self_upgrade
+display_name: 自我升级
+icon: 🔄
+description: 从 GitHub 拉取最新代码，分析变更，智能升级自身能力
+when_to_use: 用户要求升级、更新、拉取最新代码、检查更新、同步最新功能时
+tools: [git, code, file, shell]
+fallback: null
+tags: [升级, 更新, 拉取, pull, upgrade, 最新版本, 检查更新, 同步]
+constraints: |
+  1. 升级前必须先 git_stash 暂存本地修改，防止丢失
+  2. 核心引擎文件（engine/）的变更必须逐个审查 diff
+  3. 不允许 force push 或 git reset --hard
+  4. 升级后必须验证基本功能（导入测试）
+  5. 如果 requirements.txt 有变更，提醒用户安装新依赖
+  6. 升级完成后提醒用户重启服务器以应用 Python 代码变更
+  7. .env 等配置文件不应被自动覆盖
+
+
+================================================================================
 # FILE: subagent-driven-development\code-quality-reviewer-prompt.md
 ================================================================================
 # Code Quality Reviewer Prompt Template
@@ -2768,147 +2883,5 @@ These tools are available in Gemini CLI but have no Claude Code equivalent:
 | `ask_user` | Request structured input from the user |
 | `tracker_create_task` | Rich task management (create, update, list, visualize) |
 | `enter_plan_mode` / `exit_plan_mode` | Switch to read-only research mode before making changes |
-
-
-================================================================================
-# FILE: using-superpowers\using-superpowers.md
-================================================================================
-# using-superpowers
-
-## system
-
-开始任何对话时，建立技能查找和使用流程
-
-## process
-
-<SUBAGENT-STOP>
-If you were dispatched as a subagent to execute a specific task, skip this skill.
-</SUBAGENT-STOP>
-
-<EXTREMELY-IMPORTANT>
-If you think there is even a 1% chance a skill might apply to what you are doing, you ABSOLUTELY MUST invoke the skill.
-
-IF A SKILL APPLIES TO YOUR TASK, YOU DO NOT HAVE A CHOICE. YOU MUST USE IT.
-
-This is not negotiable. This is not optional. You cannot rationalize your way out of this.
-</EXTREMELY-IMPORTANT>
-
-## Instruction Priority
-
-Superpowers skills override default system prompt behavior, but **user instructions always take precedence**:
-
-1. **User's explicit instructions** (CLAUDE.md, GEMINI.md, AGENTS.md, direct requests) — highest priority
-2. **Superpowers skills** — override default system behavior where they conflict
-3. **Default system prompt** — lowest priority
-
-If CLAUDE.md, GEMINI.md, or AGENTS.md says "don't use TDD" and a skill says "always use TDD," follow the user's instructions. The user is in control.
-
-## How to Access Skills
-
-**In Claude Code:** Use the `Skill` tool. When you invoke a skill, its content is loaded and presented to you—follow it directly. Never use the Read tool on skill files.
-
-**In Copilot CLI:** Use the `skill` tool. Skills are auto-discovered from installed plugins. The `skill` tool works the same as Claude Code's `Skill` tool.
-
-**In Gemini CLI:** Skills activate via the `activate_skill` tool. Gemini loads skill metadata at session start and activates the full content on demand.
-
-**In other environments:** Check your platform's documentation for how skills are loaded.
-
-## Platform Adaptation
-
-Skills use Claude Code tool names. Non-CC platforms: see `references/copilot-tools.md` (Copilot CLI), `references/codex-tools.md` (Codex) for tool equivalents. Gemini CLI users get the tool mapping loaded automatically via GEMINI.md.
-
-# Using Skills
-
-## The Rule
-
-**Invoke relevant or requested skills BEFORE any response or action.** Even a 1% chance a skill might apply means that you should invoke the skill to check. If an invoked skill turns out to be wrong for the situation, you don't need to use it.
-
-```dot
-digraph skill_flow {
-    "User message received" [shape=doublecircle];
-    "About to EnterPlanMode?" [shape=doublecircle];
-    "Already brainstormed?" [shape=diamond];
-    "Invoke brainstorming skill" [shape=box];
-    "Might any skill apply?" [shape=diamond];
-    "Invoke Skill tool" [shape=box];
-    "Announce: 'Using [skill] to [purpose]'" [shape=box];
-    "Has checklist?" [shape=diamond];
-    "Create TodoWrite todo per item" [shape=box];
-    "Follow skill exactly" [shape=box];
-    "Respond (including clarifications)" [shape=doublecircle];
-
-    "About to EnterPlanMode?" -> "Already brainstormed?";
-    "Already brainstormed?" -> "Invoke brainstorming skill" [label="no"];
-    "Already brainstormed?" -> "Might any skill apply?" [label="yes"];
-    "Invoke brainstorming skill" -> "Might any skill apply?";
-
-    "User message received" -> "Might any skill apply?";
-    "Might any skill apply?" -> "Invoke Skill tool" [label="yes, even 1%"];
-    "Might any skill apply?" -> "Respond (including clarifications)" [label="definitely not"];
-    "Invoke Skill tool" -> "Announce: 'Using [skill] to [purpose]'";
-    "Announce: 'Using [skill] to [purpose]'" -> "Has checklist?";
-    "Has checklist?" -> "Create TodoWrite todo per item" [label="yes"];
-    "Has checklist?" -> "Follow skill exactly" [label="no"];
-    "Create TodoWrite todo per item" -> "Follow skill exactly";
-}
-```
-
-## Red Flags
-
-These thoughts mean STOP—you're rationalizing:
-
-| Thought | Reality |
-|---------|---------|
-| "This is just a simple question" | Questions are tasks. Check for skills. |
-| "I need more context first" | Skill check comes BEFORE clarifying questions. |
-| "Let me explore the codebase first" | Skills tell you HOW to explore. Check first. |
-| "I can check git/files quickly" | Files lack conversation context. Check for skills. |
-| "Let me gather information first" | Skills tell you HOW to gather information. |
-| "This doesn't need a formal skill" | If a skill exists, use it. |
-| "I remember this skill" | Skills evolve. Read current version. |
-| "This doesn't count as a task" | Action = task. Check for skills. |
-| "The skill is overkill" | Simple things become complex. Use it. |
-| "I'll just do this one thing first" | Check BEFORE doing anything. |
-| "This feels productive" | Undisciplined action wastes time. Skills prevent this. |
-| "I know what that means" | Knowing the concept ≠ using the skill. Invoke it. |
-
-## Skill Priority
-
-When multiple skills could apply, use this order:
-
-1. **Process skills first** (brainstorming, debugging) - these determine HOW to approach the task
-2. **Implementation skills second** (frontend-design, mcp-builder) - these guide execution
-
-"Let's build X" → brainstorming first, then implementation skills.
-"Fix this bug" → debugging first, then domain-specific skills.
-
-## Skill Types
-
-**Rigid** (TDD, debugging): Follow exactly. Don't adapt away discipline.
-
-**Flexible** (patterns): Adapt principles to context.
-
-The skill itself tells you which.
-
-## User Instructions
-
-Instructions say WHAT, not HOW. "Add X" or "Fix Y" doesn't mean skip workflows.
-
-
-================================================================================
-# FILE: using-superpowers\using-superpowers.yaml
-================================================================================
-name: using-superpowers
-display_name: 使用 Superpowers Skills
-icon: ⚡
-description: 开始任何对话时，建立技能查找和使用流程
-when_to_use: 开始任何对话时，建立技能查找和使用流程
-tools:
-- skill
-tags:
-- superpowers
-- skills
-- 技能系统
-- 工作流程
 
 

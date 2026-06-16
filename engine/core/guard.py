@@ -52,10 +52,11 @@ def safe_inject_system(messages: List[Dict], content: str) -> None:
     """安全地在 messages 末尾追加 system 消息（避开 tool_calls 块）。"""
     if (messages and messages[-1].get("role") == "assistant"
             and messages[-1].get("tool_calls")):
-        insert_at = len(messages) - 1
-        messages.insert(insert_at, {"role": "system", "content": content})
-    else:
-        messages.append({"role": "system", "content": content})
+        # assistant+tool_calls 后必须紧跟 tool 消息，不可插入 system
+        # 为避免破坏消息序列，跳过本次注入
+        logger.debug("safe_inject_system: 跳过（末尾为 tool_calls 块）")
+        return
+    messages.append({"role": "system", "content": content})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -108,6 +109,9 @@ def check_stuck_hard(state: GuardState, tool_name: str, tool_args: Dict) -> Opti
         sig = f"{tool_name}:{str(tool_args)}"
 
     state.exact_call_signatures.append(sig)
+    # 只保留最近 10 条，防止长会话无限增长
+    if len(state.exact_call_signatures) > 10:
+        state.exact_call_signatures = state.exact_call_signatures[-10:]
 
     if (len(state.exact_call_signatures) >= 3
             and len(set(state.exact_call_signatures[-3:])) == 1):
