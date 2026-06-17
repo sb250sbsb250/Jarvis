@@ -37,11 +37,15 @@ class ConversationSession:
         self,
         loop_factory: Callable[[], AgentLoop],
         session_id: str = "",
+        todo_manager: Optional[Any] = None,
+        llm_client: Optional[Any] = None,
     ):
         self._loop_factory = loop_factory
         self.session_id: str = session_id
         self._messages: List[Dict] = []       # LLM 格式的完整对话历史
         self._turn_count: int = 0
+        self._todo_manager = todo_manager  # 会话级别的 TodoManager
+        self._llm_client = llm_client  # 用于任务完成后压缩历史
 
         # 压缩状态
         self.compressed_until: int = 0
@@ -152,6 +156,10 @@ class ConversationSession:
         self.compressed_until = result.get("compressed_until", self.compressed_until)
         self.compressed_summary = result.get("compressed_summary", self.compressed_summary)
 
+        # ── 任务完成后压缩历史 ──
+        if result.get("success") and self._llm_client:
+            await self._compress_completed_turn()
+
         logger.info(
             f"🧵 第 {self._turn_count} 轮结束: "
             f"AgentLoop 返回 {len(new_messages)} 条消息, "
@@ -176,6 +184,141 @@ class ConversationSession:
         elif total > self._TOTAL_TOKEN_WARN:
             logger.info(f"💰 Token 水位 {total}/{self._TOTAL_TOKEN_HARD}")
 
+    # ── 任务完成压缩 ──
+
+    async def _compress_completed_turn(self) -> None:
+        """
+        任务完成后压缩历史：将已完成的轮次压缩为摘要，只保留最近 1 轮完整消息。
+
+        流程：
+          1. 找到最后一个 user 消息的位置（当前轮起点）
+          2. 找到倒数第二个 user 消息的位置（上一轮起点）
+          3. 将上一轮之前的所有消息发给 LLM 生成摘要
+          4. 用摘要替换那些消息，更新 compressed_until/compressed_summary
+        """
+        msgs = self._messages
+        if len(msgs) < 6:
+            return  # 太少，不压缩
+
+        # 找所有 user 消息的位置
+        user_indices = [
+            i for i, m in enumerate(msgs) if m.get("role") == "user"
+        ]
+        if len(user_indices) < 2:
+            return  # 只有一轮，不压缩
+
+        # 要压缩的范围：[0, 倒数第二轮的起点)
+        # 保留：最近一轮 [倒数第二轮的起点, end]
+        keep_from = user_indices[-2]
+        to_compress = msgs[:keep_from]
+
+        if not to_compress:
+            return
+
+        # 如果已经压缩过到这个位置，跳过
+        if self.compressed_until >= keep_from:
+            return
+
+        # 构建压缩输入（只发要压缩的消息，不传完整对话）
+        dialogue_parts = []
+        for m in to_compress:
+            role = m.get("role", "?")
+            content = str(m.get("content", ""))[:300]
+            if m.get("tool_calls"):
+                tools = [tc.get("function", {}).get("name", "?") for tc in m.get("tool_calls", [])]
+                content += f"【工具: {', '.join(tools)}】"
+            if role in ("user", "assistant"):
+                dialogue_parts.append(f"[{role}] {content}")
+
+        if not dialogue_parts:
+            return
+
+        # LLM 压缩调用（轻量级：只传要压缩的部分）
+        prompt = (
+            "将以下对话记录压缩为**操作日志**。每条包含：做了什么 → 结果。\n\n"
+            "输出格式：每行一条，格式为：\n"
+            "  - {状态} {操作}: {做了什么} → {结果/发现}\n\n"
+            "状态: ✅成功 ❌失败 ⚠️部分\n\n"
+            "要求：\n"
+            "1. 每条一句话，保留关键信息（文件路径、数据量、错误原因）\n"
+            "2. 丢弃冗余过程（重试、调试、重复操作）\n"
+            "3. 控制在100-200字\n\n"
+            + "\n".join(dialogue_parts)
+            + "\n\n操作日志:"
+        )
+
+        try:
+            resp = await self._llm_client.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=400,
+                temperature=0.1,
+            )
+            summary = resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            logger.warning(f"压缩 LLM 调用失败: {e}")
+            summary = ""
+
+        if not summary or len(summary) < 10:
+            # fallback: 规则摘要
+            summary = self._rule_compress(to_compress)
+
+        if not summary:
+            return
+
+        # 更新压缩状态
+        prefix = "## 📜 已完成任务摘要\n" if not self.compressed_summary else ""
+        if self.compressed_summary:
+            self.compressed_summary = f"{self.compressed_summary}\n\n{summary}"
+        else:
+            self.compressed_summary = f"{prefix}{summary}"
+        self.compressed_until = keep_from
+
+        # 截断消息列表：只保留最近一轮
+        self._messages = msgs[keep_from:]
+        self._update_token_estimate()
+
+        compressed_count = len(to_compress)
+        remaining = len(self._messages)
+        logger.info(
+            f"📐 任务完成压缩: {compressed_count}条 → 摘要{len(summary)}字 | "
+            f"保留 {remaining} 条 (最近1轮)"
+        )
+
+    @staticmethod
+    def _rule_compress(messages: List[Dict]) -> str:
+        """规则压缩 — LLM 不可用时的 fallback。"""
+        turns: List[List[Dict]] = []
+        current: List[Dict] = []
+        for m in messages:
+            if m.get("role") == "user" and current:
+                turns.append(current)
+                current = []
+            current.append(m)
+        if current:
+            turns.append(current)
+
+        lines = []
+        for i, turn in enumerate(turns, 1):
+            user_text = ""
+            tools = []
+            result_text = ""
+            for m in turn:
+                role = m.get("role", "")
+                if role == "user":
+                    user_text = str(m.get("content", ""))[:80].replace("\n", " ")
+                elif role == "assistant":
+                    for tc in m.get("tool_calls", []):
+                        tools.append(tc.get("function", {}).get("name", "?"))
+                    content = m.get("content", "")
+                    if content:
+                        result_text = str(content)[:100].replace("\n", " ")
+            indicator = f"[{', '.join(tools[:3])}]" if tools else "[直接回答]"
+            line = f"- R{i} {indicator} {user_text}"
+            if result_text:
+                line += f" → {result_text}"
+            lines.append(line)
+        return "\n".join(lines) if lines else ""
+
     # ── 管理 ──
 
     async def reset(self) -> None:
@@ -185,6 +328,9 @@ class ConversationSession:
         self._estimated_tokens = 0
         self.compressed_until = 0
         self.compressed_summary = ""
+        # 重置 Todo 状态
+        if self._todo_manager is not None:
+            self._todo_manager.reset()
         logger.info(f"🧵 [会话 {self.session_id[:8]}] 已重置")
 
     def import_history(self, messages: List[Dict]) -> None:

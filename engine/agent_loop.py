@@ -80,11 +80,13 @@ class AgentLoop:
         auto_lint: bool = True,
         lint_runner: Optional[LintRunner] = None,
         enable_checkpoint: bool = True,
+        todo_manager: Optional[Any] = None,
     ):
         self.llm_client = llm_client
         self.tool_registry = tool_registry
         self.max_rounds = max_rounds
         self.base_system = system_prompt
+        self._todo_manager = todo_manager  # 外部传入的 TodoManager（会话级别生命周期）
 
         self.auto_lint = auto_lint
         self.lint_runner = lint_runner or LintRunner()
@@ -148,6 +150,11 @@ class AgentLoop:
         self._total_tokens_used = 0
         self._last_llm_usage = None
         self._has_compressed = False
+
+        # ── Todo 管理器激活（会话级别生命周期，不在 run 内重置）──
+        if self._todo_manager is not None:
+            from tools.todo_tool import set_active_manager
+            set_active_manager(self._todo_manager)
 
         # 守卫状态重置
         self._guard_state = GuardState()
@@ -221,6 +228,7 @@ class AgentLoop:
                     compressed_until=compressed_until,
                     compressed_summary=compressed_summary,
                     mode=mode,
+                    todo_state=self._format_todo_state(),
                 )
         else:
             messages = await self._context_builder.build_messages(
@@ -230,6 +238,7 @@ class AgentLoop:
                 compressed_until=compressed_until,
                 compressed_summary=compressed_summary,
                 mode=mode,
+                todo_state=self._format_todo_state(),
             )
 
         # ── 长期记忆注入 ──
@@ -610,13 +619,20 @@ class AgentLoop:
                         # ── ScriptSuggestionDetector ──
                         self._script_detector.record(tool_name, is_success)
 
-                        # ── Todo 更新事件 ──
-                        if (on_event and error_str and "todo_write" in error_str
-                                and "已完成" in error_str):
-                            try:
-                                await on_event("todo_update", {"message": error_str})
-                            except Exception:
-                                pass
+                        # ── Todo 更新事件（从 ToolResult.metadata 提取）──
+                        if on_event and is_success:
+                            todo_data = getattr(result, 'metadata', {}).get('todo_update')
+                            if todo_data is not None:
+                                try:
+                                    stats = getattr(result, 'metadata', {}).get('todo_stats', {})
+                                    if not stats and self._todo_manager:
+                                        stats = self._todo_manager.get_stats()
+                                    await on_event("todo_update", {
+                                        "todos": todo_data,
+                                        "stats": stats,
+                                    })
+                                except Exception:
+                                    pass
 
                     # ── 轮次内 lint 检查 ──
                     if self.auto_lint and round_idx > 0 and round_idx % 5 == 0:
@@ -879,6 +895,32 @@ class AgentLoop:
                         await on_event("lint_error", {"file": file_path})
             except Exception as e:
                 logger.debug(f"Lint 跳过 {file_path}: {e}")
+
+    # ═══════════════════════════════════════════════════════════════
+    #  Todo 状态格式化
+    # ═══════════════════════════════════════════════════════════════
+
+    def _format_todo_state(self) -> str:
+        """格式化当前 TodoManager 状态为可注入的文本。"""
+        if self._todo_manager is None:
+            return ""
+        items = self._todo_manager.list_all()
+        if not items:
+            return ""
+        # 最多显示 20 条，防止 system prompt 膨胀
+        max_display = 20
+        stats = self._todo_manager.get_stats()
+        lines = [f"## 📋 当前任务进度 [{stats['completed']}/{stats['total']}]"]
+        status_icons = {
+            "completed": "✅", "in_progress": "🔄",
+            "pending": "⬜", "cancelled": "❌",
+        }
+        for item in items[:max_display]:
+            icon = status_icons.get(item.status, "⬜")
+            lines.append(f"{icon} {item.content}")
+        if len(items) > max_display:
+            lines.append(f"... (还有 {len(items) - max_display} 项未显示)")
+        return "\n".join(lines)
 
     # ═══════════════════════════════════════════════════════════════
     #  诊断输出

@@ -173,12 +173,30 @@ class TodoManager:
         return int(match.group(1)) if match else 0
 
 
-# ── 全局单例 ──
+# ═══════════════════════════════════════
+#  全局 Todo 状态管理器
+# ═══════════════════════════════════════
+
+# 全局默认管理器（向后兼容）
 _global_todo_manager = TodoManager()
+
+# 活跃管理器（由 ConversationSession 在每轮 run 前设置）
+_active_manager: Optional[TodoManager] = None
+
+
+def set_active_manager(manager: Optional[TodoManager]) -> None:
+    """设置当前活跃的 TodoManager（由 AgentLoop.run() 调用）"""
+    global _active_manager
+    _active_manager = manager
+
+
+def get_active_manager() -> TodoManager:
+    """获取当前活跃的 TodoManager（活跃管理器 > 全局默认）"""
+    return _active_manager if _active_manager is not None else _global_todo_manager
 
 
 def get_todo_manager() -> TodoManager:
-    """获取全局 TodoManager 实例"""
+    """获取全局默认 TodoManager（向后兼容）"""
     return _global_todo_manager
 
 
@@ -190,11 +208,16 @@ class TodoTool(BaseTool):
     """任务追踪工具集"""
 
     def __init__(self):
-        self._manager = get_todo_manager()
+        # 延迟获取：每次 execute 时动态获取活跃管理器
         self._handlers = {
             "todo_write": self._handle_write,
             "todo_list": self._handle_list,
         }
+
+    @property
+    def _manager(self) -> TodoManager:
+        """动态获取当前活跃的 TodoManager"""
+        return get_active_manager()
 
     @property
     def name(self) -> str:
@@ -269,13 +292,13 @@ class TodoTool(BaseTool):
         items = self._manager.write(todos)
         display = self._manager.format_display()
 
-        # metadata 中携带 todo_update 数据，由 agent_loop 触发 SSE
+        # metadata 中携带 todo_update + todo_stats，由 agent_loop 触发 SSE
         return ToolResult.ok(call_id, "todo_write", {
             "status": "updated",
             "total": len(items),
             "stats": self._manager.get_stats(),
             "display": display,
-        }, todo_update=self._manager.to_dict_list())
+        }, todo_update=self._manager.to_dict_list(), todo_stats=self._manager.get_stats())
 
     async def _handle_list(self, call_id: str, **kwargs) -> ToolResult:
         items = self._manager.list_all()

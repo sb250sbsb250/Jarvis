@@ -21,6 +21,7 @@ from tools import register_all_tools
 from engine.tool.registry import ToolRegistry
 from engine.session.manager import SessionManager
 from engine.core.approval import ApprovalGate
+from tools.todo_tool import TodoManager
 
 # ───────────── 日志 ─────────────
 logging.basicConfig(
@@ -109,12 +110,14 @@ def _get_or_create_conv_session(session_id: str, model_name: str = "deepseek-v4-
     """获取或创建该会话的 ConversationSession（管理历史 + 调用 AgentLoop）"""
     if session_id not in _conv_sessions:
         _client = _model_clients.get(model_name, llm_client)
+        _todo_mgr = TodoManager()  # 会话级别的 TodoManager
 
-        def _make_loop(c=_client, sid=session_id):
+        def _make_loop(c=_client, sid=session_id, tm=_todo_mgr):
             loop = AgentLoop(
                 llm_client=c,
                 tool_registry=tool_registry,
                 max_rounds=200,
+                todo_manager=tm,
             )
             # 注册 approval gate 到全局（供手动审批 API 访问）
             if hasattr(loop, '_approval_gate') and loop._approval_gate:
@@ -124,6 +127,8 @@ def _get_or_create_conv_session(session_id: str, model_name: str = "deepseek-v4-
         _conv_sessions[session_id] = ConversationSession(
             loop_factory=_make_loop,
             session_id=session_id,
+            todo_manager=_todo_mgr,
+            llm_client=_client,
         )
         logger.info(f"🧵 创建会话: {session_id[:12]}... (模型: {model_name})")
     return _conv_sessions[session_id]

@@ -256,6 +256,7 @@ class ContextBuilder:
         compressed_until: int = 0,
         compressed_summary: str = "",
         mode: str = "coding",
+        todo_state: str = "",
     ) -> List[Dict]:
         """构建初始消息列表。返回 messages + 更新 compressed_* 状态。"""
         self.compressed_until = compressed_until
@@ -263,6 +264,7 @@ class ContextBuilder:
 
         messages: List[Dict] = []
         variables = self._build_template_variables(task, working_dir, skill)
+        variables["todo_state"] = todo_state
 
         if self.compressed_summary:
             variables["compressed_summary"] = f"## 📜 历史操作日志\n{self.compressed_summary}"
@@ -319,6 +321,7 @@ class ContextBuilder:
             "constraints": "",
             "compressed_summary": "",
             "self_knowledge": "",
+            "todo_state": "",
         }
         if skill:
             if hasattr(skill, 'get_config_value'):
